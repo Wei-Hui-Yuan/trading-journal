@@ -112,6 +112,36 @@ class Trade(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Position(Base):
+    """A closed round trip produced by the FIFO matching engine.
+
+    Kept separate from `trades` so raw broker executions remain an immutable
+    log; matching only ever appends here.
+    """
+
+    __tablename__ = "positions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    symbol = Column(String(20), nullable=False)
+    style = Column(String(50), nullable=False)
+    quantity = Column(Numeric(12, 4), nullable=False)
+    entry_price = Column(Numeric(10, 4), nullable=False)
+    exit_price = Column(Numeric(10, 4), nullable=False)
+    entry_time = Column(DateTime(timezone=True), nullable=False)
+    exit_time = Column(DateTime(timezone=True), nullable=False)
+    realized_pnl = Column(Numeric(12, 4), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Which pair of executions produced this position. A unique index on the
+    # pair makes re-running the matching engine a no-op instead of a duplicate.
+    open_trade_id = Column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=True
+    )
+    close_trade_id = Column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 async def get_session():
     async with SessionLocal() as session:
         yield session

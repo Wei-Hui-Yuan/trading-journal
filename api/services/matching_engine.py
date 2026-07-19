@@ -5,6 +5,10 @@ BUY/SELL direction). This module pairs those fills into round-trip positions
 using first-in-first-out accounting, computes realized P&L, and classifies the
 holding period into a trading style.
 
+Clean-room separation: `trades` is treated as an immutable execution log and is
+never written to. Every derived round trip is appended to the `positions` table
+instead (see migrations/001_create_positions.sql).
+
 The core matcher is intentionally pure: it operates on lightweight `Execution`
 values rather than ORM rows, so it can be unit tested without a database and
 reused for backtests. `run_matching_for_ticker` is the thin database adapter.
@@ -20,6 +24,7 @@ from decimal import Decimal
 from typing import Iterable, Optional
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Style buckets. All values fit the trades.style VARCHAR(15) column.
@@ -250,15 +255,16 @@ async def run_matching_for_ticker(
     session: AsyncSession,
     ticker: str,
     *,
-    persist: bool = False,
+    persist: bool = True,
     only_unclassified: bool = False,
 ) -> MatchingResult:
-    """Match one ticker's executions, optionally writing results back.
+    """Match one ticker's executions and append the round trips to `positions`.
 
-    `persist` is opt-in because the write is lossy against the current schema:
-    the opening execution row is updated in place to represent the round trip
-    (exit price, exit date, resolved style). Callers that only want the numbers
-    should leave it False.
+    Rows in `trades` are never modified: they stay an immutable record of what
+    the broker actually filled. Everything derived lands in `positions`.
+
+    Set `persist=False` to compute the numbers without writing (useful for
+    previews and backtests).
     """
     executions = await load_executions_for_ticker(
         session, ticker, only_unclassified=only_unclassified
@@ -267,29 +273,46 @@ async def run_matching_for_ticker(
     result.ticker = ticker
 
     if persist and result.positions:
-        await _persist_positions(session, result.positions)
+        await insert_positions(session, result.positions)
         await session.commit()
 
     return result
 
 
-async def _persist_positions(
+async def insert_positions(
     session: AsyncSession, positions: list[MatchedPosition]
-) -> None:
-    """Write matched round trips back onto their opening execution rows.
+) -> int:
+    """Batch-insert closed round trips into the `positions` table.
 
-    Only rows still carrying the placeholder style are reclassified, so a style
-    a human has already set by hand is never overwritten.
+    One statement for the whole batch rather than a write per position.
+
+    `open_trade_id` / `close_trade_id` identify the two executions behind each
+    position and must always be set: the uq_positions_open_close unique index
+    is what makes ON CONFLICT DO NOTHING turn a re-run into a no-op, and
+    Postgres treats NULLs as distinct, so null keys would never collide.
     """
-    from main import Trade  # noqa: PLC0415 - deferred to avoid circular import
+    if not positions:
+        return 0
 
-    for position in positions:
-        opening_row = await session.get(Trade, position.open_trade_id)
-        if opening_row is None:
-            continue
+    from main import Position  # noqa: PLC0415 - deferred to avoid circular import
 
-        opening_row.exit_price = position.exit_price
-        opening_row.exit_date = position.exit_date
+    rows = [
+        {
+            "id": uuid.uuid4(),
+            "symbol": position.ticker,
+            "style": position.style,
+            "quantity": Decimal(position.quantity),
+            "entry_price": position.entry_price,
+            "exit_price": position.exit_price,
+            "entry_time": position.entry_date,
+            "exit_time": position.exit_date,
+            "realized_pnl": position.realized_pnl,
+            "open_trade_id": position.open_trade_id,
+            "close_trade_id": position.close_trade_id,
+        }
+        for position in positions
+    ]
 
-        if opening_row.style == UNCLASSIFIED_STYLE:
-            opening_row.style = position.style
+    stmt = pg_insert(Position).values(rows).on_conflict_do_nothing()
+    result = await session.execute(stmt)
+    return result.rowcount or 0
