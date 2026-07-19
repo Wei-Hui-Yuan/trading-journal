@@ -1,0 +1,13 @@
+# Secrets & Environment variables
+.env
+.env.local
+.env.production
+*.env
+
+# Dependencies & Build outputs
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
