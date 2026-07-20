@@ -2,6 +2,8 @@ import axios from 'axios';
 
 import type {
   DashboardStats,
+  ManualTradePayload,
+  ManualTradeResult,
   Position,
   PositionReviewPayload,
   Strategy,
@@ -107,6 +109,22 @@ export async function updateStrategy(
   payload: StrategyUpdatePayload
 ): Promise<Strategy> {
   const { data } = await apiClient.patch<Strategy>(`/strategies/${id}`, payload);
+  return data;
+}
+
+/**
+ * POST /api/trades/manual - hand-log an execution.
+ *
+ * The backend inserts it into `trades` like a synced fill, then re-runs FIFO
+ * matching for that ticker, so positions appear without a broker sync.
+ */
+export async function createManualTrade(
+  payload: ManualTradePayload
+): Promise<ManualTradeResult> {
+  const { data } = await apiClient.post<ManualTradeResult>(
+    '/trades/manual',
+    payload
+  );
   return data;
 }
 

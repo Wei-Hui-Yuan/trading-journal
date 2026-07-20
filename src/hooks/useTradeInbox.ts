@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
+  createManualTrade,
   createStrategy,
   getDashboardAnalytics,
   getPendingPositions,
@@ -12,6 +13,8 @@ import {
 } from '@/lib/api';
 import type {
   DashboardStats,
+  ManualTradePayload,
+  ManualTradeResult,
   Position,
   PositionReviewPayload,
   Strategy,
@@ -50,6 +53,25 @@ export function useDashboardStats() {
   return useQuery<DashboardStats>({
     queryKey: queryKeys.dashboardStats,
     queryFn: getDashboardAnalytics,
+  });
+}
+
+/**
+ * Hand-log an execution.
+ *
+ * The backend re-runs FIFO matching on save, so a closing fill can produce a
+ * new position immediately. Both the inbox queue and the dashboard are
+ * invalidated so the queue and heatmap reflect it without a reload.
+ */
+export function useCreateManualTrade() {
+  const queryClient = useQueryClient();
+
+  return useMutation<ManualTradeResult, Error, ManualTradePayload>({
+    mutationFn: createManualTrade,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+    },
   });
 }
 

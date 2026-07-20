@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -281,6 +282,117 @@ async def complete_trade(
     await session.commit()
     await session.refresh(trade)
     return TradeOut.model_validate(trade)
+
+
+# ---------------------------------------------------------------------------
+# Manual trade entry
+# ---------------------------------------------------------------------------
+
+# Naive timestamps from the client are interpreted as US market time, matching
+# how the analytics service buckets sessions.
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+class ManualTradeCreate(BaseModel):
+    """One hand-logged execution, for traders not on an automated broker sync."""
+
+    symbol: str = Field(..., min_length=1, max_length=10)
+    side: str = Field(..., description="BUY or SELL")
+    quantity: float = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    # Omitted -> now in America/New_York. A naive value is read as market time.
+    execution_time: Optional[datetime] = None
+
+    @field_validator("symbol")
+    @classmethod
+    def _upper_symbol(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("side")
+    @classmethod
+    def _valid_side(cls, value: str) -> str:
+        side = value.strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("side must be 'BUY' or 'SELL'")
+        return side
+
+    @field_validator("quantity")
+    @classmethod
+    def _whole_shares(cls, value: float) -> float:
+        # trades.quantity is an INTEGER column. Reject fractional input rather
+        # than silently truncating 0.5 shares to 0.
+        if value != int(value):
+            raise ValueError(
+                "quantity must be a whole number of shares "
+                "(the trades table stores an integer quantity)"
+            )
+        return value
+
+
+class ManualTradeResult(BaseModel):
+    trade_id: uuid.UUID
+    ticker: str
+    direction: str
+    quantity: int
+    price: float
+    execution_time: datetime
+    # Round trips the FIFO engine closed as a result of this execution.
+    positions_created: int
+    open_quantity: int
+
+
+@app.post("/api/trades/manual", response_model=ManualTradeResult, status_code=201)
+async def create_manual_trade(
+    params: ManualTradeCreate, session: AsyncSession = Depends(get_session)
+):
+    """Log an execution by hand and re-run FIFO matching for its ticker.
+
+    The execution lands in `trades` exactly like a synced fill, so the matching
+    engine treats hand-logged and broker-sourced fills identically.
+    """
+    from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        UNCLASSIFIED_STYLE,
+        run_matching_for_ticker,
+    )
+
+    executed_at = params.execution_time or datetime.now(MARKET_TZ)
+    if executed_at.tzinfo is None:
+        # datetime-local inputs arrive without an offset; anchor to market time.
+        executed_at = executed_at.replace(tzinfo=MARKET_TZ)
+
+    trade = Trade(
+        id=uuid.uuid4(),
+        # Synthetic id keeps manual fills traceable and distinct from broker
+        # rows, while still satisfying the UNIQUE constraint.
+        ibkr_exec_id=f"MANUAL-{uuid.uuid4()}",
+        ticker=params.symbol,
+        direction=params.side,
+        style=UNCLASSIFIED_STYLE,
+        status=TradeStatus.pending_review.value,
+        entry_date=executed_at,
+        actual_entry=params.price,
+        quantity=int(params.quantity),
+        source_tag="Manual",
+    )
+    session.add(trade)
+    await session.commit()
+    await session.refresh(trade)
+
+    # Re-run matching for this ticker. The engine is idempotent (unique index
+    # on the open/close execution pair), so already-matched round trips are not
+    # duplicated -- only newly closable ones are written.
+    result = await run_matching_for_ticker(session, params.symbol, persist=True)
+
+    return ManualTradeResult(
+        trade_id=trade.id,
+        ticker=trade.ticker,
+        direction=trade.direction,
+        quantity=trade.quantity,
+        price=float(trade.actual_entry),
+        execution_time=trade.entry_date,
+        positions_created=len(result.positions),
+        open_quantity=result.open_quantity,
+    )
 
 
 # ---------------------------------------------------------------------------

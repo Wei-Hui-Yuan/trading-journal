@@ -102,6 +102,42 @@ export interface PositionReviewPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Manual trade entry
+// ---------------------------------------------------------------------------
+
+export type TradeSide = 'BUY' | 'SELL';
+
+/**
+ * Body for POST /api/trades/manual.
+ *
+ * `quantity` must be a whole number — `trades.quantity` is an INTEGER column,
+ * and the API rejects fractional shares rather than truncating them.
+ *
+ * `execution_time` omitted means "now, US market time". A value without a
+ * timezone offset is interpreted by the backend as America/New_York.
+ */
+export interface ManualTradePayload {
+  symbol: string;
+  side: TradeSide;
+  quantity: number;
+  price: number;
+  execution_time?: string | null;
+}
+
+export interface ManualTradeResult {
+  trade_id: string;
+  ticker: string;
+  direction: TradeSide;
+  quantity: number;
+  price: number;
+  execution_time: string;
+  /** Round trips the FIFO engine closed because of this execution. */
+  positions_created: number;
+  /** Shares left open on this ticker after matching. */
+  open_quantity: number;
+}
+
+// ---------------------------------------------------------------------------
 // Analytics
 // ---------------------------------------------------------------------------
 
