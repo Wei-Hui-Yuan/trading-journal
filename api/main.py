@@ -205,10 +205,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Trading Journal API", lifespan=lifespan)
 
-# Next.js frontend runs on localhost:3000.
+# Local dev (localhost:3000) and the production Vercel deployment.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://trading-journal-seven-ivory.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
