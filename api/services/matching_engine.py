@@ -38,6 +38,9 @@ SCALP_MAX_HOLD = timedelta(hours=2)
 # Rows the sync engine inserts before a human classifies them.
 UNCLASSIFIED_STYLE = "Unclassified"
 
+# Every freshly matched position lands in the Trade Inbox awaiting review.
+DEFAULT_REVIEW_STATUS = "pending"
+
 LONG = "LONG"
 SHORT = "SHORT"
 BUY = "BUY"
@@ -309,6 +312,10 @@ async def insert_positions(
             "realized_pnl": position.realized_pnl,
             "open_trade_id": position.open_trade_id,
             "close_trade_id": position.close_trade_id,
+            # New positions enter the Trade Inbox awaiting review. DO NOTHING
+            # (rather than an upsert) is what preserves tags and grades a user
+            # has already set when the engine is re-run over the same fills.
+            "review_status": DEFAULT_REVIEW_STATUS,
         }
         for position in positions
     ]

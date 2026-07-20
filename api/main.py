@@ -27,6 +27,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -70,12 +71,20 @@ class TradeStatus(str, Enum):
     completed = "completed"
 
 
+class ReviewStatus(str, Enum):
+    """Lifecycle of a position in the Trade Inbox."""
+
+    pending = "pending"
+    completed = "completed"
+
+
 class Strategy(Base):
     __tablename__ = "strategies"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String(50), nullable=False, unique=True)
+    name = Column(String(100), nullable=False, unique=True)
     description = Column(Text, nullable=True)
+    # Predates migration 002; retained so existing rows keep their data.
     instruments = Column(ARRAY(Text), default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -140,6 +149,17 @@ class Position(Base):
     close_trade_id = Column(
         UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=True
     )
+
+    # Review workflow (migration 002). The matching engine writes review_status
+    # 'pending'; everything else is filled in by the user via the Trade Inbox.
+    strategy_id = Column(
+        UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
+    )
+    review_status = Column(String(20), default=ReviewStatus.pending.value)
+    tag_hard_sl = Column(Boolean, default=False)
+    tag_retest = Column(Boolean, default=False)
+    tag_plan_compliant = Column(Boolean, default=False)
+    trade_grade = Column(String(5), nullable=True)
 
 
 async def get_session():
@@ -255,6 +275,136 @@ async def complete_trade(
     await session.commit()
     await session.refresh(trade)
     return TradeOut.model_validate(trade)
+
+
+# ---------------------------------------------------------------------------
+# Strategies
+# ---------------------------------------------------------------------------
+
+
+class StrategyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+
+
+class StrategyOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: Optional[str]
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+@app.get("/api/strategies", response_model=list[StrategyOut])
+async def list_strategies(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Strategy).order_by(Strategy.name))
+    return [StrategyOut.model_validate(s) for s in result.scalars().all()]
+
+
+@app.post("/api/strategies", response_model=StrategyOut, status_code=201)
+async def create_strategy(
+    params: StrategyCreate, session: AsyncSession = Depends(get_session)
+):
+    strategy = Strategy(name=params.name, description=params.description)
+    session.add(strategy)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # strategies.name carries a UNIQUE constraint.
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail=f"A strategy named '{params.name}' already exists"
+        )
+    await session.refresh(strategy)
+    return StrategyOut.model_validate(strategy)
+
+
+# ---------------------------------------------------------------------------
+# Position review (Trade Inbox)
+# ---------------------------------------------------------------------------
+
+
+class PositionReviewUpdate(BaseModel):
+    """Checklist payload from the Trade Inbox.
+
+    Every field is optional; only those present in the request body are
+    applied, so a partial save never clears untouched fields.
+    """
+
+    strategy_id: Optional[uuid.UUID] = None
+    tag_hard_sl: Optional[bool] = None
+    tag_retest: Optional[bool] = None
+    tag_plan_compliant: Optional[bool] = None
+    trade_grade: Optional[str] = Field(None, max_length=5)
+
+
+class PositionOut(BaseModel):
+    id: uuid.UUID
+    symbol: str
+    style: str
+    quantity: float
+    entry_price: float
+    exit_price: float
+    entry_time: datetime
+    exit_time: datetime
+    realized_pnl: float
+    strategy_id: Optional[uuid.UUID]
+    review_status: Optional[str]
+    tag_hard_sl: Optional[bool]
+    tag_retest: Optional[bool]
+    tag_plan_compliant: Optional[bool]
+    trade_grade: Optional[str]
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+@app.patch("/api/positions/{position_id}/review", response_model=PositionOut)
+async def review_position(
+    position_id: uuid.UUID,
+    params: PositionReviewUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Record the review checklist and mark the position completed."""
+    position = await session.get(Position, position_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    updates = params.model_dump(exclude_unset=True)
+
+    # Reject a dangling strategy reference up front rather than surfacing a
+    # foreign-key error from the database.
+    strategy_id = updates.get("strategy_id")
+    if strategy_id is not None:
+        if await session.get(Strategy, strategy_id) is None:
+            raise HTTPException(
+                status_code=400, detail=f"Strategy {strategy_id} does not exist"
+            )
+
+    for field, value in updates.items():
+        setattr(position, field, value)
+
+    position.review_status = ReviewStatus.completed.value
+
+    await session.commit()
+    await session.refresh(position)
+    return PositionOut.model_validate(position)
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/analytics/dashboard")
+async def analytics_dashboard(session: AsyncSession = Depends(get_session)):
+    """Core stats plus the day/session heatmap grid."""
+    from services.analytics import build_dashboard
+
+    return await build_dashboard(session)
 
 
 # ---------------------------------------------------------------------------
