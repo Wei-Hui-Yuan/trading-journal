@@ -25,6 +25,7 @@ from sqlalchemy import (
     Text,
     func,
     select,
+    update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -169,6 +170,27 @@ class Position(Base):
     trade_grade = Column(String(5), nullable=True)
 
 
+class IBKRExecution(Base):
+    """Raw broker fills, staged before promotion into `trades`.
+
+    `transaction_id` is UNIQUE: that constraint is what makes re-syncing an
+    overlapping date range a no-op instead of a duplicate.
+    """
+
+    __tablename__ = "ibkr_executions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transaction_id = Column(Text, nullable=False, unique=True)
+    symbol = Column(Text, nullable=False)
+    # Signed as IBKR reports it: positive bought, negative sold.
+    quantity = Column(Integer, nullable=False)
+    price = Column(Numeric(14, 6), nullable=True)
+    commission = Column(Numeric(14, 6), nullable=True)
+    execution_time = Column(DateTime(timezone=True), nullable=True)
+    processed = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 async def get_session():
     async with SessionLocal() as session:
         yield session
@@ -282,6 +304,141 @@ async def complete_trade(
     await session.commit()
     await session.refresh(trade)
     return TradeOut.model_validate(trade)
+
+
+# ---------------------------------------------------------------------------
+# IBKR automated ingestion
+# ---------------------------------------------------------------------------
+
+
+class IngestResult(BaseModel):
+    """Outcome of one ingest run, at each stage of the pipeline."""
+
+    executions_parsed: int
+    staged_new: int
+    staged_duplicates: int
+    trades_created: int
+    trades_duplicates: int
+    positions_matched: int
+    symbols_touched: list[str]
+    fractional_quantities: int
+
+
+@app.post("/api/ingest/ibkr", response_model=IngestResult)
+async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
+    """Fetch, stage, promote, and match IBKR executions.
+
+    Pipeline, each step idempotent:
+      1. Flex handshake -> statement XML
+      2. Parse into normalized executions
+      3. Batch upsert into `ibkr_executions` (ON CONFLICT DO NOTHING on
+         transaction_id) -- the absolute duplicate guard
+      4. Promote only genuinely new rows into `trades`
+      5. Re-run FIFO matching for each affected symbol
+    """
+    from services import ibkr_client, ibkr_parser  # noqa: PLC0415 - import cycle
+    from services.matching_engine import (  # noqa: PLC0415
+        UNCLASSIFIED_STYLE,
+        run_matching_for_ticker,
+    )
+
+    # --- 1 & 2: fetch and parse -------------------------------------------
+    try:
+        root = await ibkr_client.fetch_statement()
+    except ibkr_client.IBKRError as exc:
+        # Transient "still compiling" conditions are a 503 so callers retry;
+        # everything else is an upstream failure.
+        raise HTTPException(status_code=503 if exc.retryable else 502, detail=str(exc))
+
+    executions = ibkr_parser.parse_statement(root)
+    if not executions:
+        return IngestResult(
+            executions_parsed=0,
+            staged_new=0,
+            staged_duplicates=0,
+            trades_created=0,
+            trades_duplicates=0,
+            positions_matched=0,
+            symbols_touched=[],
+            fractional_quantities=0,
+        )
+
+    # --- 3: stage, skipping anything already seen -------------------------
+    staging_rows = [ibkr_parser.to_staging_row(e) for e in executions]
+    staged_stmt = (
+        pg_insert(IBKRExecution)
+        .values(staging_rows)
+        .on_conflict_do_nothing(index_elements=["transaction_id"])
+        .returning(IBKRExecution.transaction_id)
+    )
+    staged_ids = {row[0] for row in (await session.execute(staged_stmt)).fetchall()}
+
+    # Only executions that were genuinely new to staging get promoted; the rest
+    # were ingested on a previous run and already have a trades row.
+    new_executions = [e for e in executions if e.transaction_id in staged_ids]
+
+    # --- 4: promote into the trades ledger --------------------------------
+    trade_rows = [
+        {
+            "id": uuid.uuid4(),
+            # Namespaced so a manual entry can never collide with a broker fill.
+            "ibkr_exec_id": f"IBKR-{e.transaction_id}"[:100],
+            "ticker": e.symbol[:10],
+            "direction": e.side,
+            "style": UNCLASSIFIED_STYLE,
+            "status": TradeStatus.pending_review.value,
+            "entry_date": e.execution_time or datetime.now(MARKET_TZ),
+            # IBKR's execution price is the fill actually received.
+            "actual_entry": e.price if e.price is not None else 0,
+            # Side lives in `direction`; store magnitude only.
+            "quantity": e.abs_quantity,
+            "source_tag": "IBKR",
+        }
+        for e in new_executions
+        if e.price is not None
+    ]
+
+    created_ids: list[str] = []
+    if trade_rows:
+        trade_stmt = (
+            pg_insert(Trade)
+            .values(trade_rows)
+            .on_conflict_do_nothing(index_elements=["ibkr_exec_id"])
+            .returning(Trade.ibkr_exec_id)
+        )
+        created_ids = [row[0] for row in (await session.execute(trade_stmt)).fetchall()]
+
+    # Mark staged rows processed so a later failure does not re-promote them.
+    if staged_ids:
+        await session.execute(
+            update(IBKRExecution)
+            .where(IBKRExecution.transaction_id.in_(staged_ids))
+            .values(processed=True)
+        )
+
+    await session.commit()
+
+    # --- 5: re-run FIFO for every affected symbol -------------------------
+    symbols = sorted({e.symbol for e in new_executions})
+    positions_matched = 0
+    for symbol in symbols:
+        result = await run_matching_for_ticker(session, symbol, persist=True)
+        positions_matched += len(result.positions)
+
+    return IngestResult(
+        executions_parsed=len(executions),
+        staged_new=len(staged_ids),
+        staged_duplicates=len(executions) - len(staged_ids),
+        trades_created=len(created_ids),
+        trades_duplicates=len(trade_rows) - len(created_ids),
+        positions_matched=positions_matched,
+        symbols_touched=symbols,
+        # Fills IBKR reported fractionally that had to be rounded to satisfy
+        # the INTEGER ledger column; each one is also logged as a warning.
+        fractional_quantities=sum(
+            1 for e in new_executions if e.quantity_was_rounded
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
