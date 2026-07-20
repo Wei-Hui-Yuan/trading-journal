@@ -1,12 +1,9 @@
 /**
  * Types mirroring the FastAPI backend response models.
  *
- * Kept separate from `types/trade.ts`, which describes the older raw-execution
- * (`trades` table) shape. This file covers the positions/strategies/analytics
- * layer the UI is being rebuilt on.
- *
- * Field names match the API payloads exactly (snake_case) so responses can be
- * consumed without a mapping step.
+ * The single source of truth for API shapes. Field names match the payloads
+ * exactly (snake_case) so responses are consumed without a mapping step; the
+ * one exception is `KPIStats` at the bottom, a camelCase presentation shape.
  */
 
 // ---------------------------------------------------------------------------
@@ -291,4 +288,24 @@ export interface AdvancedMetrics {
   slippage_sample: number;
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard view models
+// ---------------------------------------------------------------------------
+
+/**
+ * View model for the KPI stat strip.
+ *
+ * camelCase because it is a presentation shape, not an API payload -- it is
+ * mapped from `CoreStats` in the dashboard page.
+ */
+export interface KPIStats {
+  netPnl: number;
+  winRate: number;
+  totalTrades: number;
+  /** null when there are no losing trades - the ratio is unbounded. */
+  profitFactor: number | null;
+  avgRoi: number;
+  pendingCount: number;
 }

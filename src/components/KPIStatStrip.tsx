@@ -1,5 +1,5 @@
 import React from 'react';
-import { KPIStats } from '@/types/trade';
+import type { KPIStats } from '@/types/api';
 import { TrendingUp, TrendingDown, Target, BarChart2, DollarSign, Clock, ShieldAlert } from 'lucide-react';
 
 interface KPIStatStripProps {

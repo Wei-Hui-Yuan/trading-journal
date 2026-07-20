@@ -65,11 +65,6 @@ class Base(DeclarativeBase):
     pass
 
 
-class TradeStatus(str, Enum):
-    pending_review = "pending_review"
-    completed = "completed"
-
-
 class ReviewStatus(str, Enum):
     """Lifecycle of a position's qualitative review.
 
@@ -107,7 +102,6 @@ class Trade(Base):
     ticker = Column(String(10), nullable=False)
     direction = Column(String(5), nullable=False)
     style = Column(String(15), nullable=False)
-    status = Column(String(20), default=TradeStatus.pending_review.value)
     entry_date = Column(DateTime(timezone=True), nullable=False)
     exit_date = Column(DateTime(timezone=True), nullable=True)
     actual_entry = Column(Numeric(10, 4), nullable=False)
@@ -124,7 +118,6 @@ class Trade(Base):
     market_regime = Column(String(20), nullable=True)
     source_tag = Column(String(10), default="Own")
     screenshot_url = Column(Text, nullable=True)
-    lessons_comments = Column(Text, nullable=True)
     hard_sl_set = Column(Boolean, default=True)
     waited_retest = Column(Boolean, default=True)
     followed_plan = Column(Boolean, default=True)
@@ -222,98 +215,6 @@ app.add_middleware(
 )
 
 
-class TradeManualUpdate(BaseModel):
-    """Manual planning + qualitative fields only.
-
-    IBKR-populated execution fields (actual_entry, exit_price, quantity,
-    entry_date, exit_date, ticker, direction, ibkr_exec_id) are intentionally
-    excluded and cannot be modified through this endpoint.
-    """
-
-    planned_entry: Optional[float] = None
-    stop_loss: Optional[float] = None
-    target: Optional[float] = None
-    risk_percent: Optional[float] = Field(None, gt=0)
-    strategy_id: Optional[uuid.UUID] = None
-    style: Optional[str] = Field(None, max_length=15)
-    grade: Optional[str] = Field(None, min_length=1, max_length=1)
-    market_regime: Optional[str] = Field(None, max_length=20)
-    source_tag: Optional[str] = Field(None, max_length=10)
-    screenshot_url: Optional[str] = None
-    lessons_comments: Optional[str] = None
-    hard_sl_set: Optional[bool] = None
-    waited_retest: Optional[bool] = None
-    followed_plan: Optional[bool] = None
-
-
-class TradeOut(BaseModel):
-    id: uuid.UUID
-    ibkr_exec_id: Optional[str]
-    ticker: str
-    direction: str
-    style: str
-    status: str
-    entry_date: datetime
-    exit_date: Optional[datetime]
-    actual_entry: float
-    exit_price: Optional[float]
-    quantity: int
-    planned_entry: Optional[float]
-    stop_loss: Optional[float]
-    target: Optional[float]
-    risk_percent: Optional[float]
-    strategy_id: Optional[uuid.UUID]
-    grade: Optional[str]
-    market_regime: Optional[str]
-    source_tag: Optional[str]
-    screenshot_url: Optional[str]
-    lessons_comments: Optional[str]
-    hard_sl_set: Optional[bool]
-    waited_retest: Optional[bool]
-    followed_plan: Optional[bool]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-@app.get("/api/trades")
-async def get_trades_grouped_by_status(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(Trade))
-    trades = result.scalars().all()
-
-    grouped: dict[str, list[TradeOut]] = {}
-    for trade in trades:
-        grouped.setdefault(trade.status, []).append(TradeOut.model_validate(trade))
-    return grouped
-
-
-@app.put("/api/trades/{trade_id}")
-async def complete_trade(
-    trade_id: uuid.UUID,
-    params: TradeManualUpdate,
-    session: AsyncSession = Depends(get_session),
-):
-    trade = await session.get(Trade, trade_id)
-    if trade is None:
-        raise HTTPException(status_code=404, detail="Trade not found")
-
-    if trade.status != TradeStatus.pending_review.value:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Trade {trade_id} is not pending review (current status: {trade.status})",
-        )
-
-    updates = params.model_dump(exclude_unset=True)
-    for field, value in updates.items():
-        setattr(trade, field, value)
-    trade.status = TradeStatus.completed.value
-
-    await session.commit()
-    await session.refresh(trade)
-    return TradeOut.model_validate(trade)
-
-
 # ---------------------------------------------------------------------------
 # IBKR automated ingestion
 # ---------------------------------------------------------------------------
@@ -394,7 +295,6 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             "ticker": e.symbol[:10],
             "direction": e.side,
             "style": UNCLASSIFIED_STYLE,
-            "status": TradeStatus.pending_review.value,
             "entry_date": e.execution_time or datetime.now(MARKET_TZ),
             # IBKR's execution price is the fill actually received.
             "actual_entry": e.price if e.price is not None else 0,
@@ -547,7 +447,6 @@ async def create_manual_trade(
         ticker=params.symbol,
         direction=params.side,
         style=UNCLASSIFIED_STYLE,
-        status=TradeStatus.pending_review.value,
         entry_date=executed_at,
         # The form's price field is explicitly the fill actually received.
         actual_entry=params.price,

@@ -6,7 +6,7 @@ import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
-import { KPIStats } from '@/types/trade';
+import type { KPIStats } from '@/types/api';
 import {
   usePendingPositions,
   useDashboardStats,
