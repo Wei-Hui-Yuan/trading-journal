@@ -53,7 +53,7 @@ export interface StrategyUpdatePayload {
 // ---------------------------------------------------------------------------
 
 /** Lifecycle of a position in the Trade Inbox. */
-export type ReviewStatus = 'pending' | 'completed';
+export type ReviewStatus = 'pending' | 'reviewed';
 
 /** Holding-period buckets assigned by the FIFO matching engine. */
 export type TradeStyle = 'Scalp' | 'Day Trade' | 'Swing Trade';
@@ -82,6 +82,10 @@ export interface Position {
   tag_retest: boolean | null;
   tag_plan_compliant: boolean | null;
   trade_grade: string | null;
+  /** Free-form review notes (migration 007, moved here from trades). */
+  notes: string | null;
+  /** Behavioural tags, e.g. ['FOMO', 'Chased']. */
+  mistakes: string[];
 
   created_at: string | null;
 }
@@ -99,6 +103,8 @@ export interface PositionReviewPayload {
   tag_retest?: boolean;
   tag_plan_compliant?: boolean;
   trade_grade?: string | null;
+  notes?: string | null;
+  mistakes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -251,38 +257,8 @@ export interface DashboardStats {
 }
 
 // ---------------------------------------------------------------------------
-// Trade review & advanced analytics (Phase 5)
+// Advanced analytics
 // ---------------------------------------------------------------------------
-
-export type TradeReviewStatus = 'pending' | 'reviewed';
-
-/** An execution in the qualitative review queue. */
-export interface TradeReview {
-  id: string;
-  ticker: string;
-  direction: string;
-  quantity: number;
-  actual_entry: number;
-  exit_price: number | null;
-  planned_entry: number | null;
-  stop_loss: number | null;
-  target: number | null;
-  entry_date: string;
-  review_status: TradeReviewStatus | null;
-  notes: string | null;
-  /** Behavioural tags, e.g. ['FOMO', 'Chased']. */
-  mistakes: string[];
-  strategy_id: string | null;
-}
-
-/**
- * Body for PUT /api/trades/{id}/review.
- * Omitted keys are left untouched; the server always sets review_status.
- */
-export interface TradeReviewPayload {
-  notes?: string | null;
-  mistakes?: string[];
-}
 
 export interface MistakeBreakdown {
   mistake: string;

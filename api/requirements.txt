@@ -5,3 +5,6 @@ asyncpg>=0.29
 httpx>=0.27
 python-dotenv>=1.0
 pydantic>=2.6
+
+# Test suite (api/tests) -- run with: python -m pytest tests/
+pytest>=8.0

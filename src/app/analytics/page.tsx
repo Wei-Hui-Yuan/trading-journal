@@ -16,10 +16,10 @@ import {
 
 import {
   useAdvancedMetrics,
-  useReviewTrade,
-  useTradeReviewQueue,
+  usePendingPositions,
+  useReviewPosition,
 } from '@/hooks/useTradeInbox';
-import type { AdvancedMetrics, TradeReview } from '@/types/api';
+import type { AdvancedMetrics, Position } from '@/types/api';
 
 /** Common behavioural tags, offered as chips. Free text is also allowed. */
 const MISTAKE_TAGS = [
@@ -162,27 +162,27 @@ function MistakeBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
 }
 
 function ReviewDrawer({
-  trade,
+  position,
   onClose,
 }: {
-  trade: TradeReview | null;
+  position: Position | null;
   onClose: () => void;
 }) {
   const [notes, setNotes] = useState('');
   const [tags, setTags] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const mutation = useReviewTrade();
+  const mutation = useReviewPosition();
 
-  // Reload the draft whenever a different trade is opened.
+  // Reload the draft whenever a different position is opened.
   useEffect(() => {
-    if (trade) {
-      setNotes(trade.notes ?? '');
-      setTags(trade.mistakes ?? []);
+    if (position) {
+      setNotes(position.notes ?? '');
+      setTags(position.mistakes ?? []);
       setError(null);
     }
-  }, [trade]);
+  }, [position]);
 
-  if (!trade) return null;
+  if (!position) return null;
 
   const toggleTag = (tag: string) =>
     setTags((prev) =>
@@ -192,7 +192,7 @@ function ReviewDrawer({
   const handleSave = () => {
     setError(null);
     mutation.mutate(
-      { id: trade.id, payload: { notes, mistakes: tags } },
+      { id: position.id, payload: { notes, mistakes: tags } },
       { onSuccess: onClose, onError: (e) => setError(e.message) }
     );
   };
@@ -209,11 +209,15 @@ function ReviewDrawer({
         <div className="flex items-center justify-between px-5 py-4 border-b border-obsidian-border sticky top-0 bg-obsidian-card">
           <div>
             <h2 className="text-sm font-semibold text-slate-100">
-              Review {trade.ticker}
+              Review {position.symbol}
             </h2>
             <p className="text-[11px] text-obsidian-muted font-mono">
-              {trade.direction} {trade.quantity} @ {trade.actual_entry}
-              {trade.exit_price !== null && ` → ${trade.exit_price}`}
+              {position.quantity} @ {position.entry_price} → {position.exit_price}
+              {' · '}
+              <span className={position.realized_pnl >= 0 ? 'text-win' : 'text-loss'}>
+                {position.realized_pnl >= 0 ? '+' : ''}
+                {position.realized_pnl.toFixed(2)}
+              </span>
             </p>
           </div>
           <button
@@ -234,7 +238,9 @@ function ReviewDrawer({
             </span>
             <textarea
               value={notes}
-              onChange={(e) => setNotes(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
+                setNotes(e.target.value)
+              }
               disabled={isSaving}
               rows={8}
               placeholder="What was the setup? What did you see? What would you do differently?"
@@ -317,8 +323,9 @@ function ReviewDrawer({
 
 export default function AnalyticsPage() {
   const metricsQuery = useAdvancedMetrics();
-  const queueQuery = useTradeReviewQueue('pending');
-  const [selected, setSelected] = useState<TradeReview | null>(null);
+  // Same hook the dashboard Trade Inbox uses -- one queue, one lifecycle.
+  const queueQuery = usePendingPositions();
+  const [selected, setSelected] = useState<Position | null>(null);
 
   const m = metricsQuery.data;
   const queue = queueQuery.data ?? [];
@@ -463,35 +470,34 @@ export default function AnalyticsPage() {
             </div>
           ) : (
             <ul className="space-y-2">
-              {queue.map((trade) => (
-                <li key={trade.id}>
+              {queue.map((position) => (
+                <li key={position.id}>
                   <button
                     type="button"
-                    onClick={() => setSelected(trade)}
+                    onClick={() => setSelected(position)}
                     className="w-full flex items-center justify-between rounded-lg border border-obsidian-border bg-obsidian-bg/50 px-4 py-3 text-left hover:border-slate-600 transition-colors"
                   >
                     <div className="flex items-center gap-3">
                       <span className="font-semibold text-slate-100">
-                        {trade.ticker}
+                        {position.symbol}
                       </span>
-                      <span
-                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
-                          trade.direction === 'BUY'
-                            ? 'border-win/30 bg-win/10 text-win'
-                            : 'border-loss/30 bg-loss/10 text-loss'
-                        }`}
-                      >
-                        {trade.direction}
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-obsidian-border bg-obsidian-bg text-slate-300">
+                        {position.style}
                       </span>
                       <span className="text-[11px] font-mono text-obsidian-muted">
-                        {trade.quantity} @ {trade.actual_entry}
-                        {trade.stop_loss !== null && ` · stop ${trade.stop_loss}`}
+                        {position.quantity} @ {position.entry_price} →{' '}
+                        {position.exit_price}
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
-                      {trade.exit_price === null && (
-                        <span className="text-[10px] text-obsidian-muted">open</span>
-                      )}
+                      <span
+                        className={`text-xs font-mono font-semibold ${
+                          position.realized_pnl >= 0 ? 'text-win' : 'text-loss'
+                        }`}
+                      >
+                        {position.realized_pnl >= 0 ? '+' : ''}
+                        {position.realized_pnl.toFixed(2)}
+                      </span>
                       <TrendingDown className="h-3.5 w-3.5 text-obsidian-muted" />
                     </div>
                   </button>
@@ -502,7 +508,7 @@ export default function AnalyticsPage() {
         </section>
       </main>
 
-      <ReviewDrawer trade={selected} onClose={() => setSelected(null)} />
+      <ReviewDrawer position={selected} onClose={() => setSelected(null)} />
     </div>
   );
 }

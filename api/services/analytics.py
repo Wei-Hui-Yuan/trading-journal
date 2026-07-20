@@ -465,29 +465,59 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
 
 
 async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
-    """Read closed executions from the trades ledger."""
-    from main import Trade  # noqa: PLC0415 - deferred to avoid circular import
+    """Assemble scoreable round trips by joining positions to their opening fill.
 
-    rows = (await session.execute(select(Trade))).scalars().all()
+    Neither table alone is sufficient:
 
-    return [
-        ReviewedTrade(
-            trade_id=str(row.id),
-            ticker=row.ticker,
-            direction=row.direction or "",
-            quantity=int(row.quantity or 0),
-            actual_entry=Decimal(str(row.actual_entry)),
-            exit_price=Decimal(str(row.exit_price)) if row.exit_price is not None else None,
-            planned_entry=(
-                Decimal(str(row.planned_entry)) if row.planned_entry is not None else None
-            ),
-            stop_loss=Decimal(str(row.stop_loss)) if row.stop_loss is not None else None,
-            mistakes=list(row.mistakes or []),
-            review_status=row.review_status,
+      * `positions` holds what happened -- entry, exit, and the qualitative
+        review (notes, mistake tags, review status).
+      * `trades` holds what was INTENDED -- stop_loss and planned_entry, which
+        R-multiple and slippage are measured against.
+
+    Reading exits from `trades` does not work: the matching engine writes the
+    exit onto the position and leaves the execution ledger immutable, so a
+    matched round trip has `trades.exit_price = NULL`.
+    """
+    from main import Position, Trade  # noqa: PLC0415 - deferred, avoids a cycle
+
+    positions = (await session.execute(select(Position))).scalars().all()
+    trades = (await session.execute(select(Trade))).scalars().all()
+    trade_by_id = {str(t.id): t for t in trades}
+
+    reviewed: list[ReviewedTrade] = []
+    for position in positions:
+        if position.entry_price is None or position.exit_price is None:
+            continue
+
+        # The opening execution carries the plan for this round trip.
+        opening = trade_by_id.get(str(position.open_trade_id))
+
+        # Direction comes from the opening fill; a position does not store it.
+        direction = (opening.direction if opening else "") or "BUY"
+
+        reviewed.append(
+            ReviewedTrade(
+                trade_id=str(position.id),
+                ticker=position.symbol,
+                direction=direction,
+                quantity=int(position.quantity or 0),
+                actual_entry=Decimal(str(position.entry_price)),
+                exit_price=Decimal(str(position.exit_price)),
+                planned_entry=(
+                    Decimal(str(opening.planned_entry))
+                    if opening is not None and opening.planned_entry is not None
+                    else None
+                ),
+                stop_loss=(
+                    Decimal(str(opening.stop_loss))
+                    if opening is not None and opening.stop_loss is not None
+                    else None
+                ),
+                mistakes=list(position.mistakes or []),
+                review_status=position.review_status,
+            )
         )
-        for row in rows
-        if row.actual_entry is not None
-    ]
+    return reviewed
 
 
 async def build_advanced_analytics(session: AsyncSession) -> dict[str, Any]:

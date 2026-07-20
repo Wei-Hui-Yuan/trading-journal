@@ -11,9 +11,6 @@ import type {
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
-  TradeReview,
-  TradeReviewPayload,
-  TradeReviewStatus,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -123,28 +120,6 @@ export async function getAdvancedMetrics(): Promise<AdvancedMetrics> {
   return data;
 }
 
-/** GET /api/trades/review-queue - executions awaiting qualitative review. */
-export async function getTradeReviewQueue(
-  reviewStatus: TradeReviewStatus = 'pending'
-): Promise<TradeReview[]> {
-  const { data } = await apiClient.get<TradeReview[]>('/trades/review-queue', {
-    params: { review_status: reviewStatus },
-  });
-  return data;
-}
-
-/** PUT /api/trades/{id}/review - save notes + mistake tags, mark reviewed. */
-export async function reviewTrade(
-  id: string,
-  payload: TradeReviewPayload
-): Promise<TradeReview> {
-  const { data } = await apiClient.put<TradeReview>(
-    `/trades/${id}/review`,
-    payload
-  );
-  return data;
-}
-
 /** GET /api/analytics/dashboard â€” core stats plus the heatmap grid. */
 export async function getDashboardAnalytics(): Promise<DashboardStats> {
   const { data } = await apiClient.get<DashboardStats>('/analytics/dashboard');
@@ -161,7 +136,7 @@ export async function updatePositionReview(
   id: string,
   payload: PositionReviewPayload
 ): Promise<Position> {
-  const { data } = await apiClient.patch<Position>(
+  const { data } = await apiClient.put<Position>(
     `/positions/${id}/review`,
     payload
   );

@@ -71,10 +71,15 @@ class TradeStatus(str, Enum):
 
 
 class ReviewStatus(str, Enum):
-    """Lifecycle of a position in the Trade Inbox."""
+    """Lifecycle of a position's qualitative review.
+
+    One vocabulary for every surface: the Trade Inbox checklist and the
+    Analytics notes/mistakes drawer both terminate at 'reviewed', so a single
+    `review_status = 'pending'` filter drives both queues.
+    """
 
     pending = "pending"
-    completed = "completed"
+    reviewed = "reviewed"
 
 
 class Strategy(Base):
@@ -125,11 +130,6 @@ class Trade(Base):
     followed_plan = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Qualitative review pass (migration 006). Distinct from `status`, which
-    # tracks the execution lifecycle rather than whether a human has reviewed it.
-    review_status = Column(Text, default="pending")
-    notes = Column(Text, nullable=True)
-    mistakes = Column(ARRAY(Text), default=list)
 
 
 class Position(Base):
@@ -171,6 +171,11 @@ class Position(Base):
     tag_retest = Column(Boolean, default=False)
     tag_plan_compliant = Column(Boolean, default=False)
     trade_grade = Column(String(5), nullable=True)
+
+    # Qualitative review (migration 007). Consolidated here from `trades` so a
+    # round trip has exactly one review state.
+    notes = Column(Text, nullable=True)
+    mistakes = Column(ARRAY(Text), default=list)
 
 
 class IBKRExecution(Base):
@@ -691,10 +696,12 @@ async def update_strategy(
 
 
 class PositionReviewUpdate(BaseModel):
-    """Checklist payload from the Trade Inbox.
+    """Review payload for a round trip.
 
-    Every field is optional; only those present in the request body are
-    applied, so a partial save never clears untouched fields.
+    Covers both surfaces that review a position: the Trade Inbox checklist
+    (strategy / discipline tags / grade) and the Analytics drawer (notes and
+    behavioural mistake tags). Every field is optional and only keys present
+    in the request are applied, so one surface never clears the other's work.
     """
 
     strategy_id: Optional[uuid.UUID] = None
@@ -702,6 +709,9 @@ class PositionReviewUpdate(BaseModel):
     tag_retest: Optional[bool] = None
     tag_plan_compliant: Optional[bool] = None
     trade_grade: Optional[str] = Field(None, max_length=5)
+    notes: Optional[str] = None
+    # Behavioural tags, e.g. ['FOMO', 'Chased', 'Early Liquidation'].
+    mistakes: Optional[list[str]] = None
 
 
 class PositionOut(BaseModel):
@@ -720,7 +730,14 @@ class PositionOut(BaseModel):
     tag_retest: Optional[bool]
     tag_plan_compliant: Optional[bool]
     trade_grade: Optional[str]
+    notes: Optional[str]
+    mistakes: list[str] = []
     created_at: Optional[datetime]
+
+    @field_validator("mistakes", mode="before")
+    @classmethod
+    def _null_to_list(cls, value: Optional[list[str]]) -> list[str]:
+        return list(value or [])
 
     class Config:
         from_attributes = True
@@ -743,6 +760,10 @@ async def list_positions(
     return [PositionOut.model_validate(p) for p in result.scalars().all()]
 
 
+# Both verbs hit the same handler: PUT is the documented route, PATCH is
+# retained because the Trade Inbox already calls it. The body is a partial
+# update either way (exclude_unset), which is why PATCH remains accurate.
+@app.put("/api/positions/{position_id}/review", response_model=PositionOut)
 @app.patch("/api/positions/{position_id}/review", response_model=PositionOut)
 async def review_position(
     position_id: uuid.UUID,
@@ -765,10 +786,21 @@ async def review_position(
                 status_code=400, detail=f"Strategy {strategy_id} does not exist"
             )
 
+    if "mistakes" in updates:
+        # Trim, drop blanks, de-duplicate while preserving order.
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for tag in updates["mistakes"] or []:
+            tag = (tag or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                cleaned.append(tag)
+        updates["mistakes"] = cleaned
+
     for field, value in updates.items():
         setattr(position, field, value)
 
-    position.review_status = ReviewStatus.completed.value
+    position.review_status = ReviewStatus.reviewed.value
 
     await session.commit()
     await session.refresh(position)
@@ -798,91 +830,4 @@ async def analytics_advanced(session: AsyncSession = Depends(get_session)):
     from services.analytics import build_advanced_analytics
 
     return await build_advanced_analytics(session)
-
-
-# ---------------------------------------------------------------------------
-# Trade review (qualitative pass)
-# ---------------------------------------------------------------------------
-
-
-class TradeReviewUpdate(BaseModel):
-    """Qualitative review of a single execution."""
-
-    notes: Optional[str] = None
-    # Behavioural tags, e.g. ['FOMO', 'Chased', 'Early Liquidation'].
-    mistakes: Optional[list[str]] = None
-
-
-class TradeReviewOut(BaseModel):
-    id: uuid.UUID
-    ticker: str
-    direction: str
-    quantity: int
-    actual_entry: float
-    exit_price: Optional[float]
-    planned_entry: Optional[float]
-    stop_loss: Optional[float]
-    target: Optional[float]
-    entry_date: datetime
-    review_status: Optional[str]
-    notes: Optional[str]
-    mistakes: list[str] = []
-    strategy_id: Optional[uuid.UUID]
-
-    @field_validator("mistakes", mode="before")
-    @classmethod
-    def _null_to_list(cls, value: Optional[list[str]]) -> list[str]:
-        return list(value or [])
-
-    class Config:
-        from_attributes = True
-
-
-@app.get("/api/trades/review-queue", response_model=list[TradeReviewOut])
-async def trade_review_queue(
-    review_status: str = "pending",
-    session: AsyncSession = Depends(get_session),
-):
-    """Executions awaiting (or having completed) the qualitative review pass."""
-    stmt = (
-        select(Trade)
-        .where(Trade.review_status == review_status)
-        .order_by(Trade.entry_date.desc())
-    )
-    result = await session.execute(stmt)
-    return [TradeReviewOut.model_validate(t) for t in result.scalars().all()]
-
-
-@app.put("/api/trades/{trade_id}/review", response_model=TradeReviewOut)
-async def review_trade(
-    trade_id: uuid.UUID,
-    params: TradeReviewUpdate,
-    session: AsyncSession = Depends(get_session),
-):
-    """Record notes and behavioural tags, and mark the trade reviewed."""
-    trade = await session.get(Trade, trade_id)
-    if trade is None:
-        raise HTTPException(status_code=404, detail="Trade not found")
-
-    # Only fields present in the body are applied, so saving notes alone does
-    # not wipe previously recorded mistakes.
-    updates = params.model_dump(exclude_unset=True)
-    if "notes" in updates:
-        trade.notes = updates["notes"]
-    if "mistakes" in updates:
-        # Normalize: trim, drop blanks, de-duplicate while keeping order.
-        seen: set[str] = set()
-        cleaned: list[str] = []
-        for tag in updates["mistakes"] or []:
-            tag = (tag or "").strip()
-            if tag and tag not in seen:
-                seen.add(tag)
-                cleaned.append(tag)
-        trade.mistakes = cleaned
-
-    trade.review_status = "reviewed"
-
-    await session.commit()
-    await session.refresh(trade)
-    return TradeReviewOut.model_validate(trade)
 
