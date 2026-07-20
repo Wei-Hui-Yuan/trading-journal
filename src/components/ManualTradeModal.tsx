@@ -12,13 +12,42 @@ interface ManualTradeModalProps {
   onClose: () => void;
 }
 
+/**
+ * All numeric fields are held as strings.
+ *
+ * A controlled number input must be able to represent "empty" and mid-typing
+ * states ("1.", "-") that Number() would mangle into NaN. They are parsed once,
+ * at submit, by `toNullableNumber`.
+ */
 interface FormState {
   symbol: string;
   side: TradeSide;
   quantity: string;
-  price: string;
   executionTime: string;
+  // The plan
+  plannedEntry: string;
+  plannedStopLoss: string;
+  takeProfitPrice: string;
+  // The execution
+  price: string; // actual entry — required
+  exitPrice: string; // blank while the trade is still running
 }
+
+/** '' / whitespace / unparseable -> null, so the API never receives NaN. */
+function toNullableNumber(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Payload key -> the form field it came from, for targeted error messages. */
+const fieldForKey = {
+  planned_entry: 'plannedEntry',
+  planned_stop_loss: 'plannedStopLoss',
+  take_profit_price: 'takeProfitPrice',
+  exit_price: 'exitPrice',
+} as const satisfies Record<string, keyof FormState>;
 
 /**
  * "now" formatted for a datetime-local input, in US market time.
@@ -48,8 +77,12 @@ const blankForm = (): FormState => ({
   symbol: '',
   side: 'BUY',
   quantity: '',
-  price: '',
   executionTime: nowInMarketTz(),
+  plannedEntry: '',
+  plannedStopLoss: '',
+  takeProfitPrice: '',
+  price: '',
+  exitPrice: '',
 });
 
 export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
@@ -108,7 +141,31 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
     if (!Number.isInteger(quantity))
       return setError('Quantity must be a whole number of shares.');
     if (!Number.isFinite(price) || price <= 0)
-      return setError('Execution price must be greater than zero.');
+      return setError('Actual entry price must be greater than zero.');
+
+    // Optional fields: blank stays blank (null). A value that is present must
+    // still be a positive number, or the API would reject it with a less
+    // specific message.
+    const optional = {
+      planned_entry: toNullableNumber(form.plannedEntry),
+      planned_stop_loss: toNullableNumber(form.plannedStopLoss),
+      take_profit_price: toNullableNumber(form.takeProfitPrice),
+      exit_price: toNullableNumber(form.exitPrice),
+    };
+    const labels: Record<keyof typeof optional, string> = {
+      planned_entry: 'Planned entry',
+      planned_stop_loss: 'Planned stop loss',
+      take_profit_price: 'Take profit price',
+      exit_price: 'Exit price',
+    };
+    for (const [key, value] of Object.entries(optional)) {
+      const typedKey = key as keyof typeof optional;
+      // Non-empty but unparseable, or non-positive.
+      if (value === null && form[fieldForKey[typedKey]].trim() !== '')
+        return setError(`${labels[typedKey]} must be a number.`);
+      if (value !== null && value <= 0)
+        return setError(`${labels[typedKey]} must be greater than zero.`);
+    }
 
     mutation.mutate(
       {
@@ -118,6 +175,7 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
         price,
         // Sent without an offset; the backend anchors it to America/New_York.
         execution_time: form.executionTime ? `${form.executionTime}:00` : null,
+        ...optional,
       },
       {
         onSuccess: (result) => {
@@ -181,7 +239,11 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="px-5 py-5 space-y-4">
+        <form
+          onSubmit={handleSubmit}
+          className="px-5 py-5 space-y-4 max-h-[75vh] overflow-y-auto"
+        >
+          {/* ---- Section 1: core details ---- */}
           <label className="block">
             <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
               Ticker
@@ -250,37 +312,127 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
 
             <label className="block">
               <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-                Price
+                Execution Time (ET)
               </span>
               <input
-                type="number"
-                inputMode="decimal"
-                step="0.0001"
-                min="0"
-                value={form.price}
-                onChange={(e) => patch({ price: e.target.value })}
+                type="datetime-local"
+                value={form.executionTime}
+                onChange={(e) => patch({ executionTime: e.target.value })}
                 disabled={isSaving}
-                placeholder="150.25"
                 className={`mt-1 font-mono ${fieldClass}`}
               />
             </label>
           </div>
+          <span className="block -mt-2 text-[10px] text-obsidian-muted">
+            Times are US market time — matches how sessions are bucketed.
+          </span>
 
-          <label className="block">
-            <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-              Execution Time (ET)
-            </span>
-            <input
-              type="datetime-local"
-              value={form.executionTime}
-              onChange={(e) => patch({ executionTime: e.target.value })}
-              disabled={isSaving}
-              className={`mt-1 font-mono ${fieldClass}`}
-            />
-            <span className="text-[10px] text-obsidian-muted">
-              US market time — matches how sessions are bucketed.
-            </span>
-          </label>
+          {/* ---- Section 2: the plan ---- */}
+          <fieldset className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 px-3 pb-3 pt-2">
+            <legend className="px-1.5 text-[10px] font-semibold uppercase tracking-wider text-obsidian-muted">
+              The Plan · Risk Setup
+            </legend>
+            <div className="grid grid-cols-3 gap-2">
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Plan Entry
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.0001"
+                  min="0"
+                  value={form.plannedEntry}
+                  onChange={(e) => patch({ plannedEntry: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="150.00"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Plan Stop
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.0001"
+                  min="0"
+                  value={form.plannedStopLoss}
+                  onChange={(e) => patch({ plannedStopLoss: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="148.00"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Take Profit
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.0001"
+                  min="0"
+                  value={form.takeProfitPrice}
+                  onChange={(e) => patch({ takeProfitPrice: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="156.00"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+            </div>
+            <p className="mt-1.5 text-[10px] text-obsidian-muted">
+              Optional — leave blank if you did not pre-plan the trade.
+            </p>
+          </fieldset>
+
+          {/* ---- Section 3: the execution ---- */}
+          <fieldset className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 px-3 pb-3 pt-2">
+            <legend className="px-1.5 text-[10px] font-semibold uppercase tracking-wider text-obsidian-muted">
+              The Execution
+            </legend>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Actual Entry <span className="text-loss">*</span>
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.0001"
+                  min="0"
+                  value={form.price}
+                  onChange={(e) => patch({ price: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="150.25"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Exit Price
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.0001"
+                  min="0"
+                  value={form.exitPrice}
+                  onChange={(e) => patch({ exitPrice: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="still open"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+            </div>
+            <p className="mt-1.5 text-[10px] text-obsidian-muted">
+              Leave Exit Price blank while the trade is still running.
+            </p>
+          </fieldset>
 
           {error && (
             <div className="flex items-start text-xs text-loss">

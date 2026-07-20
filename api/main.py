@@ -299,9 +299,19 @@ class ManualTradeCreate(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=10)
     side: str = Field(..., description="BUY or SELL")
     quantity: float = Field(..., gt=0)
+    # The fill price actually received. Maps to trades.actual_entry (NOT NULL).
     price: float = Field(..., gt=0)
     # Omitted -> now in America/New_York. A naive value is read as market time.
     execution_time: Optional[datetime] = None
+
+    # --- Planning / risk setup (all optional) ---------------------------
+    # These map onto columns that already exist on the trades ledger; the two
+    # renamed ones are noted so the mapping is obvious at the call site.
+    planned_entry: Optional[float] = Field(None, gt=0)
+    planned_stop_loss: Optional[float] = Field(None, gt=0)  # -> trades.stop_loss
+    take_profit_price: Optional[float] = Field(None, gt=0)  # -> trades.target
+    # Left blank while a trade is still running.
+    exit_price: Optional[float] = Field(None, gt=0)
 
     @field_validator("symbol")
     @classmethod
@@ -336,6 +346,10 @@ class ManualTradeResult(BaseModel):
     quantity: int
     price: float
     execution_time: datetime
+    planned_entry: Optional[float]
+    planned_stop_loss: Optional[float]
+    take_profit_price: Optional[float]
+    exit_price: Optional[float]
     # Round trips the FIFO engine closed as a result of this execution.
     positions_created: int
     open_quantity: int
@@ -370,8 +384,16 @@ async def create_manual_trade(
         style=UNCLASSIFIED_STYLE,
         status=TradeStatus.pending_review.value,
         entry_date=executed_at,
+        # The form's price field is explicitly the fill actually received.
         actual_entry=params.price,
         quantity=int(params.quantity),
+        # Planning fields map onto the ledger's existing columns; stop_loss and
+        # target are the canonical homes for the planned stop and take-profit,
+        # and are what PUT /api/trades/{id} reads and writes.
+        planned_entry=params.planned_entry,
+        stop_loss=params.planned_stop_loss,
+        target=params.take_profit_price,
+        exit_price=params.exit_price,
         source_tag="Manual",
     )
     session.add(trade)
@@ -390,6 +412,10 @@ async def create_manual_trade(
         quantity=trade.quantity,
         price=float(trade.actual_entry),
         execution_time=trade.entry_date,
+        planned_entry=float(trade.planned_entry) if trade.planned_entry is not None else None,
+        planned_stop_loss=float(trade.stop_loss) if trade.stop_loss is not None else None,
+        take_profit_price=float(trade.target) if trade.target is not None else None,
+        exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
         positions_created=len(result.positions),
         open_quantity=result.open_quantity,
     )

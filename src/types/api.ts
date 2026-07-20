@@ -120,8 +120,19 @@ export interface ManualTradePayload {
   symbol: string;
   side: TradeSide;
   quantity: number;
+  /** The fill actually received. Maps to trades.actual_entry. */
   price: number;
   execution_time?: string | null;
+
+  // Planning / risk setup. All optional — send null, never '' or NaN.
+  // Server-side these land on existing ledger columns:
+  //   planned_stop_loss -> trades.stop_loss
+  //   take_profit_price -> trades.target
+  planned_entry?: number | null;
+  planned_stop_loss?: number | null;
+  take_profit_price?: number | null;
+  /** Left null while the trade is still running. */
+  exit_price?: number | null;
 }
 
 export interface ManualTradeResult {
@@ -131,6 +142,10 @@ export interface ManualTradeResult {
   quantity: number;
   price: number;
   execution_time: string;
+  planned_entry: number | null;
+  planned_stop_loss: number | null;
+  take_profit_price: number | null;
+  exit_price: number | null;
   /** Round trips the FIFO engine closed because of this execution. */
   positions_created: number;
   /** Shares left open on this ticker after matching. */
