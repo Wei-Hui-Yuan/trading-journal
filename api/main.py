@@ -362,6 +362,23 @@ class PositionOut(BaseModel):
         from_attributes = True
 
 
+@app.get("/api/positions", response_model=list[PositionOut])
+async def list_positions(
+    review_status: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """List closed positions, newest first.
+
+    `review_status=pending` backs the Trade Inbox queue.
+    """
+    stmt = select(Position).order_by(Position.exit_time.desc())
+    if review_status:
+        stmt = stmt.where(Position.review_status == review_status)
+
+    result = await session.execute(stmt)
+    return [PositionOut.model_validate(p) for p in result.scalars().all()]
+
+
 @app.patch("/api/positions/{position_id}/review", response_model=PositionOut)
 async def review_position(
     position_id: uuid.UUID,

@@ -1,4 +1,13 @@
+import axios from 'axios';
+
 import { Trade, KPIStats, HeatmapCell } from '@/types/trade';
+import type {
+  DashboardStats,
+  Position,
+  PositionReviewPayload,
+  Strategy,
+  StrategyCreatePayload,
+} from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -170,4 +179,91 @@ export function computeKPIStats(trades: Trade[]): KPIStats {
     avgRoi,
     pendingCount,
   };
+}
+
+// ===========================================================================
+// Typed API client (Phase 1)
+// ===========================================================================
+//
+// The fetch-based helpers above target the legacy `trades` endpoints and are
+// still used by the current dashboard. Everything below is the axios client
+// for the positions/strategies/analytics layer.
+
+/** Axios instance pointed at the FastAPI router root. */
+export const apiClient = axios.create({
+  baseURL: `${API_BASE_URL}/api`,
+  headers: { 'Content-Type': 'application/json' },
+  timeout: 30_000,
+});
+
+/**
+ * Normalize errors into something renderable.
+ *
+ * FastAPI puts its message in `detail`; without this, a failed request
+ * surfaces as a generic "Request failed with status code 4xx".
+ */
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (axios.isAxiosError(error)) {
+      const detail = (error.response?.data as { detail?: string } | undefined)?.detail;
+      if (detail) {
+        error.message = detail;
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+/** GET /api/positions?review_status=pending — the Trade Inbox queue. */
+export async function getPendingPositions(): Promise<Position[]> {
+  const { data } = await apiClient.get<Position[]>('/positions', {
+    params: { review_status: 'pending' },
+  });
+  return data;
+}
+
+/** GET /api/positions — every closed position, newest first. */
+export async function getPositions(reviewStatus?: string): Promise<Position[]> {
+  const { data } = await apiClient.get<Position[]>('/positions', {
+    params: reviewStatus ? { review_status: reviewStatus } : undefined,
+  });
+  return data;
+}
+
+/** GET /api/strategies */
+export async function getStrategies(): Promise<Strategy[]> {
+  const { data } = await apiClient.get<Strategy[]>('/strategies');
+  return data;
+}
+
+/** POST /api/strategies — rejects with the API's detail on a duplicate name. */
+export async function createStrategy(
+  payload: StrategyCreatePayload
+): Promise<Strategy> {
+  const { data } = await apiClient.post<Strategy>('/strategies', payload);
+  return data;
+}
+
+/** GET /api/analytics/dashboard — core stats plus the heatmap grid. */
+export async function getDashboardAnalytics(): Promise<DashboardStats> {
+  const { data } = await apiClient.get<DashboardStats>('/analytics/dashboard');
+  return data;
+}
+
+/**
+ * PATCH /api/positions/{id}/review
+ *
+ * Only the keys present in `payload` are applied; the backend always sets
+ * review_status to 'completed' on success.
+ */
+export async function updatePositionReview(
+  id: string,
+  payload: PositionReviewPayload
+): Promise<Position> {
+  const { data } = await apiClient.patch<Position>(
+    `/positions/${id}/review`,
+    payload
+  );
+  return data;
 }
