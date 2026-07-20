@@ -111,6 +111,14 @@ export interface HeatmapCell {
   trade_count: number;
   net_pnl: number;
   win_rate_pct: number;
+  /**
+   * Gross wins / gross losses for this cell.
+   *
+   * `null` means the cell contains no losing trades — a flawless session.
+   * Not derivable from `win_rate_pct`: a scratch trade (P&L exactly 0) counts
+   * as neither win nor loss, so a cell can be loss-free below 100% win rate.
+   */
+  profit_factor: number | null;
 }
 
 export interface HeatmapTotal {

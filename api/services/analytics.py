@@ -102,21 +102,44 @@ class _Bucket:
     trade_count: int = 0
     net_pnl: Decimal = Decimal("0")
     wins: int = 0
+    gross_profit: Decimal = Decimal("0")
+    gross_loss: Decimal = Decimal("0")  # stored positive
 
     def add(self, position: ClosedPosition) -> None:
         self.trade_count += 1
         self.net_pnl += position.realized_pnl
         if position.realized_pnl > 0:
             self.wins += 1
+            self.gross_profit += position.realized_pnl
+        elif position.realized_pnl < 0:
+            self.gross_loss += -position.realized_pnl
 
     def as_dict(self) -> dict[str, Any]:
         win_rate = (
             round(self.wins / self.trade_count * 100, 2) if self.trade_count else 0.0
         )
+
+        # Same contract as core_stats.profit_factor: null means "no losing
+        # trades, ratio unbounded". Never float('inf') -- that is not valid
+        # JSON and Starlette's encoder rejects it.
+        #
+        # This is not derivable from win_rate on the client: a scratch trade
+        # (P&L exactly 0) is neither a win nor a loss, so a cell can have zero
+        # losses while its win rate sits below 100%.
+        if self.gross_loss > 0:
+            profit_factor: Optional[float] = float(
+                round(self.gross_profit / self.gross_loss, 2)
+            )
+        elif self.gross_profit > 0:
+            profit_factor = None
+        else:
+            profit_factor = 0.0
+
         return {
             "trade_count": self.trade_count,
             "net_pnl": float(self.net_pnl),
             "win_rate_pct": win_rate,
+            "profit_factor": profit_factor,
         }
 
 

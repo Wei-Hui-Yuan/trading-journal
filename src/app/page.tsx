@@ -7,7 +7,6 @@ import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
-import { mockHeatmapData } from '@/data/mockTrades';
 import { KPIStats } from '@/types/trade';
 import {
   queryKeys,
@@ -71,10 +70,12 @@ export default function Home() {
         </section>
 
         {/* Day-of-Week Heatmap Layout Grid */}
-        {/* TODO: swap mockHeatmapData for dashboardQuery.data.heatmap once the
-            heatmap component is migrated to the API grid shape. */}
         <section>
-          <DayOfWeekHeatmap data={mockHeatmapData} />
+          <DayOfWeekHeatmap
+            data={dashboardQuery.data?.heatmap}
+            isLoading={dashboardQuery.isPending}
+            error={dashboardQuery.error as Error | null}
+          />
         </section>
 
         {/* Trade Inbox Queue */}
