@@ -1,104 +1,85 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+
 import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
-import { TradeInbox } from '@/components/TradeInbox';
-import { mockTrades, mockKPIStats, mockHeatmapData } from '@/data/mockTrades';
-import { Trade, KPIStats } from '@/types/trade';
-import { fetchTradesFromAPI, completeTradeAPI, computeKPIStats } from '@/lib/api';
+import { TradeInboxQueue } from '@/components/TradeInboxQueue';
+import { mockHeatmapData } from '@/data/mockTrades';
+import { KPIStats } from '@/types/trade';
+import {
+  queryKeys,
+  usePendingPositions,
+  useDashboardStats,
+} from '@/hooks/useTradeInbox';
+
+const EMPTY_STATS: KPIStats = {
+  netPnl: 0,
+  winRate: 0,
+  totalTrades: 0,
+  profitFactor: 0,
+  avgRoi: 0,
+  pendingCount: 0,
+};
 
 export default function Home() {
-  const [trades, setTrades] = useState<Trade[]>(mockTrades);
-  const [kpiStats, setKpiStats] = useState<KPIStats>(mockKPIStats);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [isApiConnected, setIsApiConnected] = useState<boolean>(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
-  // Fetch state on mount from live API
-  const loadTrades = async () => {
-    setIsLoading(true);
-    setFetchError(null);
-    try {
-      const apiTrades = await fetchTradesFromAPI();
-      if (apiTrades && apiTrades.length > 0) {
-        setTrades(apiTrades);
-        setKpiStats(computeKPIStats(apiTrades));
-        setIsApiConnected(true);
-      } else {
-        // Connected to API but table empty -> use mock trades for initial visual demo
-        setIsApiConnected(true);
-        setTrades(mockTrades);
-        setKpiStats(computeKPIStats(mockTrades));
+  // Both queries are served from the React Query cache, so mounting the inbox
+  // and the stat strip does not double-fetch.
+  const dashboardQuery = useDashboardStats();
+  const pendingQuery = usePendingPositions();
+
+  const pendingCount = pendingQuery.data?.length ?? 0;
+
+  // Map the API's snake_case core stats onto the strip's view model.
+  const core = dashboardQuery.data?.core_stats;
+  const kpiStats: KPIStats = core
+    ? {
+        netPnl: core.net_pnl,
+        winRate: core.win_rate_pct,
+        totalTrades: core.total_trades,
+        // Passed through as null rather than coerced to 0: the strip renders
+        // an unbounded ratio as infinity.
+        profitFactor: core.profit_factor,
+        avgRoi: core.avg_roi_pct,
+        pendingCount,
       }
-    } catch (err: any) {
-      console.warn('Backend API offline or unreachable, using initial mock dataset.');
-      setIsApiConnected(false);
-      setFetchError('Live API offline - using fallback dataset');
-      setTrades(mockTrades);
-      setKpiStats(computeKPIStats(mockTrades));
-    } finally {
-      setIsLoading(false);
-    }
+    : { ...EMPTY_STATS, pendingCount };
+
+  // After a broker sync, new positions and stats may exist server-side.
+  const handleSyncComplete = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats }),
+    ]);
   };
-
-  useEffect(() => {
-    loadTrades();
-  }, []);
-
-  const handleCompleteTrade = async (tradeId: string, exitPrice: number, notes?: string) => {
-    try {
-      // Call PUT /api/trades/{id}
-      let updatedTrade: Trade;
-      if (isApiConnected) {
-        updatedTrade = await completeTradeAPI(tradeId, { exit_price: exitPrice, notes });
-      } else {
-        // Fallback local update if API is disconnected
-        const target = trades.find((t) => t.id === tradeId);
-        updatedTrade = {
-          ...(target || mockTrades[0]),
-          id: tradeId,
-          status: 'completed',
-          exit_price: exitPrice,
-          lessons_comments: notes || '',
-        };
-      }
-
-      setTrades((prevTrades) => {
-        const updatedList = prevTrades.map((t) => (t.id === tradeId ? updatedTrade : t));
-        setKpiStats(computeKPIStats(updatedList));
-        return updatedList;
-      });
-    } catch (err: any) {
-      console.error('Failed to complete trade via API:', err);
-      throw err;
-    }
-  };
-
-  const pendingCount = trades.filter((t) => t.status === 'pending_review').length;
 
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
       {/* Navigation Topbar */}
-      <Header pendingCount={pendingCount} onSyncComplete={loadTrades} />
+      <Header pendingCount={pendingCount} onSyncComplete={handleSyncComplete} />
 
       {/* Main Dashboard Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        
+
         {/* Top KPI Stat Strip */}
         <section>
-          <KPIStatStrip stats={{ ...kpiStats, pendingCount }} />
+          <KPIStatStrip stats={kpiStats} />
         </section>
 
         {/* Day-of-Week Heatmap Layout Grid */}
+        {/* TODO: swap mockHeatmapData for dashboardQuery.data.heatmap once the
+            heatmap component is migrated to the API grid shape. */}
         <section>
           <DayOfWeekHeatmap data={mockHeatmapData} />
         </section>
 
         {/* Trade Inbox Queue */}
         <section>
-          <TradeInbox trades={trades} onCompleteTrade={handleCompleteTrade} />
+          <TradeInboxQueue />
         </section>
 
       </main>

@@ -78,7 +78,9 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
           </div>
         </div>
         <div className="mt-2 flex items-baseline justify-between">
-          <span className="text-2xl font-bold font-mono text-white">{stats.profitFactor.toFixed(2)}</span>
+          <span className="text-2xl font-bold font-mono text-white">
+            {stats.profitFactor === null ? '∞' : stats.profitFactor.toFixed(2)}
+          </span>
         </div>
         <div className="mt-2 text-[11px] text-emerald-400 font-medium">
           <span>&gt; 2.0 Benchmark</span>

@@ -37,7 +37,8 @@ export interface KPIStats {
   netPnl: number;
   winRate: number;
   totalTrades: number;
-  profitFactor: number;
+  /** null when there are no losing trades - the ratio is unbounded. */
+  profitFactor: number | null;
   avgRoi: number;
   pendingCount: number;
 }
