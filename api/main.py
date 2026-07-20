@@ -11,7 +11,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     CHAR,
     Boolean,
@@ -87,6 +87,12 @@ class Strategy(Base):
     # Predates migration 002; retained so existing rows keep their data.
     instruments = Column(ARRAY(Text), default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Playbook fields (migration 003). Default to '' rather than NULL so the
+    # editor always has a string to bind to.
+    method = Column(Text, default="")
+    entry_criteria = Column(Text, default="")
+    exit_criteria = Column(Text, default="")
 
 
 class Trade(Base):
@@ -285,13 +291,42 @@ async def complete_trade(
 class StrategyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = None
+    # Playbook fields default to '' so a strategy can be created from just a
+    # name and filled in later from the editor.
+    method: str = ""
+    entry_criteria: str = ""
+    exit_criteria: str = ""
+
+
+class StrategyUpdate(BaseModel):
+    """Partial update from the strategy editor.
+
+    Every field is optional; only keys present in the request body are
+    applied, so saving one pane never clears another.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+    method: Optional[str] = None
+    entry_criteria: Optional[str] = None
+    exit_criteria: Optional[str] = None
 
 
 class StrategyOut(BaseModel):
     id: uuid.UUID
     name: str
     description: Optional[str]
+    # Rows created before migration 003 could still read back NULL; coerced to
+    # '' below so the client always receives a string.
+    method: str = ""
+    entry_criteria: str = ""
+    exit_criteria: str = ""
     created_at: Optional[datetime]
+
+    @field_validator("method", "entry_criteria", "exit_criteria", mode="before")
+    @classmethod
+    def _null_to_empty(cls, value: Optional[str]) -> str:
+        return value or ""
 
     class Config:
         from_attributes = True
@@ -307,12 +342,43 @@ async def list_strategies(session: AsyncSession = Depends(get_session)):
 async def create_strategy(
     params: StrategyCreate, session: AsyncSession = Depends(get_session)
 ):
-    strategy = Strategy(name=params.name, description=params.description)
+    strategy = Strategy(
+        name=params.name,
+        description=params.description,
+        method=params.method,
+        entry_criteria=params.entry_criteria,
+        exit_criteria=params.exit_criteria,
+    )
     session.add(strategy)
     try:
         await session.commit()
     except IntegrityError:
         # strategies.name carries a UNIQUE constraint.
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail=f"A strategy named '{params.name}' already exists"
+        )
+    await session.refresh(strategy)
+    return StrategyOut.model_validate(strategy)
+
+
+@app.patch("/api/strategies/{strategy_id}", response_model=StrategyOut)
+async def update_strategy(
+    strategy_id: uuid.UUID,
+    params: StrategyUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Save edits from the strategy playbook editor."""
+    strategy = await session.get(Strategy, strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    for field, value in params.model_dump(exclude_unset=True).items():
+        setattr(strategy, field, value)
+
+    try:
+        await session.commit()
+    except IntegrityError:
         await session.rollback()
         raise HTTPException(
             status_code=409, detail=f"A strategy named '{params.name}' already exists"

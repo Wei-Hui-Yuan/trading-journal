@@ -17,12 +17,35 @@ export interface Strategy {
   id: string; // UUID
   name: string;
   description: string | null;
+  /** Overarching approach, e.g. "Supply/Demand", "Momentum Breakout". */
+  method: string;
+  /** Entry rules / triggers, free-form (newline-separated bullets). */
+  entry_criteria: string;
+  /** Exit rules, risk parameters, targets. */
+  exit_criteria: string;
   created_at: string | null; // ISO 8601
 }
 
 export interface StrategyCreatePayload {
   name: string;
   description?: string | null;
+  method?: string;
+  entry_criteria?: string;
+  exit_criteria?: string;
+}
+
+/**
+ * Body for PATCH /api/strategies/{id}.
+ *
+ * Only keys present are applied server-side, so saving one field never clears
+ * the others.
+ */
+export interface StrategyUpdatePayload {
+  name?: string;
+  description?: string | null;
+  method?: string;
+  entry_criteria?: string;
+  exit_criteria?: string;
 }
 
 // ---------------------------------------------------------------------------

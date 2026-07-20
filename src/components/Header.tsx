@@ -1,7 +1,8 @@
 'use client';
 
 import React from 'react';
-import { Activity, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
+import Link from 'next/link';
+import { Activity, BookOpen, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 
 interface HeaderProps {
@@ -56,6 +57,14 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount, onSyncComplete }) 
 
         {/* Right Controls */}
         <div className="flex items-center space-x-3">
+          <Link
+            href="/strategies"
+            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
+          >
+            <BookOpen className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Strategies</span>
+          </Link>
+
           <SyncBrokerButton onSyncComplete={onSyncComplete} />
 
           <button className="p-2 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition">

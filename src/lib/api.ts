@@ -6,6 +6,7 @@ import type {
   PositionReviewPayload,
   Strategy,
   StrategyCreatePayload,
+  StrategyUpdatePayload,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -97,6 +98,15 @@ export async function createStrategy(
   payload: StrategyCreatePayload
 ): Promise<Strategy> {
   const { data } = await apiClient.post<Strategy>('/strategies', payload);
+  return data;
+}
+
+/** PATCH /api/strategies/{id} - save playbook edits. */
+export async function updateStrategy(
+  id: string,
+  payload: StrategyUpdatePayload
+): Promise<Strategy> {
+  const { data } = await apiClient.patch<Strategy>(`/strategies/${id}`, payload);
   return data;
 }
 

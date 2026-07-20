@@ -3,16 +3,20 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
+  createStrategy,
   getDashboardAnalytics,
   getPendingPositions,
   getStrategies,
   updatePositionReview,
+  updateStrategy,
 } from '@/lib/api';
 import type {
   DashboardStats,
   Position,
   PositionReviewPayload,
   Strategy,
+  StrategyCreatePayload,
+  StrategyUpdatePayload,
 } from '@/types/api';
 
 /**
@@ -46,6 +50,35 @@ export function useDashboardStats() {
   return useQuery<DashboardStats>({
     queryKey: queryKeys.dashboardStats,
     queryFn: getDashboardAnalytics,
+  });
+}
+
+/** Create a strategy, then refresh every list that offers strategies. */
+export function useCreateStrategy() {
+  const queryClient = useQueryClient();
+
+  return useMutation<Strategy, Error, StrategyCreatePayload>({
+    mutationFn: createStrategy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.strategies });
+    },
+  });
+}
+
+export interface UpdateStrategyVariables {
+  id: string;
+  payload: StrategyUpdatePayload;
+}
+
+/** Save playbook edits for an existing strategy. */
+export function useUpdateStrategy() {
+  const queryClient = useQueryClient();
+
+  return useMutation<Strategy, Error, UpdateStrategyVariables>({
+    mutationFn: ({ id, payload }) => updateStrategy(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.strategies });
+    },
   });
 }
 
