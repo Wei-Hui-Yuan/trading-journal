@@ -102,6 +102,32 @@ export interface PositionReviewPayload {
 }
 
 // ---------------------------------------------------------------------------
+// IBKR ingestion
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of POST /api/ingest/ibkr.
+ *
+ * Reports each stage of the pipeline separately, so a run that finds nothing
+ * new is distinguishable from one that failed. `staged_duplicates` being high
+ * with `staged_new` at 0 is the normal, healthy outcome of re-syncing an
+ * overlapping date range.
+ */
+export interface IngestResult {
+  executions_parsed: number;
+  /** Fills new to the staging ledger this run. */
+  staged_new: number;
+  /** Fills rejected by the transaction_id UNIQUE guard — already ingested. */
+  staged_duplicates: number;
+  trades_created: number;
+  trades_duplicates: number;
+  positions_matched: number;
+  symbols_touched: string[];
+  /** Fractional fills rounded to satisfy the INTEGER quantity column. */
+  fractional_quantities: number;
+}
+
+// ---------------------------------------------------------------------------
 // Manual trade entry
 // ---------------------------------------------------------------------------
 

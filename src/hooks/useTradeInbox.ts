@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   createManualTrade,
+  ingestIBKR,
   createStrategy,
   getDashboardAnalytics,
   getPendingPositions,
@@ -13,6 +14,7 @@ import {
 } from '@/lib/api';
 import type {
   DashboardStats,
+  IngestResult,
   ManualTradePayload,
   ManualTradeResult,
   Position,
@@ -53,6 +55,26 @@ export function useDashboardStats() {
   return useQuery<DashboardStats>({
     queryKey: queryKeys.dashboardStats,
     queryFn: getDashboardAnalytics,
+  });
+}
+
+/**
+ * Pull executions from IBKR via the idempotent ingest pipeline.
+ *
+ * Invalidation lives here rather than in the button so any caller gets a
+ * correct cache refresh: the ingest promotes staged fills into `trades` and
+ * re-runs FIFO matching, so new positions can appear in the inbox and shift
+ * every dashboard figure.
+ */
+export function useSyncBroker() {
+  const queryClient = useQueryClient();
+
+  return useMutation<IngestResult, Error, void>({
+    mutationFn: ingestIBKR,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+    },
   });
 }
 

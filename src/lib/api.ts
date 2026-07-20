@@ -2,6 +2,7 @@ import axios from 'axios';
 
 import type {
   DashboardStats,
+  IngestResult,
   ManualTradePayload,
   ManualTradeResult,
   Position,
@@ -13,39 +14,11 @@ import type {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-// Shape returned by POST /api/sync/ibkr
-export interface SyncResult {
-  reference_code: string;
-  fills_found: number;
-  inserted: number;
-  skipped_duplicates: number;
-  skipped_unparseable: number;
-  inserted_trade_ids: string[];
-}
-
-// POST /api/sync/ibkr - pulls fresh executions from the IBKR Flex service
-export async function syncBrokerAPI(): Promise<SyncResult> {
-  const res = await fetch(`${API_BASE_URL}/api/sync/ibkr`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
-
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.detail || `Broker sync failed: ${res.status} ${res.statusText}`);
-  }
-
-  return res.json();
-}
-
 // ===========================================================================
 // Typed API client (Phase 1)
 // ===========================================================================
 //
-// `syncBrokerAPI` above still uses fetch directly; everything below is the
-// axios client for the positions/strategies/analytics layer.
+// Axios client for the positions / strategies / analytics / ingest layer.
 
 /** Axios instance pointed at the FastAPI router root. */
 export const apiClient = axios.create({
@@ -125,6 +98,18 @@ export async function createManualTrade(
     '/trades/manual',
     payload
   );
+  return data;
+}
+
+/**
+ * POST /api/ingest/ibkr - pull executions from IBKR.
+ *
+ * Replaces the retired /api/sync/ibkr. Fills are staged in `ibkr_executions`
+ * keyed by the broker's transaction id before promotion, so re-running over an
+ * overlapping date range is a no-op rather than a duplicate.
+ */
+export async function ingestIBKR(): Promise<IngestResult> {
+  const { data } = await apiClient.post<IngestResult>('/ingest/ibkr');
   return data;
 }
 

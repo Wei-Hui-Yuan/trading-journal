@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Check, X, DownloadCloud } from 'lucide-react';
-import { syncBrokerAPI } from '@/lib/api';
+import { useSyncBroker } from '@/hooks/useTradeInbox';
 
 type SyncState = 'idle' | 'syncing' | 'success' | 'error';
 
@@ -21,6 +21,8 @@ export const SyncBrokerButton: React.FC<SyncBrokerButtonProps> = ({ onSyncComple
   // the component unmounts.
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMounted = useRef(true);
+
+  const syncMutation = useSyncBroker();
 
   useEffect(() => {
     isMounted.current = true;
@@ -47,32 +49,36 @@ export const SyncBrokerButton: React.FC<SyncBrokerButtonProps> = ({ onSyncComple
     setDetail(null);
 
     try {
-      const result = await syncBrokerAPI();
+      // The hook invalidates the positions queue and dashboard on success, so
+      // the cache is already refreshing by the time this resolves.
+      const result = await syncMutation.mutateAsync();
 
-      // Refresh the dashboard before flashing success so the view is already
-      // current by the time the user reads the confirmation.
+      // Any extra caller-supplied refresh runs before the success flash, so the
+      // view is current by the time the user reads the confirmation.
       if (onSyncComplete) {
         await onSyncComplete();
       }
 
       if (!isMounted.current) return;
       setState('success');
+      // Distinguish "found new fills" from "already up to date": a run where
+      // everything was rejected as a duplicate is a healthy no-op, not a miss.
       setDetail(
-        result.inserted > 0
-          ? `${result.inserted} new`
-          : result.fills_found > 0
+        result.trades_created > 0
+          ? `${result.trades_created} new`
+          : result.staged_duplicates > 0
             ? 'up to date'
             : 'no fills'
       );
       scheduleReset();
     } catch (err) {
-      console.error('Broker sync failed:', err);
+      console.error('Broker ingest failed:', err);
       if (!isMounted.current) return;
       setState('error');
       setDetail(err instanceof Error ? err.message : null);
       scheduleReset();
     }
-  }, [state, onSyncComplete, scheduleReset]);
+  }, [state, onSyncComplete, scheduleReset, syncMutation]);
 
   const isSyncing = state === 'syncing';
 
