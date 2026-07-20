@@ -277,3 +277,220 @@ async def build_dashboard(session: AsyncSession) -> dict[str, Any]:
         "core_stats": compute_core_stats(positions),
         "heatmap": build_heatmap(positions),
     }
+
+
+# ---------------------------------------------------------------------------
+# Advanced trade-level performance metrics
+# ---------------------------------------------------------------------------
+#
+# These read the `trades` ledger rather than `positions`, because R-multiple
+# and slippage need the PLAN -- stop_loss and planned_entry -- and those live
+# only on trades. `positions` records what happened, not what was intended.
+
+
+@dataclass(frozen=True)
+class ReviewedTrade:
+    """One closed execution with enough plan data to score."""
+
+    trade_id: str
+    ticker: str
+    direction: str  # BUY (long) / SELL (short)
+    quantity: int
+    actual_entry: Decimal
+    exit_price: Optional[Decimal]
+    planned_entry: Optional[Decimal]
+    stop_loss: Optional[Decimal]
+    mistakes: list[str]
+    review_status: Optional[str]
+
+
+def compute_r_multiple(trade: ReviewedTrade) -> Optional[float]:
+    """Realized reward measured in units of the risk actually taken.
+
+    Long:  (exit - entry) / (entry - stop)
+    Short: (entry - exit) / (stop - entry)
+
+    Returns None -- never 0.0 -- when the trade cannot be scored: no exit, no
+    stop, or a stop at the entry price. Zero is a real R value (a scratch),
+    so conflating "no risk defined" with "broke even" would corrupt every
+    aggregate built on top of this.
+    """
+    if trade.exit_price is None or trade.stop_loss is None:
+        return None
+
+    is_long = (trade.direction or "").upper() == "BUY"
+
+    if is_long:
+        reward = trade.exit_price - trade.actual_entry
+        risk = trade.actual_entry - trade.stop_loss
+    else:
+        reward = trade.actual_entry - trade.exit_price
+        risk = trade.stop_loss - trade.actual_entry
+
+    # A non-positive denominator means the stop was at or beyond the entry --
+    # there was no defined risk to measure the return against.
+    if risk <= 0:
+        return None
+
+    return float(round(reward / risk, 4))
+
+
+def compute_slippage(trade: ReviewedTrade) -> Optional[float]:
+    """Difference between the fill and the plan, signed against the trader.
+
+    Positive = worse than planned (paid up on a long, sold lower on a short).
+    Returns None when no entry was planned.
+    """
+    if trade.planned_entry is None:
+        return None
+
+    is_long = (trade.direction or "").upper() == "BUY"
+    diff = (
+        trade.actual_entry - trade.planned_entry
+        if is_long
+        else trade.planned_entry - trade.actual_entry
+    )
+    return float(round(diff, 4))
+
+
+def compute_expectancy(r_multiples: list[float]) -> Optional[float]:
+    """(win rate x avg win R) - (loss rate x avg loss R).
+
+    Expressed in R, so it answers "what do I earn per unit risked?".
+    Returns None on an empty sample rather than a misleading 0.0.
+    """
+    if not r_multiples:
+        return None
+
+    wins = [r for r in r_multiples if r > 0]
+    losses = [abs(r) for r in r_multiples if r < 0]
+    total = len(r_multiples)
+
+    win_rate = len(wins) / total
+    loss_rate = len(losses) / total
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+
+    return round(win_rate * avg_win - loss_rate * avg_loss, 4)
+
+
+def _r_distribution(r_multiples: list[float]) -> dict[str, int]:
+    """Bucket R outcomes so the UI can render a distribution without binning."""
+    buckets = {"<-2R": 0, "-2R..-1R": 0, "-1R..0R": 0, "0R..1R": 0, "1R..2R": 0, ">2R": 0}
+    for r in r_multiples:
+        if r < -2:
+            buckets["<-2R"] += 1
+        elif r < -1:
+            buckets["-2R..-1R"] += 1
+        elif r < 0:
+            buckets["-1R..0R"] += 1
+        elif r < 1:
+            buckets["0R..1R"] += 1
+        elif r <= 2:
+            buckets["1R..2R"] += 1
+        else:
+            buckets[">2R"] += 1
+    return buckets
+
+
+def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
+    """R-multiples, slippage, expectancy, and per-mistake breakdown."""
+    scored: list[tuple[ReviewedTrade, float]] = []
+    slippages: list[float] = []
+
+    for trade in trades:
+        r = compute_r_multiple(trade)
+        if r is not None:
+            scored.append((trade, r))
+        s = compute_slippage(trade)
+        if s is not None:
+            slippages.append(s)
+
+    r_multiples = [r for _, r in scored]
+
+    # Profit factor in R terms. None (not 0.0) when there are no losses, so it
+    # matches the contract the heatmap and core stats already use.
+    gross_win_r = sum(r for r in r_multiples if r > 0)
+    gross_loss_r = sum(-r for r in r_multiples if r < 0)
+    if gross_loss_r > 0:
+        profit_factor_r: Optional[float] = round(gross_win_r / gross_loss_r, 2)
+    elif gross_win_r > 0:
+        profit_factor_r = None
+    else:
+        profit_factor_r = 0.0
+
+    wins = [r for r in r_multiples if r > 0]
+
+    # Group performance by behavioural tag. One trade with several tags counts
+    # toward each, so these buckets intentionally overlap.
+    by_mistake: dict[str, dict[str, Any]] = {}
+    for trade, r in scored:
+        for tag in trade.mistakes or []:
+            bucket = by_mistake.setdefault(
+                tag, {"trade_count": 0, "total_r": 0.0, "wins": 0}
+            )
+            bucket["trade_count"] += 1
+            bucket["total_r"] += r
+            if r > 0:
+                bucket["wins"] += 1
+
+    mistake_breakdown = [
+        {
+            "mistake": tag,
+            "trade_count": b["trade_count"],
+            "total_r": round(b["total_r"], 4),
+            "avg_r": round(b["total_r"] / b["trade_count"], 4),
+            "win_rate_pct": round(b["wins"] / b["trade_count"] * 100, 2),
+        }
+        for tag, b in sorted(by_mistake.items(), key=lambda kv: kv[1]["total_r"])
+    ]
+
+    return {
+        "scored_trades": len(r_multiples),
+        "unscored_trades": len(trades) - len(r_multiples),
+        "total_r": round(sum(r_multiples), 4) if r_multiples else 0.0,
+        "avg_r": round(sum(r_multiples) / len(r_multiples), 4) if r_multiples else None,
+        "win_rate_pct": (
+            round(len(wins) / len(r_multiples) * 100, 2) if r_multiples else 0.0
+        ),
+        "profit_factor_r": profit_factor_r,
+        "expectancy_r": compute_expectancy(r_multiples),
+        "avg_slippage": (
+            round(sum(slippages) / len(slippages), 4) if slippages else None
+        ),
+        "slippage_sample": len(slippages),
+        "r_distribution": _r_distribution(r_multiples),
+        "mistake_breakdown": mistake_breakdown,
+    }
+
+
+async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
+    """Read closed executions from the trades ledger."""
+    from main import Trade  # noqa: PLC0415 - deferred to avoid circular import
+
+    rows = (await session.execute(select(Trade))).scalars().all()
+
+    return [
+        ReviewedTrade(
+            trade_id=str(row.id),
+            ticker=row.ticker,
+            direction=row.direction or "",
+            quantity=int(row.quantity or 0),
+            actual_entry=Decimal(str(row.actual_entry)),
+            exit_price=Decimal(str(row.exit_price)) if row.exit_price is not None else None,
+            planned_entry=(
+                Decimal(str(row.planned_entry)) if row.planned_entry is not None else None
+            ),
+            stop_loss=Decimal(str(row.stop_loss)) if row.stop_loss is not None else None,
+            mistakes=list(row.mistakes or []),
+            review_status=row.review_status,
+        )
+        for row in rows
+        if row.actual_entry is not None
+    ]
+
+
+async def build_advanced_analytics(session: AsyncSession) -> dict[str, Any]:
+    """Advanced metrics payload for the Analytics & Review tab."""
+    trades = await load_reviewed_trades(session)
+    return compute_advanced_metrics(trades)

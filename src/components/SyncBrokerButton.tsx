@@ -8,12 +8,7 @@ type SyncState = 'idle' | 'syncing' | 'success' | 'error';
 
 const RESET_DELAY_MS = 3000;
 
-interface SyncBrokerButtonProps {
-  /** Fired after a successful sync so the dashboard can reload its trades. */
-  onSyncComplete?: () => void | Promise<void>;
-}
-
-export const SyncBrokerButton: React.FC<SyncBrokerButtonProps> = ({ onSyncComplete }) => {
+export const SyncBrokerButton: React.FC = () => {
   const [state, setState] = useState<SyncState>('idle');
   const [detail, setDetail] = useState<string | null>(null);
 
@@ -53,12 +48,6 @@ export const SyncBrokerButton: React.FC<SyncBrokerButtonProps> = ({ onSyncComple
       // the cache is already refreshing by the time this resolves.
       const result = await syncMutation.mutateAsync();
 
-      // Any extra caller-supplied refresh runs before the success flash, so the
-      // view is current by the time the user reads the confirmation.
-      if (onSyncComplete) {
-        await onSyncComplete();
-      }
-
       if (!isMounted.current) return;
       setState('success');
       // Distinguish "found new fills" from "already up to date": a run where
@@ -78,7 +67,7 @@ export const SyncBrokerButton: React.FC<SyncBrokerButtonProps> = ({ onSyncComple
       setDetail(err instanceof Error ? err.message : null);
       scheduleReset();
     }
-  }, [state, onSyncComplete, scheduleReset, syncMutation]);
+  }, [state, scheduleReset, syncMutation]);
 
   const isSyncing = state === 'syncing';
 

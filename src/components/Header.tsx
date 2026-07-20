@@ -2,17 +2,15 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BookOpen, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { ManualTradeModal } from './ManualTradeModal';
 
 interface HeaderProps {
   pendingCount: number;
-  /** Reloads the dashboard trade list after a successful broker sync. */
-  onSyncComplete?: () => void | Promise<void>;
 }
 
-export const Header: React.FC<HeaderProps> = ({ pendingCount, onSyncComplete }) => {
+export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   const [isManualLogOpen, setIsManualLogOpen] = useState(false);
 
   return (
@@ -61,6 +59,14 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount, onSyncComplete }) 
         {/* Right Controls */}
         <div className="flex items-center space-x-3">
           <Link
+            href="/analytics"
+            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Analytics</span>
+          </Link>
+
+          <Link
             href="/strategies"
             className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
           >
@@ -77,7 +83,7 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount, onSyncComplete }) 
             <span className="hidden sm:inline">Manual Log</span>
           </button>
 
-          <SyncBrokerButton onSyncComplete={onSyncComplete} />
+          <SyncBrokerButton />
 
           <button className="p-2 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition">
             <SlidersHorizontal className="h-4 w-4" />

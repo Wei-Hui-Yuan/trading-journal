@@ -4,6 +4,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   createManualTrade,
+  getAdvancedMetrics,
+  getTradeReviewQueue,
+  reviewTrade,
   ingestIBKR,
   createStrategy,
   getDashboardAnalytics,
@@ -13,6 +16,7 @@ import {
   updateStrategy,
 } from '@/lib/api';
 import type {
+  AdvancedMetrics,
   DashboardStats,
   IngestResult,
   ManualTradePayload,
@@ -22,6 +26,9 @@ import type {
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
+  TradeReview,
+  TradeReviewPayload,
+  TradeReviewStatus,
 } from '@/types/api';
 
 /**
@@ -31,6 +38,9 @@ export const queryKeys = {
   pendingPositions: ['positions', 'pending'] as const,
   strategies: ['strategies'] as const,
   dashboardStats: ['dashboardStats'] as const,
+  advancedMetrics: ['advancedMetrics'] as const,
+  tradeReviewQueue: (status: TradeReviewStatus) =>
+    ['trades', 'review-queue', status] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -55,6 +65,51 @@ export function useDashboardStats() {
   return useQuery<DashboardStats>({
     queryKey: queryKeys.dashboardStats,
     queryFn: getDashboardAnalytics,
+  });
+}
+
+/** R-multiple, slippage and expectancy metrics for the Analytics tab. */
+export function useAdvancedMetrics() {
+  return useQuery<AdvancedMetrics>({
+    queryKey: queryKeys.advancedMetrics,
+    queryFn: getAdvancedMetrics,
+  });
+}
+
+/** Executions awaiting the qualitative review pass. */
+export function useTradeReviewQueue(status: TradeReviewStatus = 'pending') {
+  return useQuery<TradeReview[]>({
+    queryKey: queryKeys.tradeReviewQueue(status),
+    queryFn: () => getTradeReviewQueue(status),
+  });
+}
+
+export interface TradeReviewVariables {
+  id: string;
+  payload: TradeReviewPayload;
+}
+
+/**
+ * Save a qualitative review.
+ *
+ * Invalidates both review queues (the trade leaves 'pending' and joins
+ * 'reviewed') and the advanced metrics, since newly attached mistake tags
+ * change the per-mistake breakdown.
+ */
+export function useReviewTrade() {
+  const queryClient = useQueryClient();
+
+  return useMutation<TradeReview, Error, TradeReviewVariables>({
+    mutationFn: ({ id, payload }) => reviewTrade(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.tradeReviewQueue('pending'),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.tradeReviewQueue('reviewed'),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+    },
   });
 }
 

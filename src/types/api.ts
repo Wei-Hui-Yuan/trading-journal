@@ -249,3 +249,70 @@ export interface DashboardStats {
   core_stats: CoreStats;
   heatmap: Heatmap;
 }
+
+// ---------------------------------------------------------------------------
+// Trade review & advanced analytics (Phase 5)
+// ---------------------------------------------------------------------------
+
+export type TradeReviewStatus = 'pending' | 'reviewed';
+
+/** An execution in the qualitative review queue. */
+export interface TradeReview {
+  id: string;
+  ticker: string;
+  direction: string;
+  quantity: number;
+  actual_entry: number;
+  exit_price: number | null;
+  planned_entry: number | null;
+  stop_loss: number | null;
+  target: number | null;
+  entry_date: string;
+  review_status: TradeReviewStatus | null;
+  notes: string | null;
+  /** Behavioural tags, e.g. ['FOMO', 'Chased']. */
+  mistakes: string[];
+  strategy_id: string | null;
+}
+
+/**
+ * Body for PUT /api/trades/{id}/review.
+ * Omitted keys are left untouched; the server always sets review_status.
+ */
+export interface TradeReviewPayload {
+  notes?: string | null;
+  mistakes?: string[];
+}
+
+export interface MistakeBreakdown {
+  mistake: string;
+  trade_count: number;
+  total_r: number;
+  avg_r: number;
+  win_rate_pct: number;
+}
+
+/**
+ * GET /api/analytics/advanced
+ *
+ * Several fields are deliberately `number | null`. Null means "not
+ * computable from this sample" — no scoreable trades, no losses, no planned
+ * entries — which is distinct from a real value of 0.
+ */
+export interface AdvancedMetrics {
+  /** Trades with both an exit and a usable stop, so R could be computed. */
+  scored_trades: number;
+  /** Trades skipped: still open, or missing/invalid stop. */
+  unscored_trades: number;
+  total_r: number;
+  avg_r: number | null;
+  win_rate_pct: number;
+  /** Null when there are no losing trades — unbounded ratio. */
+  profit_factor_r: number | null;
+  expectancy_r: number | null;
+  /** Positive means worse fills than planned. Null when nothing was planned. */
+  avg_slippage: number | null;
+  slippage_sample: number;
+  r_distribution: Record<string, number>;
+  mistake_breakdown: MistakeBreakdown[];
+}

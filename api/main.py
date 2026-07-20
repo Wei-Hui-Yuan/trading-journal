@@ -125,6 +125,12 @@ class Trade(Base):
     followed_plan = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Qualitative review pass (migration 006). Distinct from `status`, which
+    # tracks the execution lifecycle rather than whether a human has reviewed it.
+    review_status = Column(Text, default="pending")
+    notes = Column(Text, nullable=True)
+    mistakes = Column(ARRAY(Text), default=list)
+
 
 class Position(Base):
     """A closed round trip produced by the FIFO matching engine.
@@ -780,4 +786,103 @@ async def analytics_dashboard(session: AsyncSession = Depends(get_session)):
     from services.analytics import build_dashboard
 
     return await build_dashboard(session)
+
+
+@app.get("/api/analytics/advanced")
+async def analytics_advanced(session: AsyncSession = Depends(get_session)):
+    """R-multiples, slippage, expectancy, and the per-mistake breakdown.
+
+    Sourced from `trades` rather than `positions`: R-multiple and slippage
+    need the plan (stop_loss, planned_entry), which only the ledger carries.
+    """
+    from services.analytics import build_advanced_analytics
+
+    return await build_advanced_analytics(session)
+
+
+# ---------------------------------------------------------------------------
+# Trade review (qualitative pass)
+# ---------------------------------------------------------------------------
+
+
+class TradeReviewUpdate(BaseModel):
+    """Qualitative review of a single execution."""
+
+    notes: Optional[str] = None
+    # Behavioural tags, e.g. ['FOMO', 'Chased', 'Early Liquidation'].
+    mistakes: Optional[list[str]] = None
+
+
+class TradeReviewOut(BaseModel):
+    id: uuid.UUID
+    ticker: str
+    direction: str
+    quantity: int
+    actual_entry: float
+    exit_price: Optional[float]
+    planned_entry: Optional[float]
+    stop_loss: Optional[float]
+    target: Optional[float]
+    entry_date: datetime
+    review_status: Optional[str]
+    notes: Optional[str]
+    mistakes: list[str] = []
+    strategy_id: Optional[uuid.UUID]
+
+    @field_validator("mistakes", mode="before")
+    @classmethod
+    def _null_to_list(cls, value: Optional[list[str]]) -> list[str]:
+        return list(value or [])
+
+    class Config:
+        from_attributes = True
+
+
+@app.get("/api/trades/review-queue", response_model=list[TradeReviewOut])
+async def trade_review_queue(
+    review_status: str = "pending",
+    session: AsyncSession = Depends(get_session),
+):
+    """Executions awaiting (or having completed) the qualitative review pass."""
+    stmt = (
+        select(Trade)
+        .where(Trade.review_status == review_status)
+        .order_by(Trade.entry_date.desc())
+    )
+    result = await session.execute(stmt)
+    return [TradeReviewOut.model_validate(t) for t in result.scalars().all()]
+
+
+@app.put("/api/trades/{trade_id}/review", response_model=TradeReviewOut)
+async def review_trade(
+    trade_id: uuid.UUID,
+    params: TradeReviewUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Record notes and behavioural tags, and mark the trade reviewed."""
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    # Only fields present in the body are applied, so saving notes alone does
+    # not wipe previously recorded mistakes.
+    updates = params.model_dump(exclude_unset=True)
+    if "notes" in updates:
+        trade.notes = updates["notes"]
+    if "mistakes" in updates:
+        # Normalize: trim, drop blanks, de-duplicate while keeping order.
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for tag in updates["mistakes"] or []:
+            tag = (tag or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                cleaned.append(tag)
+        trade.mistakes = cleaned
+
+    trade.review_status = "reviewed"
+
+    await session.commit()
+    await session.refresh(trade)
+    return TradeReviewOut.model_validate(trade)
 

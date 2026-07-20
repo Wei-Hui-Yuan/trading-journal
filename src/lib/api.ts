@@ -1,6 +1,7 @@
 import axios from 'axios';
 
 import type {
+  AdvancedMetrics,
   DashboardStats,
   IngestResult,
   ManualTradePayload,
@@ -10,6 +11,9 @@ import type {
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
+  TradeReview,
+  TradeReviewPayload,
+  TradeReviewStatus,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -110,6 +114,34 @@ export async function createManualTrade(
  */
 export async function ingestIBKR(): Promise<IngestResult> {
   const { data } = await apiClient.post<IngestResult>('/ingest/ibkr');
+  return data;
+}
+
+/** GET /api/analytics/advanced - R-multiples, slippage, expectancy. */
+export async function getAdvancedMetrics(): Promise<AdvancedMetrics> {
+  const { data } = await apiClient.get<AdvancedMetrics>('/analytics/advanced');
+  return data;
+}
+
+/** GET /api/trades/review-queue - executions awaiting qualitative review. */
+export async function getTradeReviewQueue(
+  reviewStatus: TradeReviewStatus = 'pending'
+): Promise<TradeReview[]> {
+  const { data } = await apiClient.get<TradeReview[]>('/trades/review-queue', {
+    params: { review_status: reviewStatus },
+  });
+  return data;
+}
+
+/** PUT /api/trades/{id}/review - save notes + mistake tags, mark reviewed. */
+export async function reviewTrade(
+  id: string,
+  payload: TradeReviewPayload
+): Promise<TradeReview> {
+  const { data } = await apiClient.put<TradeReview>(
+    `/trades/${id}/review`,
+    payload
+  );
   return data;
 }
 

@@ -1,7 +1,6 @@
 'use client';
 
 import React from 'react';
-import { useQueryClient } from '@tanstack/react-query';
 
 import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
@@ -9,7 +8,6 @@ import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
 import { KPIStats } from '@/types/trade';
 import {
-  queryKeys,
   usePendingPositions,
   useDashboardStats,
 } from '@/hooks/useTradeInbox';
@@ -24,8 +22,6 @@ const EMPTY_STATS: KPIStats = {
 };
 
 export default function Home() {
-  const queryClient = useQueryClient();
-
   // Both queries are served from the React Query cache, so mounting the inbox
   // and the stat strip does not double-fetch.
   const dashboardQuery = useDashboardStats();
@@ -48,18 +44,10 @@ export default function Home() {
       }
     : { ...EMPTY_STATS, pendingCount };
 
-  // After a broker sync, new positions and stats may exist server-side.
-  const handleSyncComplete = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats }),
-    ]);
-  };
-
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
       {/* Navigation Topbar */}
-      <Header pendingCount={pendingCount} onSyncComplete={handleSyncComplete} />
+      <Header pendingCount={pendingCount} />
 
       {/* Main Dashboard Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
