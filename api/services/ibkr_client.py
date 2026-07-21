@@ -32,6 +32,12 @@ GET_STATEMENT_URL = f"{FLEX_BASE}.GetStatement"
 # fatal it fails the whole sync over a condition that clears in seconds.
 NOT_READY_CODES = {"1001", "1018", "1019"}
 
+# Of those, only "generation in progress" is worth retrying inside the request.
+# 1001 and 1018 are rate limiting, whose cooldown is measured in minutes and
+# can be *restarted* by asking again -- retrying there lengthens the lockout it
+# is trying to escape. Those are reported to the caller to retry later instead.
+RETRY_IN_REQUEST_CODES = {"1019"}
+
 MAX_POLL_ATTEMPTS = 5
 POLL_DELAY_SECONDS = 4.0
 REQUEST_TIMEOUT = 30.0
@@ -124,10 +130,11 @@ async def request_statement(
             f"IBKR rejected the statement request (code {code}): {message}",
             retryable=code in NOT_READY_CODES,
         )
-        # A genuine rejection -- bad token, unknown query -- will not improve
-        # with waiting, so surface it immediately rather than stalling the
-        # request behind pointless retries.
-        if not error.retryable:
+        # Retry only what a few seconds can actually fix. A hard rejection
+        # (bad token, unknown query) will never improve, and rate limiting
+        # gets worse if prodded -- both are raised straight to the caller,
+        # which reports them rather than burning the request budget.
+        if code not in RETRY_IN_REQUEST_CODES:
             raise error
         last_error = error
 
