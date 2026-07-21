@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -24,6 +24,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    delete,
     func,
     select,
     update,
@@ -100,6 +101,14 @@ class Strategy(Base):
     method = Column(Text, default="")
     entry_criteria = Column(Text, default="")
     exit_criteria = Column(Text, default="")
+
+
+class Discipline(Base):
+    __tablename__ = "disciplines"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(Text, nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Trade(Base):
@@ -764,6 +773,89 @@ async def update_strategy(
 
 
 # ---------------------------------------------------------------------------
+# Disciplines
+# ---------------------------------------------------------------------------
+
+
+class DisciplineCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def _trim_name(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Discipline name cannot be empty")
+        return trimmed
+
+
+class DisciplineOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+@app.get(
+    "/api/disciplines",
+    response_model=list[DisciplineOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_disciplines(session: AsyncSession = Depends(get_session)):
+    """List all discipline rules, ordered by created_at."""
+    result = await session.execute(
+        select(Discipline).order_by(Discipline.created_at.asc())
+    )
+    return [DisciplineOut.model_validate(d) for d in result.scalars().all()]
+
+
+@app.post(
+    "/api/disciplines",
+    response_model=DisciplineOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_discipline(
+    params: DisciplineCreate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Add a new discipline rule."""
+    discipline = Discipline(name=params.name)
+    session.add(discipline)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A discipline rule named '{params.name}' already exists",
+        )
+    await session.refresh(discipline)
+    return DisciplineOut.model_validate(discipline)
+
+
+@app.delete(
+    "/api/disciplines/{discipline_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_discipline(
+    discipline_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a discipline rule."""
+    discipline = await session.get(Discipline, discipline_id)
+    if discipline is None:
+        raise HTTPException(status_code=404, detail="Discipline not found")
+
+    await session.delete(discipline)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
 # Position review (Trade Inbox)
 # ---------------------------------------------------------------------------
 
@@ -1030,6 +1122,28 @@ async def annotate_trade(
            if c.name in TradeOut.model_fields},
         is_matched=matched.first() is not None,
     )
+
+
+@app.delete(
+    "/api/trades/{trade_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_trade(
+    trade_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete an execution fill from the trades ledger."""
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    await session.execute(
+        delete(PositionFill).where(PositionFill.trade_id == trade_id)
+    )
+    await session.delete(trade)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get(

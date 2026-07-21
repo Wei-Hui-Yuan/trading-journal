@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import pytest
 
-os.environ.setdefault("CORS_ALLOW_ORIGINS", "https://example.test")
+os.environ.setdefault("CORS_ALLOW_ORIGINS", "https://trading-journal-test.vercel.app")
 
 import main  # noqa: E402
 

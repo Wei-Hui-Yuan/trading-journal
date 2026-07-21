@@ -9,10 +9,12 @@ import {
   Loader2,
   NotebookPen,
   Search,
+  Trash2,
 } from 'lucide-react';
 
 import {
   useAnnotateTrade,
+  useDeleteTrade,
   useReviewPosition,
   useRoundTrips,
   useStrategies,
@@ -178,6 +180,7 @@ export const TradeLedger: React.FC = () => {
   const { data: strategies } = useStrategies();
   const annotate = useAnnotateTrade();
   const review = useReviewPosition();
+  const deleteTradeMutation = useDeleteTrade();
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
@@ -565,6 +568,7 @@ export const TradeLedger: React.FC = () => {
                               <th className="pb-1 font-normal">Qty</th>
                               <th className="pb-1 font-normal">Price</th>
                               <th className="pb-1 font-normal">When</th>
+                              <th className="pb-1 text-right font-normal">Action</th>
                             </tr>
                           </thead>
                           <tbody className="font-mono text-slate-300">
@@ -583,6 +587,26 @@ export const TradeLedger: React.FC = () => {
                                 <td className="py-1.5">{f.price}</td>
                                 <td className="py-1.5 text-obsidian-muted">
                                   {dateFormatter.format(new Date(f.executed_at))}
+                                </td>
+                                <td className="py-1.5 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (
+                                        window.confirm(
+                                          'Are you sure you want to delete this trade execution fill?'
+                                        )
+                                      ) {
+                                        deleteTradeMutation.mutate(f.trade_id);
+                                      }
+                                    }}
+                                    disabled={deleteTradeMutation.isPending}
+                                    className="inline-flex items-center gap-1 rounded bg-loss/10 px-2 py-0.5 text-[10px] text-loss border border-loss/20 hover:bg-loss/20 transition-colors disabled:opacity-50 font-sans"
+                                    title="Delete execution fill"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                    <span>Delete</span>
+                                  </button>
                                 </td>
                               </tr>
                             ))}

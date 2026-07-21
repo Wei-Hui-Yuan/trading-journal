@@ -9,9 +9,15 @@ import {
   ChevronRight,
   Inbox,
   Loader2,
+  Plus,
+  Trash2,
+  X,
 } from 'lucide-react';
 
 import {
+  useCreateDiscipline,
+  useDeleteDiscipline,
+  useDisciplines,
   usePendingPositions,
   useReviewPosition,
   useStrategies,
@@ -27,6 +33,7 @@ interface ReviewDraft {
   tag_hard_sl: boolean;
   tag_retest: boolean;
   tag_plan_compliant: boolean;
+  disciplines_checked: Record<string, boolean>;
   trade_grade: string;
   // The post-mortem, asked as three questions. One combined box reliably
   // collapses into only ever recording what went wrong.
@@ -40,6 +47,7 @@ const emptyDraft: ReviewDraft = {
   tag_hard_sl: false,
   tag_retest: false,
   tag_plan_compliant: false,
+  disciplines_checked: {},
   trade_grade: '',
   review_went_well: '',
   review_went_wrong: '',
@@ -67,6 +75,9 @@ const formatDateTime = (iso: string) => {
 export function TradeInboxQueue() {
   const positionsQuery = usePendingPositions();
   const strategiesQuery = useStrategies();
+  const disciplinesQuery = useDisciplines();
+  const createDisciplineMutation = useCreateDiscipline();
+  const deleteDisciplineMutation = useDeleteDiscipline();
   const reviewMutation = useReviewPosition();
 
   // Drafts are keyed by position id so each card edits independently.
@@ -75,6 +86,11 @@ export function TradeInboxQueue() {
   const [errorFor, setErrorFor] = useState<string | null>(null);
   // Only one execution drill-down open at a time, so the queue stays scannable.
   const [expandedFills, setExpandedFills] = useState<string | null>(null);
+
+  // Manage discipline rules popover state
+  const [isManagingRules, setIsManagingRules] = useState(false);
+  const [newRuleName, setNewRuleName] = useState('');
+  const [ruleError, setRuleError] = useState<string | null>(null);
 
   const draftFor = (id: string): ReviewDraft => drafts[id] ?? emptyDraft;
 
@@ -87,13 +103,14 @@ export function TradeInboxQueue() {
 
   const handleSubmit = (position: Position) => {
     const draft = draftFor(position.id);
+    const checked = draft.disciplines_checked ?? {};
 
     // Send only what the user actually set; the backend applies just the keys
     // present, so omitting a field leaves it untouched rather than nulling it.
     const payload: PositionReviewPayload = {
-      tag_hard_sl: draft.tag_hard_sl,
-      tag_retest: draft.tag_retest,
-      tag_plan_compliant: draft.tag_plan_compliant,
+      tag_hard_sl: checked['Hard stop-loss set'] ?? draft.tag_hard_sl,
+      tag_retest: checked['Waited for retest'] ?? draft.tag_retest,
+      tag_plan_compliant: checked['Followed the plan'] ?? draft.tag_plan_compliant,
     };
     if (draft.strategy_id) payload.strategy_id = draft.strategy_id;
     if (draft.trade_grade) payload.trade_grade = draft.trade_grade;
@@ -319,33 +336,134 @@ export function TradeInboxQueue() {
                 </div>
               </div>
 
-              <div className="space-y-2">
-                <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-                  Discipline
-                </span>
-                {(
-                  [
-                    ['tag_hard_sl', 'Hard stop-loss set'],
-                    ['tag_retest', 'Waited for retest'],
-                    ['tag_plan_compliant', 'Followed the plan'],
-                  ] as const
-                ).map(([field, label]) => (
-                  <label
-                    key={field}
-                    className="flex items-center space-x-2 cursor-pointer select-none"
+              <div className="space-y-2 relative">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
+                    Discipline
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsManagingRules((prev) => !prev);
+                      setRuleError(null);
+                    }}
+                    className="text-[10px] text-emerald-400 hover:underline flex items-center gap-1 font-medium"
                   >
-                    <input
-                      type="checkbox"
-                      checked={draft[field]}
-                      disabled={isSubmitting}
-                      onChange={(e) =>
-                        patchDraft(position.id, { [field]: e.target.checked })
-                      }
-                      className="h-3.5 w-3.5 rounded border-obsidian-border bg-obsidian-card accent-win disabled:opacity-50"
-                    />
-                    <span className="text-xs text-slate-300">{label}</span>
-                  </label>
-                ))}
+                    <Plus className="h-3 w-3" />
+                    <span>Manage Rules</span>
+                  </button>
+                </div>
+
+                {/* Manage Rules Popover */}
+                {isManagingRules && (
+                  <div className="absolute right-0 top-6 z-20 w-72 rounded-lg border border-obsidian-border bg-obsidian-card p-3 shadow-xl space-y-3 text-xs">
+                    <div className="flex items-center justify-between border-b border-obsidian-border pb-2">
+                      <span className="font-semibold text-slate-200">Discipline Rules</span>
+                      <button
+                        type="button"
+                        onClick={() => setIsManagingRules(false)}
+                        className="text-obsidian-muted hover:text-slate-200"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+
+                    <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                      {(disciplinesQuery.data ?? []).map((d) => (
+                        <div key={d.id} className="flex items-center justify-between bg-obsidian-bg/60 px-2 py-1 rounded border border-obsidian-border/50 text-slate-300">
+                          <span className="truncate pr-2">{d.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => deleteDisciplineMutation.mutate(d.id)}
+                            disabled={deleteDisciplineMutation.isPending}
+                            className="text-loss hover:opacity-80 p-0.5"
+                            title="Delete rule"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {ruleError && (
+                      <p className="text-[10px] text-loss">{ruleError}</p>
+                    )}
+
+                    <div className="flex gap-1.5 pt-1 border-t border-obsidian-border">
+                      <input
+                        type="text"
+                        value={newRuleName}
+                        onChange={(e) => setNewRuleName(e.target.value)}
+                        placeholder="New rule name…"
+                        className="flex-1 rounded bg-obsidian-bg border border-obsidian-border px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-slate-600"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const name = newRuleName.trim();
+                          if (!name) return;
+                          setRuleError(null);
+                          createDisciplineMutation.mutate(
+                            { name },
+                            {
+                              onSuccess: () => setNewRuleName(''),
+                              onError: (err) => setRuleError(err.message),
+                            }
+                          );
+                        }}
+                        disabled={createDisciplineMutation.isPending || !newRuleName.trim()}
+                        className="rounded bg-win/20 border border-win/40 px-2 py-1 text-win font-medium hover:bg-win/30 disabled:opacity-50"
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {disciplinesQuery.isPending ? (
+                  <div className="text-xs text-obsidian-muted flex items-center gap-1.5 py-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <span>Loading rules…</span>
+                  </div>
+                ) : (disciplinesQuery.data ?? []).length === 0 ? (
+                  <p className="text-xs text-obsidian-muted py-1">No discipline rules defined.</p>
+                ) : (
+                  (disciplinesQuery.data ?? []).map((d) => {
+                    const isChecked = Boolean(
+                      draft.disciplines_checked?.[d.name] ??
+                        (d.name === 'Hard stop-loss set' ? draft.tag_hard_sl :
+                         d.name === 'Waited for retest' ? draft.tag_retest :
+                         d.name === 'Followed the plan' ? draft.tag_plan_compliant : false)
+                    );
+                    return (
+                      <label
+                        key={d.id}
+                        className="flex items-center space-x-2 cursor-pointer select-none"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          disabled={isSubmitting}
+                          onChange={(e) => {
+                            const newChecked = {
+                              ...(draft.disciplines_checked ?? {}),
+                              [d.name]: e.target.checked,
+                            };
+                            const updates: Partial<ReviewDraft> = {
+                              disciplines_checked: newChecked,
+                            };
+                            if (d.name === 'Hard stop-loss set') updates.tag_hard_sl = e.target.checked;
+                            if (d.name === 'Waited for retest') updates.tag_retest = e.target.checked;
+                            if (d.name === 'Followed the plan') updates.tag_plan_compliant = e.target.checked;
+                            patchDraft(position.id, updates);
+                          }}
+                          className="h-3.5 w-3.5 rounded border-obsidian-border bg-obsidian-card accent-win disabled:opacity-50"
+                        />
+                        <span className="text-xs text-slate-300">{d.name}</span>
+                      </label>
+                    );
+                  })
+                )}
               </div>
             </div>
 

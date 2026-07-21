@@ -46,6 +46,20 @@ export interface StrategyUpdatePayload {
 }
 
 // ---------------------------------------------------------------------------
+// Disciplines
+// ---------------------------------------------------------------------------
+
+export interface Discipline {
+  id: string; // UUID
+  name: string;
+  created_at: string | null;
+}
+
+export interface DisciplineCreatePayload {
+  name: string;
+}
+
+// ---------------------------------------------------------------------------
 // Positions
 // ---------------------------------------------------------------------------
 

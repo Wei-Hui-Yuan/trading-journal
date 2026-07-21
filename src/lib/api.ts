@@ -3,6 +3,8 @@ import axios from 'axios';
 import type {
   AdvancedMetrics,
   DashboardStats,
+  Discipline,
+  DisciplineCreatePayload,
   IngestResult,
   ManualTradePayload,
   ManualTradeResult,
@@ -273,4 +275,28 @@ export async function updatePositionReview(
     payload
   );
   return data;
+}
+
+/** DELETE /api/trades/{id} — delete an execution fill from the ledger. */
+export async function deleteTrade(id: string): Promise<void> {
+  await apiClient.delete(`/trades/${id}`);
+}
+
+/** GET /api/disciplines — list all discipline rules. */
+export async function getDisciplines(): Promise<Discipline[]> {
+  const { data } = await apiClient.get<Discipline[]>('/disciplines');
+  return data;
+}
+
+/** POST /api/disciplines — add a new discipline rule. */
+export async function createDiscipline(
+  payload: DisciplineCreatePayload
+): Promise<Discipline> {
+  const { data } = await apiClient.post<Discipline>('/disciplines', payload);
+  return data;
+}
+
+/** DELETE /api/disciplines/{id} — delete a discipline rule. */
+export async function deleteDiscipline(id: string): Promise<void> {
+  await apiClient.delete(`/disciplines/${id}`);
 }

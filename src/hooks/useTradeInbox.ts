@@ -3,23 +3,29 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
-  createManualTrade,
-  getAdvancedMetrics,
-  ingestIBKR,
-  createStrategy,
-  getDashboardAnalytics,
   annotateTrade,
+  createDiscipline,
+  createManualTrade,
+  createStrategy,
+  deleteDiscipline,
+  deleteTrade,
+  getAdvancedMetrics,
+  getDashboardAnalytics,
+  getDisciplines,
   getPendingPositions,
   getPositionFills,
   getRoundTrips,
   getStrategies,
   getTrades,
+  ingestIBKR,
   updatePositionReview,
   updateStrategy,
 } from '@/lib/api';
 import type {
   AdvancedMetrics,
   DashboardStats,
+  Discipline,
+  DisciplineCreatePayload,
   IngestResult,
   ManualTradePayload,
   ManualTradeResult,
@@ -43,6 +49,7 @@ export const queryKeys = {
   roundTrips: ['roundTrips'] as const,
   positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
+  disciplines: ['disciplines'] as const,
   dashboardStats: ['dashboardStats'] as const,
   advancedMetrics: ['advancedMetrics'] as const,
 };
@@ -224,6 +231,52 @@ export function useReviewPosition() {
       queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
       // The journal renders the review inline, so it must not show stale text.
       queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+    },
+  });
+}
+
+/** Delete an execution fill from the trades ledger. */
+export function useDeleteTrade() {
+  const queryClient = useQueryClient();
+  return useMutation<void, Error, string>({
+    mutationFn: deleteTrade,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+    },
+  });
+}
+
+/** Disciplines list for review checklist. */
+export function useDisciplines() {
+  return useQuery<Discipline[]>({
+    queryKey: queryKeys.disciplines,
+    queryFn: getDisciplines,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** Add a new discipline rule. */
+export function useCreateDiscipline() {
+  const queryClient = useQueryClient();
+  return useMutation<Discipline, Error, DisciplineCreatePayload>({
+    mutationFn: createDiscipline,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.disciplines });
+    },
+  });
+}
+
+/** Delete a discipline rule. */
+export function useDeleteDiscipline() {
+  const queryClient = useQueryClient();
+  return useMutation<void, Error, string>({
+    mutationFn: deleteDiscipline,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.disciplines });
     },
   });
 }
