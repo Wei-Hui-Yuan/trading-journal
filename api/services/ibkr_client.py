@@ -9,23 +9,41 @@ is polled until the payload arrives or the attempt budget runs out.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import xml.etree.ElementTree as ET
 from typing import Optional
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 FLEX_BASE = "https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService"
 SEND_REQUEST_URL = f"{FLEX_BASE}.SendRequest"
 GET_STATEMENT_URL = f"{FLEX_BASE}.GetStatement"
 
-# IBKR returns these while the report is still being generated on their side.
-# They are transient: the correct response is to wait and retry, not to fail.
-NOT_READY_CODES = {"1018", "1019"}
+# Transient conditions. All of them mean "wait and ask again", never "give up":
+#   1001 - statement could not be generated at this time (server busy/throttled)
+#   1018 - too many requests have been made
+#   1019 - statement generation in progress
+#
+# 1001 is the one that bites when several queries run in a row: the Flex
+# service rate-limits per token, so the second request is refused. Treated as
+# fatal it fails the whole sync over a condition that clears in seconds.
+NOT_READY_CODES = {"1001", "1018", "1019"}
 
 MAX_POLL_ATTEMPTS = 5
 POLL_DELAY_SECONDS = 4.0
 REQUEST_TIMEOUT = 30.0
+
+# SendRequest is where throttling shows up, so it gets its own retry rather
+# than surfacing to the caller as a failed sync.
+SEND_ATTEMPTS = 3
+SEND_RETRY_DELAY_SECONDS = 5.0
+
+# Breathing room between queries in a multi-query sync, to stay under the
+# per-token rate limit rather than tripping it and recovering.
+BETWEEN_QUERIES_SECONDS = 3.0
 
 
 class IBKRError(RuntimeError):
@@ -75,26 +93,45 @@ def _parse_xml(payload: str) -> ET.Element:
 async def request_statement(
     client: httpx.AsyncClient, token: str, query_id: str
 ) -> str:
-    """Step 1 -- ask IBKR to compile the query; return the ReferenceCode."""
-    response = await client.get(
-        SEND_REQUEST_URL, params={"t": token, "q": query_id, "v": "3"}
-    )
-    response.raise_for_status()
-    root = _parse_xml(response.text)
+    """Step 1 -- ask IBKR to compile the query; return the ReferenceCode.
 
-    status = (_text(root, "Status") or "").lower()
-    if status != "success":
+    Retries the transient refusals itself. The Flex service rate-limits per
+    token, so back-to-back queries routinely draw a "try again shortly", and
+    bubbling that up would fail a sync over something that clears in seconds.
+    """
+    last_error: Optional[IBKRError] = None
+
+    for attempt in range(SEND_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(SEND_RETRY_DELAY_SECONDS)
+
+        response = await client.get(
+            SEND_REQUEST_URL, params={"t": token, "q": query_id, "v": "3"}
+        )
+        response.raise_for_status()
+        root = _parse_xml(response.text)
+
+        status = (_text(root, "Status") or "").lower()
+        if status == "success":
+            reference_code = _text(root, "ReferenceCode")
+            if not reference_code:
+                raise IBKRError("IBKR response contained no ReferenceCode")
+            return reference_code
+
         code = _text(root, "ErrorCode") or ""
         message = _text(root, "ErrorMessage") or "unknown error"
-        raise IBKRError(
+        error = IBKRError(
             f"IBKR rejected the statement request (code {code}): {message}",
             retryable=code in NOT_READY_CODES,
         )
+        # A genuine rejection -- bad token, unknown query -- will not improve
+        # with waiting, so surface it immediately rather than stalling the
+        # request behind pointless retries.
+        if not error.retryable:
+            raise error
+        last_error = error
 
-    reference_code = _text(root, "ReferenceCode")
-    if not reference_code:
-        raise IBKRError("IBKR response contained no ReferenceCode")
-    return reference_code
+    raise last_error or IBKRError("IBKR statement request failed")
 
 
 async def download_statement(
@@ -147,27 +184,45 @@ async def fetch_statement(
 
 async def fetch_statements(
     token: Optional[str] = None, query_ids: Optional[list[str]] = None
-) -> list[tuple[str, ET.Element]]:
-    """Fetch every configured query, returning (query_id, root) pairs.
+) -> tuple[list[tuple[str, ET.Element]], list[str]]:
+    """Fetch every configured query.
 
-    Queries run sequentially rather than concurrently: the Flex service is
-    rate-limited per token, and firing several handshakes at once earns a
-    throttling error rather than a faster sync.
+    Returns the statements that came back and a description of each query that
+    did not, so the caller can ingest what it has *and* say what is missing.
 
-    A failure on any query raises. Skipping the failed one and returning what
-    succeeded would report a healthy sync that quietly omitted a date range --
-    the same silent-loss failure mode that hid the TradeConfirm bug. Ingestion
-    is idempotent, so failing loudly and retrying costs nothing.
+    Queries run sequentially, spaced out: the Flex service rate-limits per
+    token, so firing several handshakes together earns a refusal rather than a
+    faster sync.
+
+    One query failing does not abandon the others. IBKR's limit is measured in
+    minutes, far longer than a request can wait out, so an all-or-nothing sync
+    would routinely return nothing at all. Reporting the failure alongside the
+    partial result keeps that visible instead of silently losing a date range,
+    and ingestion is idempotent so the next run fills the gap.
     """
     if token is None or query_ids is None:
         token, query_ids = get_credentials()
 
     statements: list[tuple[str, ET.Element]] = []
-    for query_id in query_ids:
+    failures: list[str] = []
+
+    for index, query_id in enumerate(query_ids):
+        # Space the requests out. Cheaper to wait than to trip the limit.
+        if index:
+            await asyncio.sleep(BETWEEN_QUERIES_SECONDS)
         try:
             statements.append((query_id, await fetch_statement(token, query_id)))
         except IBKRError as exc:
-            raise IBKRError(
-                f"IBKR query {query_id} failed: {exc}", retryable=exc.retryable
-            ) from exc
-    return statements
+            logger.warning("IBKR query %s failed: %s", query_id, exc)
+            failures.append(f"query {query_id}: {exc}")
+
+    # Nothing at all came back: that is a failed sync, not a partial one.
+    if not statements and failures:
+        raise IBKRError(
+            "; ".join(failures),
+            # Rate limiting and "still generating" both clear on their own, so
+            # let the caller advertise this as worth retrying.
+            retryable=True,
+        )
+
+    return statements, failures

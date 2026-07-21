@@ -296,6 +296,10 @@ class IngestResult(BaseModel):
     # currency conversions in a multi-currency account, which outnumbered the
     # real fills and would otherwise each become a position.
     skipped_non_tradeable: int
+    # Queries that did not return this run -- IBKR rate-limits report
+    # generation per token, and its cooldown outlasts a request. Reported
+    # rather than swallowed so a partial sync never looks like a full one.
+    queries_failed: list[str] = []
 
 
 @app.post(
@@ -322,7 +326,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
 
     # --- 1 & 2: fetch and parse -------------------------------------------
     try:
-        statements = await ibkr_client.fetch_statements()
+        statements, query_failures = await ibkr_client.fetch_statements()
     except ibkr_client.IBKRError as exc:
         # Transient "still compiling" conditions are a 503 so callers retry;
         # everything else is an upstream failure.
@@ -350,6 +354,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             positions_matched=0,
             symbols_touched=[],
             skipped_non_tradeable=skipped_non_tradeable,
+            queries_failed=query_failures,
         )
 
     # --- 3: stage, skipping anything already seen -------------------------
@@ -422,6 +427,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         positions_matched=positions_matched,
         symbols_touched=symbols,
         skipped_non_tradeable=skipped_non_tradeable,
+        queries_failed=query_failures,
     )
 
 

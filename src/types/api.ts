@@ -152,6 +152,13 @@ export interface IngestResult {
    * fills and would otherwise each become a position.
    */
   skipped_non_tradeable: number;
+  /**
+   * Queries that did not return on this run. IBKR rate-limits report
+   * generation per token and its cooldown outlasts a request, so a sync can
+   * legitimately return part of the picture — this says which part is missing
+   * rather than letting a partial sync look complete.
+   */
+  queries_failed: string[];
 }
 
 // ---------------------------------------------------------------------------
