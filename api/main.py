@@ -284,6 +284,8 @@ async def get_session():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     yield
     await engine.dispose()
 
@@ -798,17 +800,40 @@ class DisciplineOut(BaseModel):
         from_attributes = True
 
 
+DEFAULT_DISCIPLINES = [
+    "Hard stop-loss set",
+    "Waited for retest",
+    "Followed the plan",
+]
+
+
 @app.get(
     "/api/disciplines",
     response_model=list[DisciplineOut],
     dependencies=[Depends(verify_clerk_token)],
 )
 async def list_disciplines(session: AsyncSession = Depends(get_session)):
-    """List all discipline rules, ordered by created_at."""
+    """List all discipline rules, ordered by created_at. Auto-seeds defaults if empty."""
     result = await session.execute(
         select(Discipline).order_by(Discipline.created_at.asc())
     )
-    return [DisciplineOut.model_validate(d) for d in result.scalars().all()]
+    disciplines = result.scalars().all()
+    if not disciplines:
+        for name in DEFAULT_DISCIPLINES:
+            session.add(Discipline(name=name))
+        try:
+            await session.commit()
+            result = await session.execute(
+                select(Discipline).order_by(Discipline.created_at.asc())
+            )
+            disciplines = result.scalars().all()
+        except IntegrityError:
+            await session.rollback()
+            result = await session.execute(
+                select(Discipline).order_by(Discipline.created_at.asc())
+            )
+            disciplines = result.scalars().all()
+    return [DisciplineOut.model_validate(d) for d in disciplines]
 
 
 @app.post(
