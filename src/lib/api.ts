@@ -15,6 +15,16 @@ import type {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+declare global {
+  interface Window {
+    Clerk?: {
+      session?: {
+        getToken: () => Promise<string | null>;
+      };
+    };
+  }
+}
+
 // ===========================================================================
 // Typed API client (Phase 1)
 // ===========================================================================
@@ -26,6 +36,23 @@ export const apiClient = axios.create({
   baseURL: `${API_BASE_URL}/api`,
   headers: { 'Content-Type': 'application/json' },
   timeout: 30_000,
+});
+
+/**
+ * Attach the active Clerk session JWT as a Bearer token.
+ *
+ * This module is called from React Query hooks, not components, so the
+ * `useAuth()` hook isn't available here -- `window.Clerk` is Clerk's
+ * documented escape hatch for reaching the session outside of React.
+ */
+apiClient.interceptors.request.use(async (config) => {
+  if (typeof window !== 'undefined') {
+    const token = await window.Clerk?.session?.getToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return config;
 });
 
 /**
