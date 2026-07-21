@@ -1,4 +1,6 @@
+import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -34,6 +36,8 @@ from sqlalchemy.orm import DeclarativeBase
 from auth import verify_clerk_token
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _build_database_url() -> str:
@@ -772,6 +776,41 @@ class PositionFillOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+@app.get("/health")
+async def health(session: AsyncSession = Depends(get_session)):
+    """Liveness and database reachability.
+
+    Deliberately unauthenticated, and deliberately free of any trade data: it
+    reports *which* database this deployment is talking to, not what is in it.
+
+    The absence of this endpoint made a whole class of problem undiagnosable.
+    A deployment pointed at the wrong database serves perfectly valid empty
+    responses, which look exactly like an account that has never traded --
+    from outside, the two are indistinguishable. The project ref settles it.
+    """
+    try:
+        await session.execute(select(1))
+        database = "ok"
+    except Exception as exc:  # noqa: BLE001 - health must never itself 500
+        logger.error("Health check could not reach the database: %s", exc)
+        database = "unreachable"
+
+    # Host only. The password lives in the same string and must never surface,
+    # so this is parsed out rather than echoed.
+    host = ""
+    match = re.search(r"@([^/]+)/", DATABASE_URL)
+    if match:
+        host = match.group(1)
+    ref_match = re.search(r"postgres\.([a-z0-9]+)", DATABASE_URL)
+
+    return {
+        "status": "ok",
+        "database": database,
+        "database_host": host,
+        "supabase_project_ref": ref_match.group(1) if ref_match else None,
+    }
 
 
 class TradeOut(BaseModel):

@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { AlertCircle } from 'lucide-react';
 
 import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
@@ -54,7 +55,22 @@ export default function Home() {
 
         {/* Top KPI Stat Strip */}
         <section>
-          <KPIStatStrip stats={kpiStats} />
+          {/* A failed request must not render as zeros. The strip has no way
+              to express "unknown", so a dead API produced a confident
+              "0 trades, $0.00" -- indistinguishable from an empty account,
+              and the reason a broken backend looked like no trading history. */}
+          {dashboardQuery.isError ? (
+            <div className="flex items-center gap-2 rounded-xl border border-loss/30 bg-loss-glow px-4 py-3 text-sm text-loss">
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              <span>
+                Could not load statistics —{' '}
+                {(dashboardQuery.error as Error)?.message ?? 'request failed'}.
+                Figures below are not zero, they are unknown.
+              </span>
+            </div>
+          ) : (
+            <KPIStatStrip stats={kpiStats} />
+          )}
         </section>
 
         {/* Day-of-Week Heatmap Layout Grid */}
