@@ -31,7 +31,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from asyncpg.exceptions import UndefinedTableError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -284,8 +285,22 @@ async def get_session():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Startup and shutdown.
+
+    Deliberately does NOT call Base.metadata.create_all. Auto-creating missing
+    tables at boot looks like a convenience and is a trap here: create_all
+    issues DDL and schema-reflection queries, which Supabase's transaction-mode
+    pooler (PgBouncer, port 6543) does not support on a startup connection.
+    asyncpg fails, the process dies before serving a single request, and the
+    whole service is down -- a strictly worse outcome than the one missing
+    table it was meant to paper over.
+
+    It is also the wrong shape of fix: create_all builds schema but never data,
+    so it produced an empty `disciplines` table with no seed rows and no column
+    defaults, leaving the database quietly diverged from what the migration
+    files describe. Schema changes belong in api/migrations/, applied
+    deliberately.
+    """
     yield
     await engine.dispose()
 
@@ -813,27 +828,33 @@ DEFAULT_DISCIPLINES = [
     dependencies=[Depends(verify_clerk_token)],
 )
 async def list_disciplines(session: AsyncSession = Depends(get_session)):
-    """List all discipline rules, ordered by created_at. Auto-seeds defaults if empty."""
-    result = await session.execute(
-        select(Discipline).order_by(Discipline.created_at.asc())
-    )
-    disciplines = result.scalars().all()
-    if not disciplines:
-        for name in DEFAULT_DISCIPLINES:
-            session.add(Discipline(name=name))
-        try:
-            await session.commit()
-            result = await session.execute(
-                select(Discipline).order_by(Discipline.created_at.asc())
-            )
-            disciplines = result.scalars().all()
-        except IntegrityError:
-            await session.rollback()
-            result = await session.execute(
-                select(Discipline).order_by(Discipline.created_at.asc())
-            )
-            disciplines = result.scalars().all()
-    return [DisciplineOut.model_validate(d) for d in disciplines]
+    """List all discipline rules, oldest first.
+
+    Seeding moved out of the read path and into the migration. A GET that
+    writes is surprising on its own, and this one would resurrect the default
+    rules every time the user deleted all of them -- the list emptying is a
+    deliberate act, not a state to be repaired.
+
+    Only a missing table is swallowed, and only so a deployment that has not
+    yet had the migration applied degrades to an empty checklist instead of a
+    broken review panel. Every other error propagates: catching bare Exception
+    here would render a dropped connection or a timeout as "you have no
+    discipline rules", indistinguishable from the truth, and is the same
+    failure that once made a dead dashboard read as a flat 0% win rate.
+    """
+    try:
+        result = await session.execute(
+            select(Discipline).order_by(Discipline.created_at.asc())
+        )
+    except ProgrammingError as exc:
+        # asyncpg raises UndefinedTableError, which SQLAlchemy wraps.
+        if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            raise
+        logger.warning("disciplines table is missing; apply the migration")
+        await session.rollback()
+        return []
+
+    return [DisciplineOut.model_validate(d) for d in result.scalars().all()]
 
 
 @app.post(
@@ -856,6 +877,20 @@ async def create_discipline(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A discipline rule named '{params.name}' already exists",
+        )
+    except ProgrammingError as exc:
+        # A missing table is an operator problem, not a bad request. 503 with
+        # the remedy beats the 500 the user actually saw, which said only
+        # "Internal Server Error" and named nothing.
+        await session.rollback()
+        if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The disciplines table does not exist. Apply the pending "
+                "migration to this database."
+            ),
         )
     await session.refresh(discipline)
     return DisciplineOut.model_validate(discipline)
