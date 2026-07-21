@@ -206,3 +206,34 @@ class TestConfiguration:
             _verify(_sign(signing_key, _claims()))
         assert exc.value.status_code in (500, 401)
         assert exc.value.status_code != 200
+
+
+class TestJwksUrlNormalization:
+    """The bare Clerk origin answers 200 with an empty body, so omitting the
+    well-known path fails as an opaque JSON error rather than an obvious
+    misconfiguration. Normalize instead of trusting operators to get it right.
+    """
+
+    @pytest.mark.parametrize(
+        "configured",
+        [
+            ISSUER,  # bare origin -- the mistake that broke production
+            f"{ISSUER}/",  # trailing slash
+            JWKS_URL,  # already correct, must stay unchanged
+            f'"{JWKS_URL}"',  # pasted with quotes
+            f"  {JWKS_URL}  ",  # pasted with whitespace
+        ],
+    )
+    def test_resolves_to_the_jwks_endpoint(self, monkeypatch, configured):
+        monkeypatch.setenv("CLERK_JWKS_URL", configured)
+        assert auth._jwks_url() == JWKS_URL
+
+    def test_issuer_still_derives_correctly_from_the_bare_origin(self, monkeypatch):
+        monkeypatch.setenv("CLERK_JWKS_URL", ISSUER)
+        monkeypatch.delenv("CLERK_ISSUER", raising=False)
+        assert auth._expected_issuer() == ISSUER
+
+    def test_bare_origin_now_verifies_a_real_token(self, monkeypatch, signing_key):
+        """End to end: the misconfiguration should no longer reject users."""
+        monkeypatch.setenv("CLERK_JWKS_URL", ISSUER)
+        assert _verify(_sign(signing_key, _claims()))["sub"]

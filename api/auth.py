@@ -42,6 +42,9 @@ JWKS_MIN_REFRESH_SECONDS = 60.0
 
 JWKS_TIMEOUT_SECONDS = 10.0
 
+# Clerk publishes the key set at this path under the frontend-API origin.
+JWKS_PATH = "/.well-known/jwks.json"
+
 # Clerk session tokens are short-lived (~60s) and the frontend refreshes them,
 # so a little tolerance for clock drift between Northflank and Clerk avoids
 # spurious 401s at the boundary.
@@ -73,7 +76,7 @@ def _unauthorized() -> HTTPException:
 
 
 def _jwks_url() -> str:
-    url = os.environ.get("CLERK_JWKS_URL", "").strip()
+    url = os.environ.get("CLERK_JWKS_URL", "").strip().strip('"').strip("'")
     if not url:
         # A misconfigured server must not silently accept traffic; 500 so the
         # deployment is visibly broken instead of quietly open.
@@ -82,6 +85,13 @@ def _jwks_url() -> str:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication is not configured on this server",
         )
+
+    # Accept the bare Clerk frontend-API origin as well as the full URL.
+    # The origin answers 200 with an *empty body* rather than 404, so the
+    # omission surfaced as a baffling JSON parse error instead of an obvious
+    # misconfiguration. Normalizing costs nothing and removes the trap.
+    if not url.rstrip("/").endswith(JWKS_PATH):
+        url = url.rstrip("/") + JWKS_PATH
     return url
 
 
@@ -113,12 +123,31 @@ async def _refresh_jwks() -> None:
             async with httpx.AsyncClient(timeout=JWKS_TIMEOUT_SECONDS) as client:
                 response = await client.get(url)
                 response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPError as exc:
             logger.error("Could not fetch Clerk JWKS from %s: %s", url, exc)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Could not reach the authentication service",
+            ) from exc
+
+        # Kept separate from the transport failure above: a host that answers
+        # but hands back something that isn't a key set is a configuration
+        # problem, and calling that "could not reach" sends you hunting for a
+        # network fault that does not exist.
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            logger.error(
+                "Clerk JWKS at %s returned %s that is not JSON (HTTP %s, %d bytes): %s",
+                url,
+                response.headers.get("content-type", "an unknown type"),
+                response.status_code,
+                len(response.content),
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service returned an unexpected response",
             ) from exc
 
         keys: dict[str, PyJWK] = {}
