@@ -11,6 +11,7 @@ import {
   annotateTrade,
   getPendingPositions,
   getPositionFills,
+  getRoundTrips,
   getStrategies,
   getTrades,
   updatePositionReview,
@@ -25,6 +26,7 @@ import type {
   Position,
   PositionFill,
   PositionReviewPayload,
+  RoundTrip,
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
@@ -38,6 +40,7 @@ import type {
 export const queryKeys = {
   pendingPositions: ['positions', 'pending'] as const,
   trades: ['trades'] as const,
+  roundTrips: ['roundTrips'] as const,
   positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
   dashboardStats: ['dashboardStats'] as const,
@@ -76,7 +79,15 @@ export function useTrades() {
   });
 }
 
-/** Attach a strategy or thesis to an execution already in the ledger. */
+/** The journal: one row per trade idea, open or closed. */
+export function useRoundTrips() {
+  return useQuery<RoundTrip[]>({
+    queryKey: queryKeys.roundTrips,
+    queryFn: () => getRoundTrips(),
+  });
+}
+
+/** Attach a strategy, thesis or plan to a round trip's opening execution. */
 export function useAnnotateTrade() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -84,6 +95,10 @@ export function useAnnotateTrade() {
       annotateTrade(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+      // The journal reads the plan off this execution, and analytics scores R
+      // from it -- both go stale the moment a stop changes.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
     },
   });
 }
@@ -207,6 +222,8 @@ export function useReviewPosition() {
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
       // Newly attached mistake tags change the per-mistake breakdown.
       queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      // The journal renders the review inline, so it must not show stale text.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
     },
   });
 }

@@ -119,8 +119,13 @@ class Trade(Base):
     quantity = Column(Numeric(18, 8), nullable=False)
     planned_entry = Column(Numeric(10, 4), nullable=True)
     stop_loss = Column(Numeric(10, 4), nullable=True)
+    # Where the stop ACTUALLY sat, after any mid-trade moves. Separate from
+    # stop_loss so widening a stop shows up instead of overwriting the intent.
+    actual_stop_loss = Column(Numeric(10, 4), nullable=True)
     target = Column(Numeric(10, 4), nullable=True)
     risk_percent = Column(Numeric(4, 2), default=1.00)
+    # The absolute figure, which is what turns an R-multiple back into money.
+    risk_amount = Column(Numeric(12, 2), nullable=True)
     strategy_id = Column(
         UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
     )
@@ -131,6 +136,10 @@ class Trade(Base):
     # outcome is known, which is the whole point -- a thesis reconstructed
     # afterwards is just the result with reasoning attached.
     thesis = Column(Text, nullable=True)
+    # Rated at entry, before the outcome is known. Correlating conviction
+    # against realised R is how overconfidence becomes a number.
+    conviction = Column(Integer, nullable=True)
+    emotional_state = Column(Text, nullable=True)
     screenshot_url = Column(Text, nullable=True)
     hard_sl_set = Column(Boolean, default=True)
     waited_retest = Column(Boolean, default=True)
@@ -189,6 +198,23 @@ class Position(Base):
     review_went_well = Column(Text, nullable=True)
     review_went_wrong = Column(Text, nullable=True)
     review_lessons = Column(Text, nullable=True)
+
+    # How the round trip ended (migration 012). The cheapest field that
+    # exposes cutting winners early while letting losers run to the stop.
+    exit_reason = Column(Text, nullable=True)
+
+    # Hindsight levels, in two families that must not be merged.
+    # ideal_*   -- what this trade's levels should have been, judged after the
+    #              fact. Scores PLAN quality, which a good plan executed badly
+    #              and a bad plan executed well cannot be told apart without.
+    ideal_entry = Column(Numeric(10, 4), nullable=True)
+    ideal_stop = Column(Numeric(10, 4), nullable=True)
+    ideal_target = Column(Numeric(10, 4), nullable=True)
+    # revised_* -- the corrected rule for the NEXT instance of this setup.
+    #              Aggregates by strategy and feeds the playbook.
+    revised_entry = Column(Numeric(10, 4), nullable=True)
+    revised_stop = Column(Numeric(10, 4), nullable=True)
+    revised_target = Column(Numeric(10, 4), nullable=True)
 
 
 class PositionFill(Base):
@@ -765,6 +791,15 @@ class PositionReviewUpdate(BaseModel):
     review_went_wrong: Optional[str] = None
     review_lessons: Optional[str] = None
 
+    # How it ended, and the two families of hindsight levels (migration 012).
+    exit_reason: Optional[str] = None
+    ideal_entry: Optional[float] = Field(None, gt=0)
+    ideal_stop: Optional[float] = Field(None, gt=0)
+    ideal_target: Optional[float] = Field(None, gt=0)
+    revised_entry: Optional[float] = Field(None, gt=0)
+    revised_stop: Optional[float] = Field(None, gt=0)
+    revised_target: Optional[float] = Field(None, gt=0)
+
 
 class PositionOut(BaseModel):
     id: uuid.UUID
@@ -787,6 +822,13 @@ class PositionOut(BaseModel):
     review_went_well: Optional[str] = None
     review_went_wrong: Optional[str] = None
     review_lessons: Optional[str] = None
+    exit_reason: Optional[str] = None
+    ideal_entry: Optional[float] = None
+    ideal_stop: Optional[float] = None
+    ideal_target: Optional[float] = None
+    revised_entry: Optional[float] = None
+    revised_stop: Optional[float] = None
+    revised_target: Optional[float] = None
     created_at: Optional[datetime]
 
     @field_validator("mistakes", mode="before")
@@ -829,6 +871,8 @@ async def health(session: AsyncSession = Depends(get_session)):
     responses, which look exactly like an account that has never traded --
     from outside, the two are indistinguishable. The project ref settles it.
     """
+    database = "ok"
+    database_error: Optional[str] = None
     try:
         await session.execute(select(1))
     except Exception as exc:  # noqa: BLE001 - health must never itself 500
@@ -880,7 +924,12 @@ class TradeOut(BaseModel):
     thesis: Optional[str]
     planned_entry: Optional[float]
     stop_loss: Optional[float]
+    actual_stop_loss: Optional[float] = None
     target: Optional[float]
+    risk_percent: Optional[float] = None
+    risk_amount: Optional[float] = None
+    conviction: Optional[int] = None
+    emotional_state: Optional[str] = None
     # True once FIFO matching has folded this fill into a closed round trip.
     # A fill with no counterpart is an open position, which is precisely what
     # the positions list cannot show -- and why a hand-logged buy appeared to
@@ -900,6 +949,18 @@ class TradeAnnotationUpdate(BaseModel):
 
     strategy_id: Optional[uuid.UUID] = None
     thesis: Optional[str] = None
+
+    # The plan. Carried by the opening execution of a round trip, which is the
+    # only place a still-open trade can hold one -- `positions` rows do not
+    # exist until the trade closes.
+    planned_entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    actual_stop_loss: Optional[float] = Field(None, gt=0)
+    target: Optional[float] = Field(None, gt=0)
+    risk_percent: Optional[float] = Field(None, ge=0)
+    risk_amount: Optional[float] = Field(None, ge=0)
+    conviction: Optional[int] = Field(None, ge=1, le=5)
+    emotional_state: Optional[str] = None
 
 
 @app.get(
@@ -1018,6 +1079,295 @@ async def list_position_fills(
     )
     result = await session.execute(stmt)
     return [PositionFillOut.model_validate(f) for f in result.scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# The journal: round trips, not executions
+# ---------------------------------------------------------------------------
+
+
+class RoundTripOut(BaseModel):
+    """One trade idea, whatever number of executions it took.
+
+    The ledger used to list raw fills, which is why a single CRWD trade showed
+    up as four rows: the broker filled the entry with two orders and the exit
+    with two more. Those four executions were always one round trip in the
+    data -- `positions` plus `position_fills` -- the view simply never used it.
+
+    `kind` distinguishes the two things a journal must show side by side:
+      closed -- a completed round trip, backed by a `positions` row.
+      open   -- exposure with no counterpart yet, which has no position row at
+                all and so was invisible on every other surface.
+    """
+
+    kind: str  # "closed" | "open"
+    key: str  # stable react key; position id, or "open:TICKER"
+    position_id: Optional[uuid.UUID] = None
+    # The execution that carries the plan. For a scale-in there are several
+    # candidates and exactly one must own it, or two contradictory stops could
+    # be stored with no way to say which was meant.
+    plan_trade_id: Optional[uuid.UUID] = None
+
+    symbol: str
+    direction: str
+    quantity: float
+    entry_price: float
+    exit_price: Optional[float] = None
+    entry_time: datetime
+    exit_time: Optional[datetime] = None
+    realized_pnl: Optional[float] = None
+    execution_count: int
+
+    # Scored, never stored: R recomputed from the current entry/exit/stop, so
+    # correcting a stop cannot leave a stale R behind.
+    r_multiple: Optional[float] = None
+    planned_r_multiple: Optional[float] = None
+
+    # --- the plan, from the opening execution -------------------------
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+    planned_entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    actual_stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    risk_percent: Optional[float] = None
+    risk_amount: Optional[float] = None
+    conviction: Optional[int] = None
+    emotional_state: Optional[str] = None
+
+    # --- the review, from the position (closed only) ------------------
+    review_status: Optional[str] = None
+    trade_grade: Optional[str] = None
+    notes: Optional[str] = None
+    mistakes: list[str] = []
+    review_went_well: Optional[str] = None
+    review_went_wrong: Optional[str] = None
+    review_lessons: Optional[str] = None
+    exit_reason: Optional[str] = None
+    ideal_entry: Optional[float] = None
+    ideal_stop: Optional[float] = None
+    ideal_target: Optional[float] = None
+    revised_entry: Optional[float] = None
+    revised_stop: Optional[float] = None
+    revised_target: Optional[float] = None
+
+    fills: list[PositionFillOut] = []
+
+
+def _score_r(
+    direction: str,
+    entry: Optional[Decimal],
+    exit_price: Optional[Decimal],
+    stop: Optional[Decimal],
+) -> Optional[float]:
+    """Reward in units of risk, or None when it cannot honestly be scored.
+
+    Delegates to the analytics implementation rather than restating the
+    formula: two copies of a sign convention drift, and a journal that scores
+    a short trade differently from the analytics page is worse than one that
+    does not score it at all.
+    """
+    from services.analytics import (  # noqa: PLC0415 - avoids an import cycle
+        ReviewedTrade,
+        compute_r_multiple,
+    )
+
+    if entry is None or exit_price is None or stop is None:
+        return None
+
+    return compute_r_multiple(
+        ReviewedTrade(
+            trade_id="",
+            ticker="",
+            direction=direction,
+            quantity=0,
+            actual_entry=Decimal(str(entry)),
+            exit_price=Decimal(str(exit_price)),
+            planned_entry=None,
+            stop_loss=Decimal(str(stop)),
+            mistakes=[],
+            review_status=None,
+        )
+    )
+
+
+def _plan_fields(trade: Optional[Trade]) -> dict:
+    """Plan attributes off the opening execution, or empty when absent."""
+    if trade is None:
+        return {}
+    return {
+        "strategy_id": trade.strategy_id,
+        "thesis": trade.thesis,
+        "planned_entry": trade.planned_entry,
+        "stop_loss": trade.stop_loss,
+        "actual_stop_loss": trade.actual_stop_loss,
+        "target": trade.target,
+        "risk_percent": trade.risk_percent,
+        "risk_amount": trade.risk_amount,
+        "conviction": trade.conviction,
+        "emotional_state": trade.emotional_state,
+    }
+
+
+@app.get(
+    "/api/round-trips",
+    response_model=list[RoundTripOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_round_trips(
+    ticker: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """The journal, grouped the way trades are actually thought about.
+
+    Closed round trips come from `positions`; open exposure is reconstructed
+    from executions that FIFO matching never paired off. Both carry their plan
+    and their fills, so one row is a whole trade rather than a fragment.
+    """
+    # Reused rather than hardcoded as "OPEN": the role vocabulary belongs to
+    # the matching engine, and two copies would drift.
+    from services.matching_engine import ROLE_OPEN  # noqa: PLC0415 - import cycle
+
+    positions = (
+        await session.execute(select(Position).order_by(Position.exit_time.desc()))
+    ).scalars().all()
+    trades = (await session.execute(select(Trade))).scalars().all()
+    fills = (await session.execute(select(PositionFill))).scalars().all()
+
+    trade_by_id = {t.id: t for t in trades}
+    fills_by_position: dict[uuid.UUID, list[PositionFill]] = {}
+    for fill in fills:
+        fills_by_position.setdefault(fill.position_id, []).append(fill)
+    matched_trade_ids = {f.trade_id for f in fills}
+
+    rows: list[RoundTripOut] = []
+
+    # --- closed round trips ------------------------------------------------
+    for position in positions:
+        if ticker and position.symbol != ticker.strip().upper():
+            continue
+        opening = trade_by_id.get(position.open_trade_id)
+        direction = (opening.direction if opening else "BUY") or "BUY"
+        plan = _plan_fields(opening)
+
+        entry = position.entry_price
+        stop = plan.get("actual_stop_loss") or plan.get("stop_loss")
+        # Realised R is measured against the stop that was actually live; the
+        # planned ratio is what the trade was *supposed* to return, so it uses
+        # the planned stop and target. Mixing them would flatter every trade
+        # where the stop was widened.
+        planned_r = _score_r(
+            direction, plan.get("planned_entry") or entry,
+            plan.get("target"), plan.get("stop_loss"),
+        )
+
+        position_fills = sorted(
+            fills_by_position.get(position.id, []),
+            key=lambda f: (f.executed_at, f.role),
+        )
+        rows.append(
+            RoundTripOut(
+                kind="closed",
+                key=str(position.id),
+                position_id=position.id,
+                plan_trade_id=position.open_trade_id,
+                symbol=position.symbol,
+                direction=direction,
+                quantity=float(position.quantity or 0),
+                entry_price=float(entry or 0),
+                exit_price=float(position.exit_price) if position.exit_price is not None else None,
+                entry_time=position.entry_time,
+                exit_time=position.exit_time,
+                realized_pnl=float(position.realized_pnl) if position.realized_pnl is not None else None,
+                execution_count=len(position_fills),
+                r_multiple=_score_r(direction, entry, position.exit_price, stop),
+                planned_r_multiple=planned_r,
+                review_status=position.review_status,
+                trade_grade=position.trade_grade,
+                notes=position.notes,
+                mistakes=list(position.mistakes or []),
+                review_went_well=position.review_went_well,
+                review_went_wrong=position.review_went_wrong,
+                review_lessons=position.review_lessons,
+                exit_reason=position.exit_reason,
+                ideal_entry=position.ideal_entry,
+                ideal_stop=position.ideal_stop,
+                ideal_target=position.ideal_target,
+                revised_entry=position.revised_entry,
+                revised_stop=position.revised_stop,
+                revised_target=position.revised_target,
+                fills=[PositionFillOut.model_validate(f) for f in position_fills],
+                **plan,
+            )
+        )
+
+    # --- open exposure -----------------------------------------------------
+    # Executions FIFO never paired off. Grouped per ticker, because that is the
+    # unit of exposure: two unsold AAPL buys are one open position, not two.
+    open_by_ticker: dict[str, list[Trade]] = {}
+    for trade in trades:
+        if trade.id in matched_trade_ids:
+            continue
+        if ticker and trade.ticker != ticker.strip().upper():
+            continue
+        open_by_ticker.setdefault(trade.ticker, []).append(trade)
+
+    for symbol, group in open_by_ticker.items():
+        group.sort(key=lambda t: t.entry_date)
+        signed = sum(
+            (t.quantity or Decimal("0"))
+            * (Decimal("1") if (t.direction or "BUY").upper() == "BUY" else Decimal("-1"))
+            for t in group
+        )
+        if signed == 0:
+            # Nets flat without ever being matched -- a data oddity rather than
+            # live exposure. Skipped rather than rendered as a zero-size row.
+            continue
+
+        net_direction = "BUY" if signed > 0 else "SELL"
+        side = [t for t in group if (t.direction or "BUY").upper() == net_direction]
+        qty = sum((t.quantity or Decimal("0")) for t in side) or Decimal("1")
+        # Quantity-weighted, so scaling in reports the real average cost.
+        avg_entry = sum(
+            (t.actual_entry or Decimal("0")) * (t.quantity or Decimal("0")) for t in side
+        ) / qty
+
+        opening = group[0]
+        plan = _plan_fields(opening)
+        rows.append(
+            RoundTripOut(
+                kind="open",
+                key=f"open:{symbol}",
+                position_id=None,
+                plan_trade_id=opening.id,
+                symbol=symbol,
+                direction=net_direction,
+                quantity=float(abs(signed)),
+                entry_price=float(avg_entry),
+                entry_time=opening.entry_date,
+                execution_count=len(group),
+                planned_r_multiple=_score_r(
+                    net_direction, plan.get("planned_entry") or avg_entry,
+                    plan.get("target"), plan.get("stop_loss"),
+                ),
+                fills=[
+                    PositionFillOut(
+                        id=t.id,
+                        trade_id=t.id,
+                        role=ROLE_OPEN,
+                        quantity=float(t.quantity or 0),
+                        price=float(t.actual_entry or 0),
+                        executed_at=t.entry_date,
+                    )
+                    for t in group
+                ],
+                **plan,
+            )
+        )
+
+    # Open exposure first (it needs decisions), then closed by recency.
+    rows.sort(key=lambda r: (r.kind != "open", -(r.exit_time or r.entry_time).timestamp()))
+    return rows
 
 
 # Both verbs hit the same handler: PUT is the documented route, PATCH is

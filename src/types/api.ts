@@ -130,6 +130,15 @@ export interface PositionReviewPayload {
   review_went_well?: string | null;
   review_went_wrong?: string | null;
   review_lessons?: string | null;
+  exit_reason?: string | null;
+  /** Hindsight-optimal levels for THIS trade — scores plan quality. */
+  ideal_entry?: number | null;
+  ideal_stop?: number | null;
+  ideal_target?: number | null;
+  /** The corrected rule for the NEXT instance of this setup. */
+  revised_entry?: number | null;
+  revised_stop?: number | null;
+  revised_target?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +244,82 @@ export interface Trade {
   created_at: string | null;
 }
 
+/**
+ * One trade idea, however many executions it took — GET /api/round-trips.
+ *
+ * The ledger used to list raw fills, which is why a single CRWD trade appeared
+ * as four rows: the broker filled the entry with two orders and the exit with
+ * two more. Those executions were always one round trip in the data; this is
+ * the shape that says so.
+ */
+export interface RoundTrip {
+  kind: 'closed' | 'open';
+  key: string;
+  position_id: string | null;
+  /** The execution that owns the plan. A scale-in has several candidates. */
+  plan_trade_id: string | null;
+
+  symbol: string;
+  direction: TradeSide;
+  quantity: number;
+  entry_price: number;
+  exit_price: number | null;
+  entry_time: string;
+  exit_time: string | null;
+  realized_pnl: number | null;
+  execution_count: number;
+
+  /** Computed server-side from entry/exit/stop, never stored. */
+  r_multiple: number | null;
+  planned_r_multiple: number | null;
+
+  strategy_id: string | null;
+  thesis: string | null;
+  planned_entry: number | null;
+  stop_loss: number | null;
+  actual_stop_loss: number | null;
+  target: number | null;
+  risk_percent: number | null;
+  risk_amount: number | null;
+  conviction: number | null;
+  emotional_state: string | null;
+
+  review_status: string | null;
+  trade_grade: string | null;
+  notes: string | null;
+  mistakes: string[];
+  review_went_well: string | null;
+  review_went_wrong: string | null;
+  review_lessons: string | null;
+  exit_reason: string | null;
+  ideal_entry: number | null;
+  ideal_stop: number | null;
+  ideal_target: number | null;
+  revised_entry: number | null;
+  revised_stop: number | null;
+  revised_target: number | null;
+
+  fills: PositionFill[];
+}
+
 /** Body for PATCH /api/trades/{id}. Only present keys are applied. */
 export interface TradeAnnotationPayload {
   strategy_id?: string | null;
   thesis?: string | null;
+  /**
+   * The plan, carried by the round trip's opening execution — the only place a
+   * still-open trade can hold one, since `positions` rows exist only once it
+   * closes.
+   */
+  planned_entry?: number | null;
+  stop_loss?: number | null;
+  actual_stop_loss?: number | null;
+  target?: number | null;
+  risk_percent?: number | null;
+  risk_amount?: number | null;
+  /** 1–5, rated at entry — correlates against realised R. */
+  conviction?: number | null;
+  emotional_state?: string | null;
 }
 
 export interface ManualTradeResult {

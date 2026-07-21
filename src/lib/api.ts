@@ -9,6 +9,7 @@ import type {
   Position,
   PositionFill,
   PositionReviewPayload,
+  RoundTrip,
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
@@ -167,6 +168,19 @@ export async function getPositionFills(id: string): Promise<PositionFill[]> {
  */
 export async function getTrades(ticker?: string): Promise<Trade[]> {
   const { data } = await apiClient.get<Trade[]>('/trades', {
+    params: ticker ? { ticker } : undefined,
+  });
+  return data;
+}
+
+/**
+ * GET /api/round-trips — the journal, one row per trade idea.
+ *
+ * Prefer this over getTrades() for anything user-facing: /trades returns raw
+ * executions, so a scale-in reads as several unrelated rows.
+ */
+export async function getRoundTrips(ticker?: string): Promise<RoundTrip[]> {
+  const { data } = await apiClient.get<RoundTrip[]>('/round-trips', {
     params: ticker ? { ticker } : undefined,
   });
   return data;

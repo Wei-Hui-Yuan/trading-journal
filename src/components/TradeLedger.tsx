@@ -11,8 +11,13 @@ import {
   Search,
 } from 'lucide-react';
 
-import { useAnnotateTrade, useStrategies, useTrades } from '@/hooks/useTradeInbox';
-import type { Trade } from '@/types/api';
+import {
+  useAnnotateTrade,
+  useReviewPosition,
+  useRoundTrips,
+  useStrategies,
+} from '@/hooks/useTradeInbox';
+import type { RoundTrip } from '@/types/api';
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
   year: 'numeric',
@@ -29,49 +34,214 @@ function formatQuantity(quantity: number): string {
   return Number(quantity.toFixed(8)).toString();
 }
 
+/** Empty means "not recorded" and must reach the API as null, never as 0. */
+function parseNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toField(value: number | null | undefined): string {
+  return value === null || value === undefined ? '' : String(value);
+}
+
+const EXIT_REASONS = [
+  'Target hit',
+  'Stopped out',
+  'Trailing stop',
+  'Manual exit',
+  'Time stop',
+  'Thesis invalidated',
+];
+
 type Filter = 'all' | 'open' | 'closed';
 
+interface PlanDraft {
+  strategyId: string;
+  thesis: string;
+  plannedEntry: string;
+  stopLoss: string;
+  actualStopLoss: string;
+  target: string;
+  riskPercent: string;
+  riskAmount: string;
+  conviction: string;
+  emotionalState: string;
+}
+
+interface ReviewDraft {
+  exitReason: string;
+  wentWell: string;
+  wentWrong: string;
+  lessons: string;
+  grade: string;
+  idealEntry: string;
+  idealStop: string;
+  idealTarget: string;
+  revisedEntry: string;
+  revisedStop: string;
+  revisedTarget: string;
+}
+
+function planDraftFrom(rt: RoundTrip): PlanDraft {
+  return {
+    strategyId: rt.strategy_id ?? '',
+    thesis: rt.thesis ?? '',
+    plannedEntry: toField(rt.planned_entry),
+    stopLoss: toField(rt.stop_loss),
+    actualStopLoss: toField(rt.actual_stop_loss),
+    target: toField(rt.target),
+    riskPercent: toField(rt.risk_percent),
+    riskAmount: toField(rt.risk_amount),
+    conviction: toField(rt.conviction),
+    emotionalState: rt.emotional_state ?? '',
+  };
+}
+
+function reviewDraftFrom(rt: RoundTrip): ReviewDraft {
+  return {
+    exitReason: rt.exit_reason ?? '',
+    wentWell: rt.review_went_well ?? '',
+    wentWrong: rt.review_went_wrong ?? '',
+    lessons: rt.review_lessons ?? '',
+    grade: rt.trade_grade ?? '',
+    idealEntry: toField(rt.ideal_entry),
+    idealStop: toField(rt.ideal_stop),
+    idealTarget: toField(rt.ideal_target),
+    revisedEntry: toField(rt.revised_entry),
+    revisedStop: toField(rt.revised_stop),
+    revisedTarget: toField(rt.revised_target),
+  };
+}
+
+const fieldClass =
+  'w-full rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs text-slate-200 ' +
+  'placeholder:text-obsidian-muted focus:outline-none focus:border-slate-600 transition-colors';
+
+const labelClass = 'text-[10px] uppercase tracking-wide text-obsidian-muted';
+
+const Field: React.FC<{
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}> = ({ label, hint, children }) => (
+  <label className="block">
+    <span className={labelClass}>{label}</span>
+    {children}
+    {hint && <span className="mt-1 block text-[10px] text-slate-600">{hint}</span>}
+  </label>
+);
+
+const SectionHeading: React.FC<{ title: string; blurb: string }> = ({ title, blurb }) => (
+  <div className="mb-3">
+    <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+      {title}
+    </h4>
+    <p className="text-[10px] text-obsidian-muted">{blurb}</p>
+  </div>
+);
+
+/** R is the headline number, so it gets colour and a sign. */
+const RBadge: React.FC<{ value: number | null; label?: string }> = ({ value, label }) => {
+  if (value === null || value === undefined) return null;
+  const positive = value >= 0;
+  return (
+    <span
+      className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] ${
+        positive ? 'bg-win/10 text-win' : 'bg-loss/10 text-loss'
+      }`}
+      title={label ?? 'Realised R — reward in units of the risk taken'}
+    >
+      {positive ? '+' : ''}
+      {value.toFixed(2)}R
+    </span>
+  );
+};
+
 /**
- * The master list: every execution, open or closed.
+ * The journal, grouped by trade idea rather than by execution.
  *
- * The Trade Inbox and analytics both read `positions`, which only ever holds
- * *closed* round trips. A buy that has not been sold produces no position, so
- * before this view a hand-logged entry was saved correctly and then appeared
- * nowhere at all.
+ * A single CRWD trade used to render as four rows, because the broker filled
+ * the entry with two orders and the exit with two more. Those executions were
+ * always one round trip in the data (`positions` + `position_fills`); this view
+ * finally uses it. Open exposure — which has no position row at all, and so was
+ * invisible on every other surface — is reconstructed from unmatched fills.
+ *
+ * The plan is saved onto the round trip's *opening* execution and the review
+ * onto its position. They are separate endpoints, so they get separate Save
+ * buttons: one control writing to two resources cannot report a partial failure
+ * honestly.
  */
 export const TradeLedger: React.FC = () => {
-  const { data: trades, isLoading, error } = useTrades();
+  const { data: roundTrips, isLoading, error } = useRoundTrips();
   const { data: strategies } = useStrategies();
   const annotate = useAnnotateTrade();
+  const review = useReviewPosition();
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
-  // Drafts are per-trade so two rows never share an editing buffer.
-  const [drafts, setDrafts] = useState<Record<string, { strategyId: string; thesis: string }>>({});
+  const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
+  const [reviewDrafts, setReviewDrafts] = useState<Record<string, ReviewDraft>>({});
 
   const visible = useMemo(() => {
     const term = query.trim().toUpperCase();
-    return (trades ?? []).filter((t) => {
-      if (filter === 'open' && t.is_matched) return false;
-      if (filter === 'closed' && !t.is_matched) return false;
-      return !term || t.ticker.includes(term);
+    return (roundTrips ?? []).filter((rt) => {
+      if (filter === 'open' && rt.kind !== 'open') return false;
+      if (filter === 'closed' && rt.kind !== 'closed') return false;
+      return !term || rt.symbol.includes(term);
     });
-  }, [trades, filter, query]);
+  }, [roundTrips, filter, query]);
 
-  const openCount = (trades ?? []).filter((t) => !t.is_matched).length;
+  const openCount = (roundTrips ?? []).filter((rt) => rt.kind === 'open').length;
 
-  const draftFor = (t: Trade) =>
-    drafts[t.id] ?? { strategyId: t.strategy_id ?? '', thesis: t.thesis ?? '' };
+  const planOf = (rt: RoundTrip) => planDrafts[rt.key] ?? planDraftFrom(rt);
+  const reviewOf = (rt: RoundTrip) => reviewDrafts[rt.key] ?? reviewDraftFrom(rt);
 
-  const strategyName = (id: string | null) =>
-    id ? (strategies ?? []).find((s) => s.id === id)?.name ?? null : null;
+  const setPlan = (rt: RoundTrip, patch: Partial<PlanDraft>) =>
+    setPlanDrafts((prev) => ({ ...prev, [rt.key]: { ...planOf(rt), ...patch } }));
+  const setReview = (rt: RoundTrip, patch: Partial<ReviewDraft>) =>
+    setReviewDrafts((prev) => ({ ...prev, [rt.key]: { ...reviewOf(rt), ...patch } }));
 
-  const save = (t: Trade) => {
-    const d = draftFor(t);
+  const savePlan = (rt: RoundTrip) => {
+    if (!rt.plan_trade_id) return;
+    const d = planOf(rt);
     annotate.mutate({
-      id: t.id,
-      payload: { strategy_id: d.strategyId || null, thesis: d.thesis.trim() || null },
+      id: rt.plan_trade_id,
+      payload: {
+        strategy_id: d.strategyId || null,
+        thesis: d.thesis.trim() || null,
+        planned_entry: parseNumber(d.plannedEntry),
+        stop_loss: parseNumber(d.stopLoss),
+        actual_stop_loss: parseNumber(d.actualStopLoss),
+        target: parseNumber(d.target),
+        risk_percent: parseNumber(d.riskPercent),
+        risk_amount: parseNumber(d.riskAmount),
+        conviction: parseNumber(d.conviction),
+        emotional_state: d.emotionalState.trim() || null,
+      },
+    });
+  };
+
+  const saveReview = (rt: RoundTrip) => {
+    if (!rt.position_id) return;
+    const d = reviewOf(rt);
+    review.mutate({
+      id: rt.position_id,
+      payload: {
+        exit_reason: d.exitReason || null,
+        review_went_well: d.wentWell.trim() || null,
+        review_went_wrong: d.wentWrong.trim() || null,
+        review_lessons: d.lessons.trim() || null,
+        trade_grade: d.grade || null,
+        ideal_entry: parseNumber(d.idealEntry),
+        ideal_stop: parseNumber(d.idealStop),
+        ideal_target: parseNumber(d.idealTarget),
+        revised_entry: parseNumber(d.revisedEntry),
+        revised_stop: parseNumber(d.revisedStop),
+        revised_target: parseNumber(d.revisedTarget),
+      },
     });
   };
 
@@ -79,7 +249,7 @@ export const TradeLedger: React.FC = () => {
     return (
       <div className="flex items-center justify-center py-16 text-sm text-obsidian-muted">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        Loading ledger…
+        Loading journal…
       </div>
     );
   }
@@ -93,15 +263,11 @@ export const TradeLedger: React.FC = () => {
     );
   }
 
-  const fieldClass =
-    'w-full rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs text-slate-200 ' +
-    'placeholder:text-obsidian-muted focus:outline-none focus:border-slate-600 transition-colors';
-
   return (
     <div className="space-y-4">
       {/* Controls */}
       <div className="flex flex-wrap items-center gap-3">
-        <div className="relative flex-1 min-w-[180px]">
+        <div className="relative min-w-[180px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-obsidian-muted" />
           <input
             value={query}
@@ -110,7 +276,7 @@ export const TradeLedger: React.FC = () => {
             className={`${fieldClass} pl-8`}
           />
         </div>
-        <div className="flex rounded-lg border border-obsidian-border overflow-hidden">
+        <div className="flex overflow-hidden rounded-lg border border-obsidian-border">
           {(['all', 'open', 'closed'] as const).map((f) => (
             <button
               key={f}
@@ -133,35 +299,33 @@ export const TradeLedger: React.FC = () => {
 
       {visible.length === 0 ? (
         <p className="py-16 text-center text-sm text-obsidian-muted">
-          No executions match this filter.
+          No trades match this filter.
         </p>
       ) : (
         <div className="space-y-2">
-          {visible.map((t) => {
-            const isBuy = t.direction === 'BUY';
-            const isOpen = !t.is_matched;
-            const d = draftFor(t);
-            const name = strategyName(t.strategy_id);
+          {visible.map((rt) => {
+            const isBuy = rt.direction === 'BUY';
+            const isOpen = rt.kind === 'open';
+            const plan = planOf(rt);
+            const rev = reviewOf(rt);
+            const strategyName = rt.strategy_id
+              ? (strategies ?? []).find((s) => s.id === rt.strategy_id)?.name ?? null
+              : null;
 
             return (
-              <div
-                key={t.id}
-                className="rounded-xl border border-obsidian-border bg-obsidian-card"
-              >
+              <div key={rt.key} className="rounded-xl border border-obsidian-border bg-obsidian-card">
                 <button
                   type="button"
-                  onClick={() => setExpanded((c) => (c === t.id ? null : t.id))}
+                  onClick={() => setExpanded((c) => (c === rt.key ? null : rt.key))}
                   className="flex w-full items-center gap-3 px-4 py-3 text-left"
                 >
                   <ChevronRight
                     className={`h-3.5 w-3.5 shrink-0 text-obsidian-muted transition-transform ${
-                      expanded === t.id ? 'rotate-90' : ''
+                      expanded === rt.key ? 'rotate-90' : ''
                     }`}
                   />
                   <div
-                    className={`rounded-lg p-1.5 ${
-                      isBuy ? 'bg-win/10 text-win' : 'bg-loss/10 text-loss'
-                    }`}
+                    className={`rounded-lg p-1.5 ${isBuy ? 'bg-win/10 text-win' : 'bg-loss/10 text-loss'}`}
                   >
                     {isBuy ? (
                       <ArrowUpRight className="h-3.5 w-3.5" />
@@ -170,96 +334,414 @@ export const TradeLedger: React.FC = () => {
                     )}
                   </div>
 
-                  <span className="w-16 shrink-0 font-semibold text-slate-100">
-                    {t.ticker}
-                  </span>
+                  <span className="w-16 shrink-0 font-semibold text-slate-100">{rt.symbol}</span>
 
-                  <span className="w-40 shrink-0 font-mono text-[11px] text-obsidian-muted">
-                    {formatQuantity(t.quantity)} @ {t.actual_entry}
+                  <span className="w-44 shrink-0 font-mono text-[11px] text-obsidian-muted">
+                    {formatQuantity(rt.quantity)} @ {rt.entry_price}
+                    {rt.exit_price !== null && ` → ${rt.exit_price}`}
                   </span>
 
                   <span
                     className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${
-                      isOpen
-                        ? 'bg-amber-500/10 text-amber-300'
-                        : 'bg-slate-800 text-slate-400'
+                      isOpen ? 'bg-amber-500/10 text-amber-300' : 'bg-slate-800 text-slate-400'
                     }`}
                   >
                     {isOpen ? 'Open' : 'Closed'}
                   </span>
 
-                  {name && (
-                    <span className="hidden shrink-0 rounded bg-indigo-500/10 px-1.5 py-0.5 text-[10px] text-indigo-300 sm:inline">
-                      {name}
+                  {/* The count is what makes grouping legible: "4 fills" is the
+                      difference between one trade and four mystery rows. */}
+                  {rt.execution_count > 1 && (
+                    <span
+                      className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-400"
+                      title={`${rt.execution_count} executions in this round trip`}
+                    >
+                      {rt.execution_count} fills
                     </span>
                   )}
-                  {t.thesis && (
+
+                  <RBadge value={rt.r_multiple} />
+
+                  {rt.realized_pnl !== null && (
+                    <span
+                      className={`shrink-0 font-mono text-[11px] ${
+                        rt.realized_pnl >= 0 ? 'text-win' : 'text-loss'
+                      }`}
+                    >
+                      {rt.realized_pnl >= 0 ? '+' : ''}
+                      {rt.realized_pnl.toFixed(2)}
+                    </span>
+                  )}
+
+                  {strategyName && (
+                    <span className="hidden shrink-0 rounded bg-indigo-500/10 px-1.5 py-0.5 text-[10px] text-indigo-300 sm:inline">
+                      {strategyName}
+                    </span>
+                  )}
+                  {rt.thesis && (
                     <NotebookPen className="hidden h-3 w-3 shrink-0 text-slate-500 sm:block" />
                   )}
 
                   <span className="ml-auto shrink-0 font-mono text-[10px] text-obsidian-muted">
-                    {dateFormatter.format(new Date(t.entry_date))}
+                    {dateFormatter.format(new Date(rt.exit_time ?? rt.entry_time))}
                   </span>
                 </button>
 
-                {expanded === t.id && (
-                  <div className="space-y-3 border-t border-obsidian-border px-4 py-3">
-                    <label className="block">
-                      <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                        Strategy
-                      </span>
-                      <select
-                        value={d.strategyId}
-                        onChange={(e) =>
-                          setDrafts((p) => ({
-                            ...p,
-                            [t.id]: { ...d, strategyId: e.target.value },
-                          }))
-                        }
-                        className={`mt-1 ${fieldClass}`}
-                      >
-                        <option value="">— None —</option>
-                        {(strategies ?? []).map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-
-                    <label className="block">
-                      <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                        Why this trade?
-                      </span>
-                      <textarea
-                        value={d.thesis}
-                        onChange={(e) =>
-                          setDrafts((p) => ({
-                            ...p,
-                            [t.id]: { ...d, thesis: e.target.value },
-                          }))
-                        }
-                        rows={3}
-                        placeholder="Setup, trigger, and what would prove you wrong."
-                        className={`mt-1 resize-y ${fieldClass}`}
+                {expanded === rt.key && (
+                  <div className="space-y-6 border-t border-obsidian-border px-4 py-4">
+                    {/* ---------------- THE PLAN ---------------- */}
+                    <section>
+                      <SectionHeading
+                        title="The Plan"
+                        blurb="Written at entry. Saved on this round trip's opening execution, so a scale-in has one stop, not several."
                       />
-                    </label>
 
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-obsidian-muted">
-                        {t.source_tag === 'Manual'
-                          ? 'Hand-logged'
-                          : 'Synced from IBKR — add the reasoning it cannot know'}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => save(t)}
-                        disabled={annotate.isPending}
-                        className="rounded-lg border border-win-border bg-win-glow px-3 py-1.5 text-[11px] text-win disabled:opacity-50"
-                      >
-                        {annotate.isPending ? 'Saving…' : 'Save'}
-                      </button>
-                    </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <Field label="Strategy">
+                          <select
+                            value={plan.strategyId}
+                            onChange={(e) => setPlan(rt, { strategyId: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          >
+                            <option value="">— None —</option>
+                            {(strategies ?? []).map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {s.name}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+
+                        <Field label="Conviction (1–5)" hint="Rated at entry, before the outcome.">
+                          <select
+                            value={plan.conviction}
+                            onChange={(e) => setPlan(rt, { conviction: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          >
+                            <option value="">— Unrated —</option>
+                            {[1, 2, 3, 4, 5].map((n) => (
+                              <option key={n} value={n}>
+                                {n}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                      </div>
+
+                      <div className="mt-3 grid gap-3 sm:grid-cols-4">
+                        <Field label="Planned entry">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.plannedEntry}
+                            onChange={(e) => setPlan(rt, { plannedEntry: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                        <Field label="Actual entry" hint="Quantity-weighted across fills.">
+                          <input
+                            value={rt.entry_price}
+                            readOnly
+                            className={`mt-1 ${fieldClass} cursor-not-allowed opacity-60`}
+                          />
+                        </Field>
+                        <Field label="Planned stop">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.stopLoss}
+                            onChange={(e) => setPlan(rt, { stopLoss: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                        <Field label="Actual stop" hint="Where it really sat, after moves.">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.actualStopLoss}
+                            onChange={(e) => setPlan(rt, { actualStopLoss: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                      </div>
+
+                      <div className="mt-3 grid gap-3 sm:grid-cols-4">
+                        <Field label="Target">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.target}
+                            onChange={(e) => setPlan(rt, { target: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                        <Field label="Risk %">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.riskPercent}
+                            onChange={(e) => setPlan(rt, { riskPercent: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                        <Field label="Risk $" hint="Turns R back into money.">
+                          <input
+                            type="number"
+                            step="any"
+                            value={plan.riskAmount}
+                            onChange={(e) => setPlan(rt, { riskAmount: e.target.value })}
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                        <Field label="State of mind">
+                          <input
+                            value={plan.emotionalState}
+                            onChange={(e) => setPlan(rt, { emotionalState: e.target.value })}
+                            placeholder="Calm / rushed / revenge…"
+                            className={`mt-1 ${fieldClass}`}
+                          />
+                        </Field>
+                      </div>
+
+                      <div className="mt-3">
+                        <Field label="Why this trade?">
+                          <textarea
+                            value={plan.thesis}
+                            onChange={(e) => setPlan(rt, { thesis: e.target.value })}
+                            rows={3}
+                            placeholder="Setup, trigger, and what would prove you wrong."
+                            className={`mt-1 resize-y ${fieldClass}`}
+                          />
+                        </Field>
+                      </div>
+
+                      <div className="mt-3 flex items-center justify-between">
+                        <div className="flex items-center gap-3 text-[10px] text-obsidian-muted">
+                          {rt.planned_r_multiple !== null && (
+                            <span>
+                              Planned R:R{' '}
+                              <span className="font-mono text-slate-300">
+                                {rt.planned_r_multiple.toFixed(2)}
+                              </span>
+                            </span>
+                          )}
+                          {rt.r_multiple !== null ? (
+                            <span>
+                              Realised{' '}
+                              <span
+                                className={`font-mono ${
+                                  rt.r_multiple >= 0 ? 'text-win' : 'text-loss'
+                                }`}
+                              >
+                                {rt.r_multiple.toFixed(2)}R
+                              </span>
+                            </span>
+                          ) : (
+                            <span>Set a stop to score this trade in R.</span>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => savePlan(rt)}
+                          disabled={annotate.isPending}
+                          className="rounded-lg border border-win-border bg-win-glow px-3 py-1.5 text-[11px] text-win disabled:opacity-50"
+                        >
+                          {annotate.isPending ? 'Saving…' : 'Save plan'}
+                        </button>
+                      </div>
+                    </section>
+
+                    {/* ---------------- EXECUTIONS ---------------- */}
+                    <section>
+                      <SectionHeading
+                        title={`Executions (${rt.execution_count})`}
+                        blurb="The individual fills behind the weighted averages above."
+                      />
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[360px] text-left text-[11px]">
+                          <thead className="text-obsidian-muted">
+                            <tr>
+                              <th className="pb-1 font-normal">Role</th>
+                              <th className="pb-1 font-normal">Qty</th>
+                              <th className="pb-1 font-normal">Price</th>
+                              <th className="pb-1 font-normal">When</th>
+                            </tr>
+                          </thead>
+                          <tbody className="font-mono text-slate-300">
+                            {rt.fills.map((f) => (
+                              <tr key={f.id} className="border-t border-obsidian-border/60">
+                                <td className="py-1.5">
+                                  <span
+                                    className={
+                                      f.role === 'OPEN' ? 'text-win' : 'text-loss'
+                                    }
+                                  >
+                                    {f.role}
+                                  </span>
+                                </td>
+                                <td className="py-1.5">{formatQuantity(f.quantity)}</td>
+                                <td className="py-1.5">{f.price}</td>
+                                <td className="py-1.5 text-obsidian-muted">
+                                  {dateFormatter.format(new Date(f.executed_at))}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+
+                    {/* ---------------- THE REVIEW ---------------- */}
+                    {rt.kind === 'closed' ? (
+                      <section>
+                        <SectionHeading
+                          title="The Review"
+                          blurb="Written after the outcome is known. Ideal levels score this trade; revised levels correct the setup for next time."
+                        />
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <Field label="Exit reason">
+                            <select
+                              value={rev.exitReason}
+                              onChange={(e) => setReview(rt, { exitReason: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            >
+                              <option value="">— Not set —</option>
+                              {EXIT_REASONS.map((r) => (
+                                <option key={r} value={r}>
+                                  {r}
+                                </option>
+                              ))}
+                            </select>
+                          </Field>
+                          <Field label="Grade">
+                            <select
+                              value={rev.grade}
+                              onChange={(e) => setReview(rt, { grade: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            >
+                              <option value="">— Ungraded —</option>
+                              {['A', 'B', 'C', 'D', 'F'].map((g) => (
+                                <option key={g} value={g}>
+                                  {g}
+                                </option>
+                              ))}
+                            </select>
+                          </Field>
+                        </div>
+
+                        <p className="mt-4 text-[10px] uppercase tracking-wide text-slate-500">
+                          With hindsight, this trade&rsquo;s levels should have been
+                        </p>
+                        <div className="mt-1 grid gap-3 sm:grid-cols-3">
+                          <Field label="Ideal entry">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.idealEntry}
+                              onChange={(e) => setReview(rt, { idealEntry: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="Ideal stop">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.idealStop}
+                              onChange={(e) => setReview(rt, { idealStop: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="Ideal target">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.idealTarget}
+                              onChange={(e) => setReview(rt, { idealTarget: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                        </div>
+
+                        <p className="mt-4 text-[10px] uppercase tracking-wide text-slate-500">
+                          Next time I take this setup, I will use
+                        </p>
+                        <div className="mt-1 grid gap-3 sm:grid-cols-3">
+                          <Field label="Revised entry">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.revisedEntry}
+                              onChange={(e) => setReview(rt, { revisedEntry: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="Revised stop">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.revisedStop}
+                              onChange={(e) => setReview(rt, { revisedStop: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="Revised target">
+                            <input
+                              type="number"
+                              step="any"
+                              value={rev.revisedTarget}
+                              onChange={(e) => setReview(rt, { revisedTarget: e.target.value })}
+                              className={`mt-1 ${fieldClass}`}
+                            />
+                          </Field>
+                        </div>
+
+                        <div className="mt-3 space-y-3">
+                          <Field label="What went well">
+                            <textarea
+                              value={rev.wentWell}
+                              onChange={(e) => setReview(rt, { wentWell: e.target.value })}
+                              rows={2}
+                              className={`mt-1 resize-y ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="What went wrong">
+                            <textarea
+                              value={rev.wentWrong}
+                              onChange={(e) => setReview(rt, { wentWrong: e.target.value })}
+                              rows={2}
+                              className={`mt-1 resize-y ${fieldClass}`}
+                            />
+                          </Field>
+                          <Field label="What to learn">
+                            <textarea
+                              value={rev.lessons}
+                              onChange={(e) => setReview(rt, { lessons: e.target.value })}
+                              rows={2}
+                              className={`mt-1 resize-y ${fieldClass}`}
+                            />
+                          </Field>
+                        </div>
+
+                        <div className="mt-3 flex items-center justify-between">
+                          <span className="text-[10px] text-obsidian-muted">
+                            {rt.review_status === 'reviewed' ? 'Reviewed' : 'Awaiting review'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => saveReview(rt)}
+                            disabled={review.isPending}
+                            className="rounded-lg border border-win-border bg-win-glow px-3 py-1.5 text-[11px] text-win disabled:opacity-50"
+                          >
+                            {review.isPending ? 'Saving…' : 'Save review'}
+                          </button>
+                        </div>
+                      </section>
+                    ) : (
+                      <p className="text-[10px] text-obsidian-muted">
+                        Still open — the review unlocks once this position is closed.
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

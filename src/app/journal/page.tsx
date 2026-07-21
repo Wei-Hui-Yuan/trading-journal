@@ -7,11 +7,12 @@ import { ArrowLeft, BookText } from 'lucide-react';
 import { TradeLedger } from '@/components/TradeLedger';
 
 /**
- * The master ledger.
+ * The master ledger, grouped by trade idea.
  *
  * Every other surface reads `positions`, which holds only closed round trips.
- * This is the one view that shows open exposure — and the reasoning attached
- * to each execution, which the broker feed cannot supply.
+ * This is the one view that also shows open exposure — and the only one that
+ * carries the plan and the post-mortem, neither of which a broker feed can
+ * supply. It is deliberately the densest page in the app.
  */
 export default function JournalPage() {
   return (
@@ -27,7 +28,7 @@ export default function JournalPage() {
                 TRADE JOURNAL
               </h1>
               <p className="text-[11px] text-obsidian-muted">
-                Every execution, open and closed — with the thinking behind it
+                Every trade, open and closed — the plan, the fills, and the review
               </p>
             </div>
           </div>
