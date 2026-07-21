@@ -1184,26 +1184,99 @@ async def annotate_trade(
     )
 
 
+class TradeDeleteResult(BaseModel):
+    """What a deletion actually did, beyond removing one row.
+
+    Returned instead of a bare 204 because the side effects are not guessable
+    from the request: deleting one fill can dissolve a whole round trip and
+    take its review with it. The UI reports this rather than letting the user
+    find out later.
+    """
+
+    deleted_trade_id: uuid.UUID
+    ticker: str
+    positions_removed: int
+    positions_rebuilt: int
+    reviews_discarded: int
+
+
 @app.delete(
     "/api/trades/{trade_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=TradeDeleteResult,
     dependencies=[Depends(verify_clerk_token)],
 )
 async def delete_trade(
     trade_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
 ):
-    """Delete an execution fill from the trades ledger."""
+    """Remove an execution, then rebuild every round trip it belonged to.
+
+    Deleting the row alone is not enough, and silently corrupts the journal.
+    A `positions` row stores quantity, weighted entry/exit and realised P&L
+    computed from a specific set of executions; drop one of them and the
+    position survives asserting a size its remaining fills no longer support,
+    with a P&L derived from a fill that no longer exists. Analytics keeps
+    reporting that figure, so the damage is invisible.
+
+    Worse, `positions.open_trade_id` is ON DELETE SET NULL, and the opening
+    execution is where the plan lives. Deleting it silently detached the stop,
+    thesis, conviction and strategy from the round trip -- the R-multiple went
+    to None with nothing on screen to say why.
+
+    So affected positions are removed and FIFO matching is re-run for the
+    ticker, exactly as manual entry and IBKR ingest already do. The rebuild is
+    lossy by nature: a round trip that no longer exists cannot keep its
+    review, so the count of discarded reviews is reported rather than left for
+    the user to discover.
+    """
+    from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        run_matching_for_ticker,
+    )
+
     trade = await session.get(Trade, trade_id)
     if trade is None:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    await session.execute(
-        delete(PositionFill).where(PositionFill.trade_id == trade_id)
-    )
+    ticker = trade.ticker
+
+    # Captured before the delete: position_fills.trade_id is ON DELETE CASCADE,
+    # so the link disappears with the trade and the positions become
+    # unreachable orphans.
+    affected_ids = (
+        await session.execute(
+            select(PositionFill.position_id).where(PositionFill.trade_id == trade_id)
+        )
+    ).scalars().all()
+    affected_ids = list(set(affected_ids))
+
+    reviews_discarded = 0
+    if affected_ids:
+        affected = (
+            await session.execute(select(Position).where(Position.id.in_(affected_ids)))
+        ).scalars().all()
+        reviews_discarded = sum(
+            1
+            for p in affected
+            if p.review_status == ReviewStatus.reviewed.value
+            or any((p.review_went_well, p.review_went_wrong, p.review_lessons, p.notes))
+        )
+        # position_fills.position_id cascades, so the fills go with them.
+        await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
+
     await session.delete(trade)
     await session.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    # Rebuild from what actually remains. Idempotent, so untouched round trips
+    # on this ticker are not duplicated.
+    result = await run_matching_for_ticker(session, ticker, persist=True)
+
+    return TradeDeleteResult(
+        deleted_trade_id=trade_id,
+        ticker=ticker,
+        positions_removed=len(affected_ids),
+        positions_rebuilt=len(result.positions),
+        reviews_discarded=reviews_discarded,
+    )
 
 
 @app.get(

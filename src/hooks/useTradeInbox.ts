@@ -37,6 +37,7 @@ import type {
   StrategyCreatePayload,
   StrategyUpdatePayload,
   Trade,
+  TradeDeleteResult,
   TradeAnnotationPayload,
 } from '@/types/api';
 
@@ -235,10 +236,17 @@ export function useReviewPosition() {
   });
 }
 
-/** Delete an execution fill from the trades ledger. */
+/**
+ * Delete an execution, and rebuild the round trips it belonged to.
+ *
+ * The server does the rebuilding — a position's size and P&L are derived from
+ * a specific set of fills, so removing one without re-matching leaves a round
+ * trip asserting a size its remaining fills cannot support. The result reports
+ * how many positions were rebuilt and how many reviews that discarded.
+ */
 export function useDeleteTrade() {
   const queryClient = useQueryClient();
-  return useMutation<void, Error, string>({
+  return useMutation<TradeDeleteResult, Error, string>({
     mutationFn: deleteTrade,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.trades });

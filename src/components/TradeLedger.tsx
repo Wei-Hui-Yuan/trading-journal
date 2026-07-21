@@ -181,6 +181,9 @@ export const TradeLedger: React.FC = () => {
   const annotate = useAnnotateTrade();
   const review = useReviewPosition();
   const deleteTradeMutation = useDeleteTrade();
+  // What a deletion actually did. Surfaced because the side effects reach
+  // beyond the row that was clicked.
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
@@ -299,6 +302,20 @@ export const TradeLedger: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {deleteNotice && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-300">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1">{deleteNotice}</span>
+          <button
+            type="button"
+            onClick={() => setDeleteNotice(null)}
+            className="text-amber-400/70 hover:text-amber-200"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {visible.length === 0 ? (
         <p className="py-16 text-center text-sm text-obsidian-muted">
@@ -592,12 +609,32 @@ export const TradeLedger: React.FC = () => {
                                   <button
                                     type="button"
                                     onClick={() => {
+                                      // A fill is rarely deletable in
+                                      // isolation. Removing one from a closed
+                                      // round trip dissolves it, and FIFO
+                                      // re-matching rebuilds whatever the
+                                      // remaining fills now form -- discarding
+                                      // the review written against the old
+                                      // shape. Said up front rather than
+                                      // discovered afterwards.
+                                      const warning =
+                                        rt.kind === 'closed'
+                                          ? `\n\nThis fill belongs to a closed round trip. Deleting it rebuilds ${rt.symbol}'s round trips from the remaining executions, and the review attached to this one will be discarded.`
+                                          : '';
                                       if (
                                         window.confirm(
-                                          'Are you sure you want to delete this trade execution fill?'
+                                          `Delete this ${f.role.toLowerCase()} fill of ${formatQuantity(f.quantity)} ${rt.symbol} @ ${f.price}?${warning}`
                                         )
                                       ) {
-                                        deleteTradeMutation.mutate(f.trade_id);
+                                        deleteTradeMutation.mutate(f.trade_id, {
+                                          onSuccess: (result) => {
+                                            if (result.reviews_discarded > 0) {
+                                              setDeleteNotice(
+                                                `${rt.symbol}: ${result.positions_removed} round trip(s) removed, ${result.positions_rebuilt} rebuilt, ${result.reviews_discarded} review(s) discarded.`
+                                              );
+                                            }
+                                          },
+                                        });
                                       }
                                     }}
                                     disabled={deleteTradeMutation.isPending}

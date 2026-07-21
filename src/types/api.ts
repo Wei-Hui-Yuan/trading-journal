@@ -155,6 +155,22 @@ export interface PositionReviewPayload {
   revised_target?: number | null;
 }
 
+/**
+ * What DELETE /api/trades/{id} actually did.
+ *
+ * Deleting one fill can dissolve a whole round trip and discard its review,
+ * because a position's size and P&L are derived from a specific set of
+ * executions. Returned so the UI can say so rather than let the user find out
+ * from a changed number later.
+ */
+export interface TradeDeleteResult {
+  deleted_trade_id: string;
+  ticker: string;
+  positions_removed: number;
+  positions_rebuilt: number;
+  reviews_discarded: number;
+}
+
 // ---------------------------------------------------------------------------
 // IBKR ingestion
 // ---------------------------------------------------------------------------

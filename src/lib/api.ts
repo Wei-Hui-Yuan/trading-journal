@@ -16,6 +16,7 @@ import type {
   StrategyCreatePayload,
   StrategyUpdatePayload,
   Trade,
+  TradeDeleteResult,
   TradeAnnotationPayload,
 } from '@/types/api';
 
@@ -278,8 +279,9 @@ export async function updatePositionReview(
 }
 
 /** DELETE /api/trades/{id} — delete an execution fill from the ledger. */
-export async function deleteTrade(id: string): Promise<void> {
-  await apiClient.delete(`/trades/${id}`);
+export async function deleteTrade(id: string): Promise<TradeDeleteResult> {
+  const { data } = await apiClient.delete<TradeDeleteResult>(`/trades/${id}`);
+  return data;
 }
 
 /** GET /api/disciplines — list all discipline rules. */
