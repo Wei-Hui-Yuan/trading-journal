@@ -9,7 +9,7 @@ the response boundary, so rounding never accumulates through the aggregation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Optional
@@ -302,6 +302,12 @@ class ReviewedTrade:
     stop_loss: Optional[Decimal]
     mistakes: list[str]
     review_status: Optional[str]
+    # Rule name -> whether it was followed on this trade (migration 014).
+    # Rules the trade was never reviewed against are absent, not False.
+    disciplines: dict[str, bool] = field(default_factory=dict)
+    # Needed by the discipline breakdown, which measures win rate from money
+    # so it works on trades that carry no stop and cannot be scored in R.
+    realized_pnl: Optional[Decimal] = None
 
 
 def compute_r_multiple(trade: ReviewedTrade) -> Optional[float]:
@@ -393,6 +399,109 @@ def _r_distribution(r_multiples: list[float]) -> dict[str, int]:
     return buckets
 
 
+def _side_stats(pnls: list[float], r_multiples: list[float]) -> dict[str, Any]:
+    """One side of a discipline split.
+
+    Win rate comes from realised P&L and is therefore available for every
+    closed round trip. Average R comes only from the subset that can be scored
+    -- it needs a stop to divide by -- so `r_sample` reports how many trades
+    actually stand behind `avg_r` rather than letting one scored trade look
+    like a verdict on twenty.
+    """
+    if not pnls:
+        return {
+            "trade_count": 0,
+            "win_rate_pct": None,
+            "avg_r": None,
+            "r_sample": 0,
+        }
+    wins = sum(1 for p in pnls if p > 0)
+    return {
+        "trade_count": len(pnls),
+        "win_rate_pct": round(wins / len(pnls) * 100, 2),
+        "avg_r": (
+            round(sum(r_multiples) / len(r_multiples), 4) if r_multiples else None
+        ),
+        "r_sample": len(r_multiples),
+    }
+
+
+def compute_discipline_breakdown(
+    trades: list[ReviewedTrade],
+    r_by_id: dict[str, float],
+) -> list[dict[str, Any]]:
+    """What each of the trader's own rules is actually worth.
+
+    The question a journal exists to answer is not "did I follow my plan on
+    this trade" but "what happens when I do". Each rule is split into the
+    trades that honoured it and the trades that did not, so the two can be
+    compared directly.
+
+    Deliberately driven by realised P&L rather than R. Scoring in R alone
+    would need a stop on every trade, and a journal whose habit analysis stays
+    empty until the user backfills stops across their entire history is a
+    feature nobody ever sees. R is still reported where it can be computed,
+    alongside the sample it rests on.
+
+    Trades never reviewed against a rule appear on NEITHER side -- they are
+    absent from the mapping rather than defaulting to False, so an unreviewed
+    backlog cannot masquerade as a discipline failure.
+
+    `edge_*` is None unless both sides have trades: a rule followed every
+    single time has no counterfactual, and manufacturing one from an empty
+    sample would be the most flattering possible lie.
+    """
+    followed: dict[str, dict[str, list[float]]] = {}
+    broken: dict[str, dict[str, list[float]]] = {}
+
+    for trade in trades:
+        if trade.realized_pnl is None:
+            continue
+        pnl = float(trade.realized_pnl)
+        r = r_by_id.get(trade.trade_id)
+        for name, was_followed in (trade.disciplines or {}).items():
+            side = followed if was_followed else broken
+            bucket = side.setdefault(name, {"pnl": [], "r": []})
+            bucket["pnl"].append(pnl)
+            if r is not None:
+                bucket["r"].append(r)
+
+    breakdown: list[dict[str, Any]] = []
+    for name in sorted(set(followed) | set(broken)):
+        y = followed.get(name, {"pnl": [], "r": []})
+        n = broken.get(name, {"pnl": [], "r": []})
+        yes = _side_stats(y["pnl"], y["r"])
+        no = _side_stats(n["pnl"], n["r"])
+
+        both = yes["trade_count"] > 0 and no["trade_count"] > 0
+        edge_win_rate = (
+            round(yes["win_rate_pct"] - no["win_rate_pct"], 2) if both else None
+        )
+        edge_r = (
+            round(yes["avg_r"] - no["avg_r"], 4)
+            if yes["avg_r"] is not None and no["avg_r"] is not None
+            else None
+        )
+
+        breakdown.append(
+            {
+                "discipline": name,
+                "followed": yes,
+                "not_followed": no,
+                "edge_win_rate_pct": edge_win_rate,
+                "edge_r": edge_r,
+                "sample": yes["trade_count"] + no["trade_count"],
+            }
+        )
+
+    # Biggest measured edge first; rules with no counterfactual sink to the
+    # bottom rather than sorting as though their edge were zero.
+    breakdown.sort(
+        key=lambda b: (b["edge_win_rate_pct"] is None, -(b["edge_win_rate_pct"] or 0))
+    )
+    return breakdown
+
+
 def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
     """R-multiples, slippage, expectancy, and per-mistake breakdown."""
     scored: list[tuple[ReviewedTrade, float]] = []
@@ -461,6 +570,9 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
         "slippage_sample": len(slippages),
         "r_distribution": _r_distribution(r_multiples),
         "mistake_breakdown": mistake_breakdown,
+        "discipline_breakdown": compute_discipline_breakdown(
+            trades, {t.trade_id: r for t, r in scored}
+        ),
     }
 
 
@@ -478,11 +590,30 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
     exit onto the position and leaves the execution ledger immutable, so a
     matched round trip has `trades.exit_price = NULL`.
     """
-    from main import Position, Trade  # noqa: PLC0415 - deferred, avoids a cycle
+    from main import (  # noqa: PLC0415 - deferred, avoids a cycle
+        Discipline,
+        Position,
+        PositionDiscipline,
+        Trade,
+    )
 
     positions = (await session.execute(select(Position))).scalars().all()
     trades = (await session.execute(select(Trade))).scalars().all()
     trade_by_id = {str(t.id): t for t in trades}
+
+    # Rule answers, keyed by position. One query for the whole set.
+    discipline_rows = (
+        await session.execute(
+            select(
+                PositionDiscipline.position_id,
+                Discipline.name,
+                PositionDiscipline.followed,
+            ).join(Discipline, Discipline.id == PositionDiscipline.discipline_id)
+        )
+    ).all()
+    disciplines_by_position: dict[str, dict[str, bool]] = {}
+    for position_id, name, followed in discipline_rows:
+        disciplines_by_position.setdefault(str(position_id), {})[name] = followed
 
     reviewed: list[ReviewedTrade] = []
     for position in positions:
@@ -515,6 +646,12 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                 ),
                 mistakes=list(position.mistakes or []),
                 review_status=position.review_status,
+                disciplines=disciplines_by_position.get(str(position.id), {}),
+                realized_pnl=(
+                    Decimal(str(position.realized_pnl))
+                    if position.realized_pnl is not None
+                    else None
+                ),
             )
         )
     return reviewed

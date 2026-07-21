@@ -105,10 +105,40 @@ class Strategy(Base):
 
 
 class Discipline(Base):
+    """A rule the trader holds themselves to. User-editable (migration 013)."""
+
     __tablename__ = "disciplines"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(Text, nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PositionDiscipline(Base):
+    """Whether one round trip honoured one rule (migration 014).
+
+    A join table rather than columns on `positions`, because the rules are
+    user-editable: three fixed booleans could only ever answer the three rules
+    that shipped, and a rule the user added had nowhere to store its answer.
+
+    Absence of a row means "not reviewed against this rule", which is NOT the
+    same as `followed = False`. Conflating them would let an unreviewed
+    backlog read as indiscipline, and drag every compliance rate toward zero.
+    """
+
+    __tablename__ = "position_disciplines"
+
+    position_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("positions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    discipline_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("disciplines.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    followed = Column(Boolean, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -836,11 +866,11 @@ async def list_disciplines(session: AsyncSession = Depends(get_session)):
     deliberate act, not a state to be repaired.
 
     Only a missing table is swallowed, and only so a deployment that has not
-    yet had the migration applied degrades to an empty checklist instead of a
-    broken review panel. Every other error propagates: catching bare Exception
-    here would render a dropped connection or a timeout as "you have no
-    discipline rules", indistinguishable from the truth, and is the same
-    failure that once made a dead dashboard read as a flat 0% win rate.
+    yet had migration 013/014 applied degrades to an empty checklist instead
+    of a broken review panel. Every other error propagates: catching bare
+    Exception here would render a dropped connection or a timeout as "you have
+    no discipline rules", which is indistinguishable from the truth and is the
+    same failure that once made a dead dashboard read as a flat 0% win rate.
     """
     try:
         result = await session.execute(
@@ -850,7 +880,7 @@ async def list_disciplines(session: AsyncSession = Depends(get_session)):
         # asyncpg raises UndefinedTableError, which SQLAlchemy wraps.
         if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
             raise
-        logger.warning("disciplines table is missing; apply the migration")
+        logger.warning("disciplines table is missing; apply migration 013/014")
         await session.rollback()
         return []
 
@@ -879,17 +909,14 @@ async def create_discipline(
             detail=f"A discipline rule named '{params.name}' already exists",
         )
     except ProgrammingError as exc:
-        # A missing table is an operator problem, not a bad request. 503 with
-        # the remedy beats the 500 the user actually saw, which said only
-        # "Internal Server Error" and named nothing.
         await session.rollback()
         if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
             raise
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "The disciplines table does not exist. Apply the pending "
-                "migration to this database."
+                "The disciplines table does not exist. Apply migration "
+                "014_position_disciplines.sql to this database."
             ),
         )
     await session.refresh(discipline)
@@ -952,6 +979,25 @@ class PositionReviewUpdate(BaseModel):
     revised_stop: Optional[float] = Field(None, gt=0)
     revised_target: Optional[float] = Field(None, gt=0)
 
+    # Answers to the user's own discipline rules (migration 014), keyed by
+    # discipline id. Omitting the field leaves existing answers untouched;
+    # including a rule with false records "reviewed, did not follow", which is
+    # a different statement from leaving it out.
+    disciplines: Optional[dict[uuid.UUID, bool]] = None
+
+
+class PositionDisciplineOut(BaseModel):
+    """One rule's answer for one round trip.
+
+    Carries `name` alongside the id so a caller can render the checklist
+    without a second lookup, and so a historical answer stays readable if the
+    rule is later renamed.
+    """
+
+    discipline_id: uuid.UUID
+    name: str
+    followed: bool
+
 
 class PositionOut(BaseModel):
     id: uuid.UUID
@@ -981,6 +1027,9 @@ class PositionOut(BaseModel):
     revised_entry: Optional[float] = None
     revised_stop: Optional[float] = None
     revised_target: Optional[float] = None
+    # Answers to the user's own rules (migration 014). Only rules actually
+    # answered appear; a rule missing here is unreviewed, not unfollowed.
+    disciplines: list[PositionDisciplineOut] = []
     created_at: Optional[datetime]
 
     @field_validator("mistakes", mode="before")
@@ -990,6 +1039,46 @@ class PositionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+async def _disciplines_by_position(
+    session: AsyncSession, position_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[PositionDisciplineOut]]:
+    """Discipline answers for many positions in one query, not one per row."""
+    if not position_ids:
+        return {}
+
+    rows = (
+        await session.execute(
+            select(
+                PositionDiscipline.position_id,
+                PositionDiscipline.discipline_id,
+                PositionDiscipline.followed,
+                Discipline.name,
+            )
+            .join(Discipline, Discipline.id == PositionDiscipline.discipline_id)
+            .where(PositionDiscipline.position_id.in_(position_ids))
+            .order_by(Discipline.created_at)
+        )
+    ).all()
+
+    grouped: dict[uuid.UUID, list[PositionDisciplineOut]] = {}
+    for position_id, discipline_id, followed, name in rows:
+        grouped.setdefault(position_id, []).append(
+            PositionDisciplineOut(
+                discipline_id=discipline_id, name=name, followed=followed
+            )
+        )
+    return grouped
+
+
+async def _position_out(session: AsyncSession, position: Position) -> PositionOut:
+    """Serialize one position with its discipline answers attached."""
+    out = PositionOut.model_validate(position)
+    out.disciplines = (await _disciplines_by_position(session, [position.id])).get(
+        position.id, []
+    )
+    return out
 
 
 class PositionFillOut(BaseModel):
@@ -1296,8 +1385,17 @@ async def list_positions(
     if review_status:
         stmt = stmt.where(Position.review_status == review_status)
 
-    result = await session.execute(stmt)
-    return [PositionOut.model_validate(p) for p in result.scalars().all()]
+    positions = (await session.execute(stmt)).scalars().all()
+
+    # One query for the whole page rather than a lookup per row.
+    by_position = await _disciplines_by_position(session, [p.id for p in positions])
+
+    out: list[PositionOut] = []
+    for position in positions:
+        row = PositionOut.model_validate(position)
+        row.disciplines = by_position.get(position.id, [])
+        out.append(row)
+    return out
 
 
 @app.get(
@@ -1397,6 +1495,7 @@ class RoundTripOut(BaseModel):
     revised_entry: Optional[float] = None
     revised_stop: Optional[float] = None
     revised_target: Optional[float] = None
+    disciplines: list[PositionDisciplineOut] = []
 
     fills: list[PositionFillOut] = []
 
@@ -1482,6 +1581,9 @@ async def list_round_trips(
     fills = (await session.execute(select(PositionFill))).scalars().all()
 
     trade_by_id = {t.id: t for t in trades}
+    disciplines_by_position = await _disciplines_by_position(
+        session, [p.id for p in positions]
+    )
     fills_by_position: dict[uuid.UUID, list[PositionFill]] = {}
     for fill in fills:
         fills_by_position.setdefault(fill.position_id, []).append(fill)
@@ -1543,6 +1645,7 @@ async def list_round_trips(
                 revised_entry=position.revised_entry,
                 revised_stop=position.revised_stop,
                 revised_target=position.revised_target,
+                disciplines=disciplines_by_position.get(position.id, []),
                 fills=[PositionFillOut.model_validate(f) for f in position_fills],
                 **plan,
             )
@@ -1642,6 +1745,11 @@ async def review_position(
 
     updates = params.model_dump(exclude_unset=True)
 
+    # Pulled out before the setattr loop below: `disciplines` lives in its own
+    # table, and assigning it to the ORM object would silently become a stray
+    # Python attribute that never reaches the database.
+    discipline_answers = updates.pop("disciplines", None)
+
     # Reject a dangling strategy reference up front rather than surfacing a
     # foreign-key error from the database.
     strategy_id = updates.get("strategy_id")
@@ -1665,11 +1773,46 @@ async def review_position(
     for field, value in updates.items():
         setattr(position, field, value)
 
+    if discipline_answers:
+        known = set(
+            (
+                await session.execute(
+                    select(Discipline.id).where(
+                        Discipline.id.in_(list(discipline_answers))
+                    )
+                )
+            ).scalars().all()
+        )
+        unknown = set(discipline_answers) - known
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown discipline rule(s): {sorted(str(u) for u in unknown)}",
+            )
+
+        # Upsert: re-saving a review must correct the previous answer, not
+        # collide with it. Deleting and re-inserting would lose created_at and
+        # briefly leave the round trip looking unreviewed.
+        for discipline_id, followed in discipline_answers.items():
+            stmt = (
+                pg_insert(PositionDiscipline)
+                .values(
+                    position_id=position_id,
+                    discipline_id=discipline_id,
+                    followed=bool(followed),
+                )
+                .on_conflict_do_update(
+                    index_elements=["position_id", "discipline_id"],
+                    set_={"followed": bool(followed)},
+                )
+            )
+            await session.execute(stmt)
+
     position.review_status = ReviewStatus.reviewed.value
 
     await session.commit()
     await session.refresh(position)
-    return PositionOut.model_validate(position)
+    return await _position_out(session, position)
 
 
 # ---------------------------------------------------------------------------

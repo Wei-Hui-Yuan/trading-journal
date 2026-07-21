@@ -104,14 +104,36 @@ export function TradeInboxQueue() {
   const handleSubmit = (position: Position) => {
     const draft = draftFor(position.id);
     const checked = draft.disciplines_checked ?? {};
+    const rules = disciplinesQuery.data ?? [];
+
+    // Every rule on screen gets an answer, not just the ticked ones: submitting
+    // the checklist means the user considered all of it, so an unticked box is
+    // a real "did not follow" rather than "not yet reviewed". The backend keeps
+    // those distinct, and a rule left out entirely stays unanswered.
+    const disciplines: Record<string, boolean> = {};
+    for (const rule of rules) {
+      const saved = position.disciplines?.find((a) => a.discipline_id === rule.id);
+      disciplines[rule.id] = Boolean(checked[rule.id] ?? saved?.followed ?? false);
+    }
 
     // Send only what the user actually set; the backend applies just the keys
     // present, so omitting a field leaves it untouched rather than nulling it.
-    const payload: PositionReviewPayload = {
-      tag_hard_sl: checked['Hard stop-loss set'] ?? draft.tag_hard_sl,
-      tag_retest: checked['Waited for retest'] ?? draft.tag_retest,
-      tag_plan_compliant: checked['Followed the plan'] ?? draft.tag_plan_compliant,
+    const payload: PositionReviewPayload = {};
+    if (rules.length > 0) payload.disciplines = disciplines;
+
+    // Mirror the three original rules onto their legacy columns. Migration 014
+    // supersedes but does not drop them, so anything still reading tag_* stays
+    // correct rather than silently freezing at its pre-014 value.
+    const byName = (name: string) => {
+      const rule = rules.find((r) => r.name === name);
+      return rule ? disciplines[rule.id] : undefined;
     };
+    const hardSl = byName('Hard stop-loss set');
+    const retest = byName('Waited for retest');
+    const plan = byName('Followed the plan');
+    if (hardSl !== undefined) payload.tag_hard_sl = hardSl;
+    if (retest !== undefined) payload.tag_retest = retest;
+    if (plan !== undefined) payload.tag_plan_compliant = plan;
     if (draft.strategy_id) payload.strategy_id = draft.strategy_id;
     if (draft.trade_grade) payload.trade_grade = draft.trade_grade;
     if (draft.review_went_well.trim())
@@ -429,11 +451,16 @@ export function TradeInboxQueue() {
                   <p className="text-xs text-obsidian-muted py-1">No discipline rules defined.</p>
                 ) : (
                   (disciplinesQuery.data ?? []).map((d) => {
+                    // Keyed by id, never by name. Name-keying meant a rule the
+                    // user added had no column to land in and was dropped on
+                    // save, and renaming a default rule silently detached its
+                    // history. Any previously saved answer wins over the draft
+                    // default so an unreviewed rule starts unticked.
+                    const saved = position.disciplines?.find(
+                      (a) => a.discipline_id === d.id
+                    );
                     const isChecked = Boolean(
-                      draft.disciplines_checked?.[d.name] ??
-                        (d.name === 'Hard stop-loss set' ? draft.tag_hard_sl :
-                         d.name === 'Waited for retest' ? draft.tag_retest :
-                         d.name === 'Followed the plan' ? draft.tag_plan_compliant : false)
+                      draft.disciplines_checked?.[d.id] ?? saved?.followed ?? false
                     );
                     return (
                       <label
@@ -444,19 +471,14 @@ export function TradeInboxQueue() {
                           type="checkbox"
                           checked={isChecked}
                           disabled={isSubmitting}
-                          onChange={(e) => {
-                            const newChecked = {
-                              ...(draft.disciplines_checked ?? {}),
-                              [d.name]: e.target.checked,
-                            };
-                            const updates: Partial<ReviewDraft> = {
-                              disciplines_checked: newChecked,
-                            };
-                            if (d.name === 'Hard stop-loss set') updates.tag_hard_sl = e.target.checked;
-                            if (d.name === 'Waited for retest') updates.tag_retest = e.target.checked;
-                            if (d.name === 'Followed the plan') updates.tag_plan_compliant = e.target.checked;
-                            patchDraft(position.id, updates);
-                          }}
+                          onChange={(e) =>
+                            patchDraft(position.id, {
+                              disciplines_checked: {
+                                ...(draft.disciplines_checked ?? {}),
+                                [d.id]: e.target.checked,
+                              },
+                            })
+                          }
                           className="h-3.5 w-3.5 rounded border-obsidian-border bg-obsidian-card accent-win disabled:opacity-50"
                         />
                         <span className="text-xs text-slate-300">{d.name}</span>

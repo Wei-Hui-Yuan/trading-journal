@@ -103,6 +103,96 @@ function RDistribution({ metrics }: { metrics: AdvancedMetrics }) {
   );
 }
 
+/**
+ * What each of the trader's own rules is measurably worth.
+ *
+ * The point of a discipline checklist is not the ticking, it is finding out
+ * which rules earn their place. Each rule is split into the trades that
+ * honoured it and the trades that did not, and the edge column is the gap
+ * between them — a rule with no measurable edge is a superstition.
+ *
+ * Win rate is used as the headline rather than R because it needs only a
+ * realised P&L. Keying this off R would leave the whole panel empty until
+ * every trade carried a stop, which is exactly the state most journals are in.
+ */
+function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
+  const rows = metrics.discipline_breakdown ?? [];
+
+  const pct = (value: number | null) => (value === null ? '—' : `${value}%`);
+
+  return (
+    <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+      <h3 className="text-sm font-semibold text-slate-200 mb-1">
+        Does Following Your Rules Pay?
+      </h3>
+      <p className="text-[11px] text-obsidian-muted mb-4">
+        Win rate when you followed each rule, against when you didn&rsquo;t.
+      </p>
+      {rows.length === 0 ? (
+        <p className="text-xs text-obsidian-muted py-4 text-center">
+          No discipline answers yet. Review a closed trade to start this
+          breakdown.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-obsidian-muted text-[10px] uppercase tracking-wider">
+                <th className="text-left font-medium pb-2">Rule</th>
+                <th className="text-right font-medium pb-2">Followed</th>
+                <th className="text-right font-medium pb-2">Win %</th>
+                <th className="text-right font-medium pb-2">Broke</th>
+                <th className="text-right font-medium pb-2">Win %</th>
+                <th className="text-right font-medium pb-2">Edge</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.discipline} className="border-t border-obsidian-border">
+                  <td className="py-2 text-slate-200">{row.discipline}</td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {row.followed.trade_count}
+                  </td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {pct(row.followed.win_rate_pct)}
+                  </td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {row.not_followed.trade_count}
+                  </td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {pct(row.not_followed.win_rate_pct)}
+                  </td>
+                  {/* Null means one side has no trades, so there is nothing to
+                      compare against. Shown as a dash rather than 0, which
+                      would read as "this rule makes no difference". */}
+                  <td
+                    className={`py-2 text-right font-mono font-semibold ${
+                      row.edge_win_rate_pct === null
+                        ? 'text-obsidian-muted'
+                        : row.edge_win_rate_pct >= 0
+                          ? 'text-win'
+                          : 'text-loss'
+                    }`}
+                    title={
+                      row.edge_win_rate_pct === null
+                        ? 'No comparison available — every reviewed trade fell on one side of this rule'
+                        : 'Percentage points of win rate gained by following this rule'
+                    }
+                  >
+                    {row.edge_win_rate_pct === null
+                      ? '—'
+                      : `${row.edge_win_rate_pct >= 0 ? '+' : ''}${row.edge_win_rate_pct} pts`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MistakeBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
   const rows = metrics.mistake_breakdown ?? [];
 
@@ -426,6 +516,10 @@ export default function AnalyticsPage() {
             <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <RDistribution metrics={m} />
               <MistakeBreakdown metrics={m} />
+            </section>
+
+            <section>
+              <DisciplineBreakdown metrics={m} />
             </section>
           </>
         ) : null}

@@ -59,6 +59,19 @@ export interface DisciplineCreatePayload {
   name: string;
 }
 
+/**
+ * One rule's answer for one round trip (migration 014).
+ *
+ * A rule absent from a position's list is UNREVIEWED, which is not the same
+ * as `followed: false`. Rendering absence as unchecked is fine; recording it
+ * as "did not follow" is not, and would drag every compliance rate down.
+ */
+export interface PositionDiscipline {
+  discipline_id: string;
+  name: string;
+  followed: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Positions
 // ---------------------------------------------------------------------------
@@ -102,6 +115,9 @@ export interface Position {
   review_went_well: string | null;
   review_went_wrong: string | null;
   review_lessons: string | null;
+
+  /** Answers to the user's own rules. Only rules actually answered appear. */
+  disciplines: PositionDiscipline[];
 
   created_at: string | null;
 }
@@ -153,22 +169,12 @@ export interface PositionReviewPayload {
   revised_entry?: number | null;
   revised_stop?: number | null;
   revised_target?: number | null;
-}
-
-/**
- * What DELETE /api/trades/{id} actually did.
- *
- * Deleting one fill can dissolve a whole round trip and discard its review,
- * because a position's size and P&L are derived from a specific set of
- * executions. Returned so the UI can say so rather than let the user find out
- * from a changed number later.
- */
-export interface TradeDeleteResult {
-  deleted_trade_id: string;
-  ticker: string;
-  positions_removed: number;
-  positions_rebuilt: number;
-  reviews_discarded: number;
+  /**
+   * Discipline answers keyed by discipline id. Omit the field to leave
+   * existing answers untouched; include a rule with `false` to record
+   * "reviewed, did not follow" — a different statement from omitting it.
+   */
+  disciplines?: Record<string, boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +334,25 @@ export interface RoundTrip {
   revised_entry: number | null;
   revised_stop: number | null;
   revised_target: number | null;
+  disciplines: PositionDiscipline[];
 
   fills: PositionFill[];
+}
+
+/**
+ * What DELETE /api/trades/{id} actually did.
+ *
+ * Deleting one fill can dissolve a whole round trip and discard its review,
+ * because a position's size and P&L are derived from a specific set of
+ * executions. Returned so the UI can say so rather than let the user find out
+ * from a changed number later.
+ */
+export interface TradeDeleteResult {
+  deleted_trade_id: string;
+  ticker: string;
+  positions_removed: number;
+  positions_rebuilt: number;
+  reviews_discarded: number;
 }
 
 /** Body for PATCH /api/trades/{id}. Only present keys are applied. */
@@ -476,6 +499,33 @@ export interface AdvancedMetrics {
   slippage_sample: number;
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
+  discipline_breakdown: DisciplineBreakdown[];
+}
+
+/** One side of a discipline split — trades that honoured a rule, or didn't. */
+export interface DisciplineSideStats {
+  trade_count: number;
+  /** From realised P&L, so available on every closed trade. Null if none. */
+  win_rate_pct: number | null;
+  /** Only from trades carrying a stop. Null when none can be scored. */
+  avg_r: number | null;
+  /** How many trades actually stand behind `avg_r`. */
+  r_sample: number;
+}
+
+/**
+ * What one of the trader's own rules is measurably worth.
+ *
+ * `edge_*` is null when one side has no trades: a rule followed every time
+ * has no counterfactual to compare against.
+ */
+export interface DisciplineBreakdown {
+  discipline: string;
+  followed: DisciplineSideStats;
+  not_followed: DisciplineSideStats;
+  edge_win_rate_pct: number | null;
+  edge_r: number | null;
+  sample: number;
 }
 
 // ---------------------------------------------------------------------------
