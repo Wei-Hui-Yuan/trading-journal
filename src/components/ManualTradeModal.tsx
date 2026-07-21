@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertCircle, Check, Loader2, PlusCircle, X } from 'lucide-react';
 
-import { useCreateManualTrade } from '@/hooks/useTradeInbox';
+import { useCreateManualTrade, useStrategies } from '@/hooks/useTradeInbox';
 import type { TradeSide } from '@/types/api';
 
 interface ManualTradeModalProps {
@@ -31,6 +31,9 @@ interface FormState {
   // The execution
   price: string; // actual entry — required
   exitPrice: string; // blank while the trade is still running
+  // The idea
+  strategyId: string; // '' means none chosen
+  thesis: string;
 }
 
 /** '' / whitespace / unparseable -> null, so the API never receives NaN. */
@@ -83,6 +86,8 @@ const blankForm = (): FormState => ({
   takeProfitPrice: '',
   price: '',
   exitPrice: '',
+  strategyId: '',
+  thesis: '',
 });
 
 export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
@@ -93,6 +98,8 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
   const symbolRef = useRef<HTMLInputElement>(null);
 
   const mutation = useCreateManualTrade();
+  // Offered straight from the playbook, so the two cannot drift apart.
+  const { data: strategies } = useStrategies();
 
   // The portal target only exists in the browser.
   useEffect(() => setMounted(true), []);
@@ -137,9 +144,6 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
     if (symbol.length > 10) return setError('Ticker must be 10 characters or fewer.');
     if (!Number.isFinite(quantity) || quantity <= 0)
       return setError('Quantity must be a positive number.');
-    // Mirrors the API rule: trades.quantity is an INTEGER column.
-    if (!Number.isInteger(quantity))
-      return setError('Quantity must be a whole number of shares.');
     if (!Number.isFinite(price) || price <= 0)
       return setError('Actual entry price must be greater than zero.');
 
@@ -175,6 +179,8 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
         price,
         // Sent without an offset; the backend anchors it to America/New_York.
         execution_time: form.executionTime ? `${form.executionTime}:00` : null,
+        strategy_id: form.strategyId || null,
+        thesis: form.thesis.trim() || null,
         ...optional,
       },
       {
@@ -431,6 +437,57 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
             </div>
             <p className="mt-1.5 text-[10px] text-obsidian-muted">
               Leave Exit Price blank while the trade is still running.
+            </p>
+          </fieldset>
+
+          {/* The idea. Captured now, before the outcome is known — a thesis
+              written after the fact is just the result with reasoning bolted
+              on, which is the bias a journal exists to catch. */}
+          <fieldset className="rounded-lg border border-obsidian-border p-3">
+            <legend className="px-1.5 text-[10px] uppercase tracking-wider text-obsidian-muted">
+              The Idea
+            </legend>
+
+            <label className="block">
+              <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                Strategy
+              </span>
+              <select
+                value={form.strategyId}
+                onChange={(e) => patch({ strategyId: e.target.value })}
+                disabled={isSaving}
+                className={`mt-1 text-xs ${fieldClass}`}
+              >
+                <option value="">— None —</option>
+                {(strategies ?? []).map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                    {s.method ? ` · ${s.method}` : ''}
+                  </option>
+                ))}
+              </select>
+              {strategies && strategies.length === 0 && (
+                <span className="mt-1 block text-[10px] text-obsidian-muted">
+                  No strategies yet — add them in the Strategy Playbook.
+                </span>
+              )}
+            </label>
+
+            <label className="mt-3 block">
+              <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                Why this trade?
+              </span>
+              <textarea
+                value={form.thesis}
+                onChange={(e) => patch({ thesis: e.target.value })}
+                disabled={isSaving}
+                rows={3}
+                placeholder="Setup, trigger, and what would prove you wrong."
+                className={`mt-1 text-xs resize-y ${fieldClass}`}
+              />
+            </label>
+            <p className="mt-1.5 text-[10px] text-obsidian-muted">
+              Written at entry. The post-trade review comes later, in the Journal.
             </p>
           </fieldset>
 

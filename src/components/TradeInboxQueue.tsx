@@ -28,6 +28,11 @@ interface ReviewDraft {
   tag_retest: boolean;
   tag_plan_compliant: boolean;
   trade_grade: string;
+  // The post-mortem, asked as three questions. One combined box reliably
+  // collapses into only ever recording what went wrong.
+  review_went_well: string;
+  review_went_wrong: string;
+  review_lessons: string;
 }
 
 const emptyDraft: ReviewDraft = {
@@ -36,6 +41,9 @@ const emptyDraft: ReviewDraft = {
   tag_retest: false,
   tag_plan_compliant: false,
   trade_grade: '',
+  review_went_well: '',
+  review_went_wrong: '',
+  review_lessons: '',
 };
 
 const currency = (value: number) =>
@@ -89,6 +97,12 @@ export function TradeInboxQueue() {
     };
     if (draft.strategy_id) payload.strategy_id = draft.strategy_id;
     if (draft.trade_grade) payload.trade_grade = draft.trade_grade;
+    if (draft.review_went_well.trim())
+      payload.review_went_well = draft.review_went_well.trim();
+    if (draft.review_went_wrong.trim())
+      payload.review_went_wrong = draft.review_went_wrong.trim();
+    if (draft.review_lessons.trim())
+      payload.review_lessons = draft.review_lessons.trim();
 
     setErrorFor(null);
     reviewMutation.mutate(
@@ -333,6 +347,35 @@ export function TradeInboxQueue() {
                   </label>
                 ))}
               </div>
+            </div>
+
+            {/* The post-mortem. Three questions rather than one notes box:
+                asked together, a single field reliably becomes a list of
+                mistakes, and what worked never gets written down. */}
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+              {(
+                [
+                  ['review_went_well', 'What went well', 'Executed the entry trigger exactly…'],
+                  ['review_went_wrong', 'What went wrong', 'Sized up after two losses…'],
+                  ['review_lessons', 'What to learn', 'Wait for the retest before adding…'],
+                ] as const
+              ).map(([field, label, placeholder]) => (
+                <label key={field} className="block">
+                  <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
+                    {label}
+                  </span>
+                  <textarea
+                    value={draft[field]}
+                    disabled={isSubmitting}
+                    onChange={(e) =>
+                      patchDraft(position.id, { [field]: e.target.value })
+                    }
+                    rows={3}
+                    placeholder={placeholder}
+                    className="mt-1 w-full resize-y rounded-lg border border-obsidian-border bg-obsidian-card px-3 py-2 text-xs text-slate-200 placeholder:text-obsidian-muted focus:border-slate-600 focus:outline-none disabled:opacity-50"
+                  />
+                </label>
+              ))}
             </div>
 
             {errorFor === position.id && reviewMutation.error && (

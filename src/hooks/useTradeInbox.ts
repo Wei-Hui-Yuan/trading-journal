@@ -8,9 +8,11 @@ import {
   ingestIBKR,
   createStrategy,
   getDashboardAnalytics,
+  annotateTrade,
   getPendingPositions,
   getPositionFills,
   getStrategies,
+  getTrades,
   updatePositionReview,
   updateStrategy,
 } from '@/lib/api';
@@ -26,6 +28,8 @@ import type {
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
+  Trade,
+  TradeAnnotationPayload,
 } from '@/types/api';
 
 /**
@@ -33,6 +37,7 @@ import type {
  */
 export const queryKeys = {
   pendingPositions: ['positions', 'pending'] as const,
+  trades: ['trades'] as const,
   positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
   dashboardStats: ['dashboardStats'] as const,
@@ -60,6 +65,26 @@ export function usePositionFills(positionId: string, enabled: boolean) {
     queryFn: () => getPositionFills(positionId),
     enabled,
     staleTime: 5 * 60_000,
+  });
+}
+
+/** Every execution, open or closed — the master list. */
+export function useTrades() {
+  return useQuery<Trade[]>({
+    queryKey: queryKeys.trades,
+    queryFn: () => getTrades(),
+  });
+}
+
+/** Attach a strategy or thesis to an execution already in the ledger. */
+export function useAnnotateTrade() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: string; payload: TradeAnnotationPayload }) =>
+      annotateTrade(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+    },
   });
 }
 
@@ -123,6 +148,9 @@ export function useCreateManualTrade() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+      // The ledger always gains a row, even when the fill opens rather than
+      // closes a position — which is the case the inbox cannot show.
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
     },
   });
 }

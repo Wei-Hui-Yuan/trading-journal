@@ -84,6 +84,11 @@ export interface Position {
   /** Behavioural tags, e.g. ['FOMO', 'Chased']. */
   mistakes: string[];
 
+  // Post-mortem, asked as three separate questions (migration 011).
+  review_went_well: string | null;
+  review_went_wrong: string | null;
+  review_lessons: string | null;
+
   created_at: string | null;
 }
 
@@ -122,6 +127,9 @@ export interface PositionReviewPayload {
   trade_grade?: string | null;
   notes?: string | null;
   mistakes?: string[];
+  review_went_well?: string | null;
+  review_went_wrong?: string | null;
+  review_lessons?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +178,8 @@ export type TradeSide = 'BUY' | 'SELL';
 /**
  * Body for POST /api/trades/manual.
  *
- * `quantity` must be a whole number — `trades.quantity` is an INTEGER column,
- * and the API rejects fractional shares rather than truncating them.
+ * `quantity` accepts fractions — `trades.quantity` is NUMERIC(18,8) since
+ * migration 010, so a 0.25-share fill is stored as 0.25 rather than rounded.
  *
  * `execution_time` omitted means "now, US market time". A value without a
  * timezone offset is interpreted by the backend as America/New_York.
@@ -193,6 +201,44 @@ export interface ManualTradePayload {
   take_profit_price?: number | null;
   /** Left null while the trade is still running. */
   exit_price?: number | null;
+
+  /** Playbook entry this trade follows. */
+  strategy_id?: string | null;
+  /** Why the trade was taken, recorded at entry. */
+  thesis?: string | null;
+}
+
+/**
+ * One execution in the ledger (GET /api/trades) — the master list.
+ *
+ * Distinct from `Position`: a position is a *closed* round trip, so a buy
+ * that has not been sold has no position row at all. This is every fill,
+ * open or closed.
+ */
+export interface Trade {
+  id: string;
+  ticker: string;
+  direction: TradeSide;
+  quantity: number;
+  actual_entry: number;
+  exit_price: number | null;
+  entry_date: string;
+  style: string;
+  source_tag: string | null;
+  strategy_id: string | null;
+  thesis: string | null;
+  planned_entry: number | null;
+  stop_loss: number | null;
+  target: number | null;
+  /** False means no counterpart fill yet � an open position. */
+  is_matched: boolean;
+  created_at: string | null;
+}
+
+/** Body for PATCH /api/trades/{id}. Only present keys are applied. */
+export interface TradeAnnotationPayload {
+  strategy_id?: string | null;
+  thesis?: string | null;
 }
 
 export interface ManualTradeResult {

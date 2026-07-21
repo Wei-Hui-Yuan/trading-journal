@@ -12,6 +12,8 @@ import type {
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
+  Trade,
+  TradeAnnotationPayload,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -145,6 +147,28 @@ export async function getPositions(reviewStatus?: string): Promise<Position[]> {
  */
 export async function getPositionFills(id: string): Promise<PositionFill[]> {
   const { data } = await apiClient.get<PositionFill[]>(`/positions/${id}/fills`);
+  return data;
+}
+
+/**
+ * GET /api/trades — every execution, newest first.
+ *
+ * The master list. `positions` holds only closed round trips, so an unsold
+ * buy has no row there; this is the only view that shows it.
+ */
+export async function getTrades(ticker?: string): Promise<Trade[]> {
+  const { data } = await apiClient.get<Trade[]>('/trades', {
+    params: ticker ? { ticker } : undefined,
+  });
+  return data;
+}
+
+/** PATCH /api/trades/{id} — attach a strategy or thesis to an execution. */
+export async function annotateTrade(
+  id: string,
+  payload: TradeAnnotationPayload
+): Promise<Trade> {
+  const { data } = await apiClient.patch<Trade>(`/trades/${id}`, payload);
   return data;
 }
 

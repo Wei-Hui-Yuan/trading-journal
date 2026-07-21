@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BarChart3, BookOpen, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { ManualTradeModal } from './ManualTradeModal';
 
@@ -58,6 +58,14 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
 
         {/* Right Controls */}
         <div className="flex items-center space-x-3">
+          <Link
+            href="/journal"
+            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
+          >
+            <BookText className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Journal</span>
+          </Link>
+
           <Link
             href="/analytics"
             className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"

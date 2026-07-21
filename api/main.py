@@ -122,6 +122,10 @@ class Trade(Base):
     grade = Column(CHAR(1), nullable=True)
     market_regime = Column(String(20), nullable=True)
     source_tag = Column(String(10), default="Own")
+    # Why this trade was taken, captured at entry. Written before the
+    # outcome is known, which is the whole point -- a thesis reconstructed
+    # afterwards is just the result with reasoning attached.
+    thesis = Column(Text, nullable=True)
     screenshot_url = Column(Text, nullable=True)
     hard_sl_set = Column(Boolean, default=True)
     waited_retest = Column(Boolean, default=True)
@@ -174,6 +178,12 @@ class Position(Base):
     # round trip has exactly one review state.
     notes = Column(Text, nullable=True)
     mistakes = Column(ARRAY(Text), default=list)
+
+    # Post-mortem, split by question (migration 011). One combined box
+    # collapses into only ever recording what went wrong.
+    review_went_well = Column(Text, nullable=True)
+    review_went_wrong = Column(Text, nullable=True)
+    review_lessons = Column(Text, nullable=True)
 
 
 class PositionFill(Base):
@@ -460,6 +470,10 @@ class ManualTradeCreate(BaseModel):
     # Left blank while a trade is still running.
     exit_price: Optional[float] = Field(None, gt=0)
 
+    # Which playbook entry this trade follows, and why it was taken.
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+
     @field_validator("symbol")
     @classmethod
     def _upper_symbol(cls, value: str) -> str:
@@ -534,6 +548,8 @@ async def create_manual_trade(
         stop_loss=params.planned_stop_loss,
         target=params.take_profit_price,
         exit_price=params.exit_price,
+        strategy_id=params.strategy_id,
+        thesis=params.thesis,
         source_tag="Manual",
     )
     session.add(trade)
@@ -701,6 +717,11 @@ class PositionReviewUpdate(BaseModel):
     # Behavioural tags, e.g. ['FOMO', 'Chased', 'Early Liquidation'].
     mistakes: Optional[list[str]] = None
 
+    # The post-mortem, asked as three separate questions (migration 011).
+    review_went_well: Optional[str] = None
+    review_went_wrong: Optional[str] = None
+    review_lessons: Optional[str] = None
+
 
 class PositionOut(BaseModel):
     id: uuid.UUID
@@ -720,6 +741,9 @@ class PositionOut(BaseModel):
     trade_grade: Optional[str]
     notes: Optional[str]
     mistakes: list[str] = []
+    review_went_well: Optional[str] = None
+    review_went_wrong: Optional[str] = None
+    review_lessons: Optional[str] = None
     created_at: Optional[datetime]
 
     @field_validator("mistakes", mode="before")
@@ -748,6 +772,113 @@ class PositionFillOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TradeOut(BaseModel):
+    """One execution in the ledger, as the master list shows it."""
+
+    id: uuid.UUID
+    ticker: str
+    direction: str
+    quantity: float
+    actual_entry: float
+    exit_price: Optional[float]
+    entry_date: datetime
+    style: str
+    source_tag: Optional[str]
+    strategy_id: Optional[uuid.UUID]
+    thesis: Optional[str]
+    planned_entry: Optional[float]
+    stop_loss: Optional[float]
+    target: Optional[float]
+    # True once FIFO matching has folded this fill into a closed round trip.
+    # A fill with no counterpart is an open position, which is precisely what
+    # the positions list cannot show -- and why a hand-logged buy appeared to
+    # vanish before this endpoint existed.
+    is_matched: bool
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class TradeAnnotationUpdate(BaseModel):
+    """Annotate an execution after the fact.
+
+    Only keys present are applied, so setting a strategy never clears a thesis.
+    """
+
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+
+
+@app.get(
+    "/api/trades",
+    response_model=list[TradeOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_trades(
+    ticker: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Every execution, newest first -- the master list.
+
+    `positions` only ever contains *closed* round trips, so a buy that has not
+    been sold has no row there and was invisible everywhere in the app. This is
+    the ledger view: open and closed alike, each carrying its own thesis.
+    """
+    stmt = select(Trade).order_by(Trade.entry_date.desc())
+    if ticker:
+        stmt = stmt.where(Trade.ticker == ticker.strip().upper())
+    trades = (await session.execute(stmt)).scalars().all()
+
+    # One query for the whole ledger rather than a lookup per row.
+    matched = (await session.execute(select(PositionFill.trade_id))).scalars().all()
+    matched_ids = set(matched)
+
+    return [
+        TradeOut(
+            **{c.name: getattr(trade, c.name) for c in Trade.__table__.columns
+               if c.name in TradeOut.model_fields},
+            is_matched=trade.id in matched_ids,
+        )
+        for trade in trades
+    ]
+
+
+@app.patch(
+    "/api/trades/{trade_id}",
+    response_model=TradeOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def annotate_trade(
+    trade_id: uuid.UUID,
+    params: TradeAnnotationUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Attach a strategy or thesis to an execution already in the ledger.
+
+    Synced fills arrive with neither -- IBKR does not know why you traded --
+    so the reasoning has to be attachable after import.
+    """
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    for field, value in params.model_dump(exclude_unset=True).items():
+        setattr(trade, field, value)
+
+    await session.commit()
+    await session.refresh(trade)
+
+    matched = await session.execute(
+        select(PositionFill.id).where(PositionFill.trade_id == trade_id).limit(1)
+    )
+    return TradeOut(
+        **{c.name: getattr(trade, c.name) for c in Trade.__table__.columns
+           if c.name in TradeOut.model_fields},
+        is_matched=matched.first() is not None,
+    )
 
 
 @app.get(
