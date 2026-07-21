@@ -104,6 +104,148 @@ function RDistribution({ metrics }: { metrics: AdvancedMetrics }) {
 }
 
 /**
+ * Which playbook entries are actually earning their place.
+ *
+ * A diverging bar chart of total R per strategy: profitable setups extend
+ * right, losing ones left, ranked so the chart reads top-to-bottom as a verdict.
+ *
+ * Total R rather than win rate or dollars, because it is the only measure that
+ * compares setups fairly. Win rate flatters a strategy that scratches often and
+ * loses big; dollars flatter whichever setup happened to be sized largest.
+ * Total R answers the question being asked -- per unit of risk committed to
+ * this setup, what came back.
+ *
+ * Each label links to the playbook entry, and the join is on strategy_id, so
+ * renaming a strategy there carries its whole history with it.
+ */
+function StrategyBreakdownChart({ metrics }: { metrics: AdvancedMetrics }) {
+  const rows = metrics.strategy_breakdown ?? [];
+  if (rows.length === 0) {
+    return (
+      <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+        <h3 className="text-sm font-semibold text-slate-200 mb-1">
+          Which Strategies Are Working
+        </h3>
+        <p className="text-xs text-obsidian-muted py-6 text-center">
+          No scored trades yet. Assign a strategy and record a stop to build
+          this.
+        </p>
+      </div>
+    );
+  }
+
+  // Symmetric scale so a +3R bar and a -3R bar are drawn the same length --
+  // an asymmetric axis would make the losing side look smaller than it is.
+  const span = Math.max(1, ...rows.map((r) => Math.abs(r.total_r)));
+  const axis = Math.ceil(span);
+  const half = (value: number) => (Math.abs(value) / axis) * 50;
+
+  const ticks = [-axis, -axis / 2, 0, axis / 2, axis];
+
+  return (
+    <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+      <h3 className="text-sm font-semibold text-slate-200 mb-1">
+        Which Strategies Are Working
+      </h3>
+      <p className="text-[11px] text-obsidian-muted mb-5">
+        Total R per playbook entry. Longer right is better; each label links to
+        the playbook.
+      </p>
+
+      <div className="space-y-1.5">
+        {rows.map((row) => {
+          const positive = row.total_r >= 0;
+          const width = half(row.total_r);
+          const isUnassigned = row.strategy === 'Unassigned';
+          return (
+            <div key={row.strategy} className="flex items-center gap-3 group">
+              <div className="w-40 shrink-0 text-right">
+                {isUnassigned ? (
+                  <span
+                    className="text-[11px] text-obsidian-muted italic"
+                    title="Trades with no strategy set — assign one in the journal"
+                  >
+                    {row.strategy} ({row.trade_count})
+                  </span>
+                ) : (
+                  <Link
+                    href="/strategies"
+                    className="text-[11px] text-slate-300 hover:text-white hover:underline"
+                    title={`Open "${row.strategy}" in the strategy playbook`}
+                  >
+                    {row.strategy} ({row.trade_count})
+                  </Link>
+                )}
+              </div>
+
+              {/* Plot area: 50% either side of a centre zero line. */}
+              <div className="relative h-7 flex-1 rounded bg-obsidian-bg/60">
+                <div className="absolute inset-y-0 left-1/2 w-px bg-obsidian-border" />
+                <div
+                  className={`absolute inset-y-1 rounded-sm transition-opacity group-hover:opacity-90 ${
+                    positive ? 'bg-blue-500' : 'bg-loss'
+                  }`}
+                  style={
+                    positive
+                      ? { left: '50%', width: `${width}%` }
+                      : { right: '50%', width: `${width}%` }
+                  }
+                  title={
+                    `${row.strategy}: ${row.total_r >= 0 ? '+' : ''}${row.total_r.toFixed(2)}R ` +
+                    `over ${row.scored} scored trade${row.scored === 1 ? '' : 's'}` +
+                    (row.unscored ? ` (${row.unscored} unscored)` : '') +
+                    (row.avg_r !== null ? ` · avg ${row.avg_r.toFixed(2)}R` : '') +
+                    (row.win_rate_pct !== null ? ` · win ${row.win_rate_pct}%` : '')
+                  }
+                />
+              </div>
+
+              <span
+                className={`w-16 shrink-0 text-right font-mono text-[11px] ${
+                  positive ? 'text-blue-400' : 'text-loss'
+                }`}
+              >
+                {row.total_r >= 0 ? '+' : ''}
+                {row.total_r.toFixed(2)}R
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Axis */}
+      <div className="mt-2 flex items-center gap-3">
+        <div className="w-40 shrink-0" />
+        <div className="relative h-4 flex-1">
+          {ticks.map((t) => (
+            <span
+              key={t}
+              className="absolute -translate-x-1/2 font-mono text-[10px] text-obsidian-muted"
+              style={{ left: `${50 + (t / axis) * 50}%` }}
+            >
+              {t > 0 ? '+' : ''}
+              {t}R
+            </span>
+          ))}
+        </div>
+        <div className="w-16 shrink-0" />
+      </div>
+
+      {/* Coverage: a strategy whose trades mostly lack stops cannot be scored,
+          and saying so beats letting it sit near zero as if it were neutral. */}
+      {rows.some((r) => r.unscored > 0) && (
+        <p className="mt-4 text-[10px] text-obsidian-muted">
+          {rows.reduce((n, r) => n + r.unscored, 0)} trade
+          {rows.reduce((n, r) => n + r.unscored, 0) === 1 ? '' : 's'} could not
+          be scored in R (no stop recorded) and contribute nothing to the bars
+          above.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * What each of the trader's own rules is measurably worth.
  *
  * The point of a discipline checklist is not the ticking, it is finding out
@@ -516,6 +658,10 @@ export default function AnalyticsPage() {
             <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <RDistribution metrics={m} />
               <MistakeBreakdown metrics={m} />
+            </section>
+
+            <section>
+              <StrategyBreakdownChart metrics={m} />
             </section>
 
             <section>

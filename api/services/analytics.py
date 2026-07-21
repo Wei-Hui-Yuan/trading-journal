@@ -308,6 +308,12 @@ class ReviewedTrade:
     # Needed by the discipline breakdown, which measures win rate from money
     # so it works on trades that carry no stop and cannot be scored in R.
     realized_pnl: Optional[Decimal] = None
+    # The playbook entry this trade followed, resolved to a name so the
+    # breakdown reads as the trader wrote it. None means unassigned, which is
+    # reported as its own bucket rather than dropped -- a large unassigned pile
+    # is itself worth seeing.
+    strategy: Optional[str] = None
+    entry_time: Optional[datetime] = None
 
 
 def compute_r_multiple(trade: ReviewedTrade) -> Optional[float]:
@@ -502,6 +508,80 @@ def compute_discipline_breakdown(
     return breakdown
 
 
+def compute_strategy_breakdown(
+    trades: list[ReviewedTrade],
+    r_by_id: dict[str, float],
+) -> list[dict[str, Any]]:
+    """Which playbook entries earn their place, measured in R.
+
+    Total R is the headline rather than win rate or dollars, because it is the
+    only figure that compares a strategy fairly against another. Win rate
+    rewards a setup that scratches often and loses big; dollars reward whichever
+    setup happened to be sized largest. Total R answers the question actually
+    being asked -- for every unit of risk I committed to this setup, what came
+    back.
+
+    Both totals are reported: `total_r` is what the strategy contributed
+    overall, `avg_r` is what one trade of it is worth. A setup can carry a fine
+    average and still be a rounding error if it was only taken twice, so
+    `trade_count` sits alongside them and the UI shows it in the label.
+
+    Trades with no stop cannot be scored and are counted in `unscored` rather
+    than silently treated as 0R -- otherwise a strategy whose trades mostly
+    lack stops would be flattered toward the middle of the chart.
+
+    Strategy is resolved through trades.strategy_id, so this stays tied to the
+    playbook: rename an entry there and every figure here follows, because the
+    join is on id and never on the label.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+
+    for trade in trades:
+        name = trade.strategy or "Unassigned"
+        b = buckets.setdefault(
+            name,
+            {"r": [], "pnl": [], "unscored": 0, "first": None, "last": None},
+        )
+
+        r = r_by_id.get(trade.trade_id)
+        if r is None:
+            b["unscored"] += 1
+        else:
+            b["r"].append(r)
+        if trade.realized_pnl is not None:
+            b["pnl"].append(float(trade.realized_pnl))
+
+        if trade.entry_time is not None:
+            if b["first"] is None or trade.entry_time < b["first"]:
+                b["first"] = trade.entry_time
+            if b["last"] is None or trade.entry_time > b["last"]:
+                b["last"] = trade.entry_time
+
+    out: list[dict[str, Any]] = []
+    for name, b in buckets.items():
+        rs, pnls = b["r"], b["pnl"]
+        wins = sum(1 for r in rs if r > 0)
+        out.append({
+            "strategy": name,
+            # Every trade attributed to the setup, scoreable or not.
+            "trade_count": len(rs) + b["unscored"],
+            "scored": len(rs),
+            "unscored": b["unscored"],
+            "total_r": round(sum(rs), 4) if rs else 0.0,
+            "avg_r": round(sum(rs) / len(rs), 4) if rs else None,
+            "win_rate_pct": round(wins / len(rs) * 100, 2) if rs else None,
+            "best_r": round(max(rs), 4) if rs else None,
+            "worst_r": round(min(rs), 4) if rs else None,
+            "net_pnl": round(sum(pnls), 2) if pnls else 0.0,
+            "first_traded": b["first"].isoformat() if b["first"] else None,
+            "last_traded": b["last"].isoformat() if b["last"] else None,
+        })
+
+    # Best contributor first, so the chart reads top-to-bottom as a ranking.
+    out.sort(key=lambda s: s["total_r"], reverse=True)
+    return out
+
+
 def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
     """R-multiples, slippage, expectancy, and per-mistake breakdown."""
     scored: list[tuple[ReviewedTrade, float]] = []
@@ -573,6 +653,9 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
         "discipline_breakdown": compute_discipline_breakdown(
             trades, {t.trade_id: r for t, r in scored}
         ),
+        "strategy_breakdown": compute_strategy_breakdown(
+            trades, {t.trade_id: r for t, r in scored}
+        ),
     }
 
 
@@ -594,12 +677,19 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
         Discipline,
         Position,
         PositionDiscipline,
+        Strategy,
         Trade,
     )
 
     positions = (await session.execute(select(Position))).scalars().all()
     trades = (await session.execute(select(Trade))).scalars().all()
     trade_by_id = {str(t.id): t for t in trades}
+
+    # Playbook names, so the breakdown reads as the trader wrote them. Joined
+    # on id, so renaming an entry in the playbook carries through everywhere.
+    strategy_name = {
+        s.id: s.name for s in (await session.execute(select(Strategy))).scalars().all()
+    }
 
     # Rule answers, keyed by position. One query for the whole set.
     discipline_rows = (
@@ -652,6 +742,14 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                     if position.realized_pnl is not None
                     else None
                 ),
+                # The position's own strategy wins when set (assigned during
+                # review); otherwise fall back to the opening execution's,
+                # which is where the journal's plan editor writes it.
+                strategy=strategy_name.get(
+                    position.strategy_id
+                    or (opening.strategy_id if opening is not None else None)
+                ),
+                entry_time=position.entry_time,
             )
         )
     return reviewed

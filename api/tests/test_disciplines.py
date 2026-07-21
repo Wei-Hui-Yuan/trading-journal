@@ -237,3 +237,70 @@ def test_rules_with_no_counterfactual_sort_last():
 
 def test_empty_input_produces_no_rows():
     assert compute_discipline_breakdown([], {}) == []
+
+
+# ---------------------------------------------------------------------------
+# Strategy breakdown (the "which strategies are working" chart)
+# ---------------------------------------------------------------------------
+
+
+def strat_trade(tid, pnl, strategy):
+    t = trade(tid, pnl, {})
+    return ReviewedTrade(
+        trade_id=t.trade_id, ticker=t.ticker, direction=t.direction,
+        quantity=t.quantity, actual_entry=t.actual_entry, exit_price=t.exit_price,
+        planned_entry=None, stop_loss=None, mistakes=[], review_status="reviewed",
+        disciplines={}, realized_pnl=t.realized_pnl, strategy=strategy,
+    )
+
+
+def test_strategy_breakdown_ranks_by_total_r():
+    """The chart reads top-to-bottom as a verdict, so order is load-bearing."""
+    from services.analytics import compute_strategy_breakdown
+
+    rows = compute_strategy_breakdown(
+        [
+            strat_trade("1", 100, "Breakout"),
+            strat_trade("2", 100, "Breakout"),
+            strat_trade("3", -50, "Stan"),
+        ],
+        {"1": 2.0, "2": 1.0, "3": -1.0},
+    )
+    assert [r["strategy"] for r in rows] == ["Breakout", "Stan"]
+    assert rows[0]["total_r"] == 3.0
+    assert rows[1]["total_r"] == -1.0
+
+
+def test_unscored_trades_are_counted_but_contribute_no_r():
+    """A strategy with no stops must not be flattered toward neutral."""
+    from services.analytics import compute_strategy_breakdown
+
+    rows = compute_strategy_breakdown(
+        [strat_trade("1", 100, "DR1"), strat_trade("2", -20, "DR1")],
+        {"1": 1.5},  # trade 2 has no R
+    )
+    row = rows[0]
+    assert row["trade_count"] == 2
+    assert row["scored"] == 1
+    assert row["unscored"] == 1
+    assert row["total_r"] == 1.5
+
+
+def test_trades_without_a_strategy_get_their_own_bucket():
+    """A large unassigned pile is itself worth seeing, not silently dropped."""
+    from services.analytics import compute_strategy_breakdown
+
+    rows = compute_strategy_breakdown([strat_trade("1", 10, None)], {"1": 0.5})
+    assert rows[0]["strategy"] == "Unassigned"
+    assert rows[0]["trade_count"] == 1
+
+
+def test_avg_r_is_none_when_nothing_scored():
+    """None, not 0.0 -- an unscoreable strategy is unknown, not break-even."""
+    from services.analytics import compute_strategy_breakdown
+
+    rows = compute_strategy_breakdown([strat_trade("1", 10, "MVR")], {})
+    assert rows[0]["avg_r"] is None
+    assert rows[0]["win_rate_pct"] is None
+    assert rows[0]["total_r"] == 0.0
+    assert rows[0]["scored"] == 0

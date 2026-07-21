@@ -500,6 +500,31 @@ export interface AdvancedMetrics {
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
   discipline_breakdown: DisciplineBreakdown[];
+  strategy_breakdown: StrategyBreakdown[];
+}
+
+/**
+ * Performance of one playbook entry, measured in R.
+ *
+ * Resolved through `trades.strategy_id`, so this stays joined to the strategy
+ * playbook by id — renaming an entry there carries through here rather than
+ * orphaning its history.
+ */
+export interface StrategyBreakdown {
+  strategy: string;
+  /** Every trade attributed to the setup, scoreable or not. */
+  trade_count: number;
+  /** How many could be scored in R — the rest have no stop recorded. */
+  scored: number;
+  unscored: number;
+  total_r: number;
+  avg_r: number | null;
+  win_rate_pct: number | null;
+  best_r: number | null;
+  worst_r: number | null;
+  net_pnl: number;
+  first_traded: string | null;
+  last_traded: string | null;
 }
 
 /** One side of a discipline split — trades that honoured a rule, or didn't. */
