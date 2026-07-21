@@ -30,6 +30,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
+from auth import verify_clerk_token
+
 load_dotenv()
 
 
@@ -236,7 +238,11 @@ class IngestResult(BaseModel):
     fractional_quantities: int
 
 
-@app.post("/api/ingest/ibkr", response_model=IngestResult)
+@app.post(
+    "/api/ingest/ibkr",
+    response_model=IngestResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     """Fetch, stage, promote, and match IBKR executions.
 
@@ -423,7 +429,12 @@ class ManualTradeResult(BaseModel):
     open_quantity: int
 
 
-@app.post("/api/trades/manual", response_model=ManualTradeResult, status_code=201)
+@app.post(
+    "/api/trades/manual",
+    response_model=ManualTradeResult,
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def create_manual_trade(
     params: ManualTradeCreate, session: AsyncSession = Depends(get_session)
 ):
@@ -537,13 +548,22 @@ class StrategyOut(BaseModel):
         from_attributes = True
 
 
-@app.get("/api/strategies", response_model=list[StrategyOut])
+@app.get(
+    "/api/strategies",
+    response_model=list[StrategyOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def list_strategies(session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(Strategy).order_by(Strategy.name))
     return [StrategyOut.model_validate(s) for s in result.scalars().all()]
 
 
-@app.post("/api/strategies", response_model=StrategyOut, status_code=201)
+@app.post(
+    "/api/strategies",
+    response_model=StrategyOut,
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def create_strategy(
     params: StrategyCreate, session: AsyncSession = Depends(get_session)
 ):
@@ -567,7 +587,11 @@ async def create_strategy(
     return StrategyOut.model_validate(strategy)
 
 
-@app.patch("/api/strategies/{strategy_id}", response_model=StrategyOut)
+@app.patch(
+    "/api/strategies/{strategy_id}",
+    response_model=StrategyOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def update_strategy(
     strategy_id: uuid.UUID,
     params: StrategyUpdate,
@@ -645,7 +669,11 @@ class PositionOut(BaseModel):
         from_attributes = True
 
 
-@app.get("/api/positions", response_model=list[PositionOut])
+@app.get(
+    "/api/positions",
+    response_model=list[PositionOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def list_positions(
     review_status: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
@@ -665,8 +693,16 @@ async def list_positions(
 # Both verbs hit the same handler: PUT is the documented route, PATCH is
 # retained because the Trade Inbox already calls it. The body is a partial
 # update either way (exclude_unset), which is why PATCH remains accurate.
-@app.put("/api/positions/{position_id}/review", response_model=PositionOut)
-@app.patch("/api/positions/{position_id}/review", response_model=PositionOut)
+@app.put(
+    "/api/positions/{position_id}/review",
+    response_model=PositionOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+@app.patch(
+    "/api/positions/{position_id}/review",
+    response_model=PositionOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
 async def review_position(
     position_id: uuid.UUID,
     params: PositionReviewUpdate,
@@ -714,7 +750,7 @@ async def review_position(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/analytics/dashboard")
+@app.get("/api/analytics/dashboard", dependencies=[Depends(verify_clerk_token)])
 async def analytics_dashboard(session: AsyncSession = Depends(get_session)):
     """Core stats plus the day/session heatmap grid."""
     from services.analytics import build_dashboard
@@ -722,7 +758,7 @@ async def analytics_dashboard(session: AsyncSession = Depends(get_session)):
     return await build_dashboard(session)
 
 
-@app.get("/api/analytics/advanced")
+@app.get("/api/analytics/advanced", dependencies=[Depends(verify_clerk_token)])
 async def analytics_advanced(session: AsyncSession = Depends(get_session)):
     """R-multiples, slippage, expectancy, and the per-mistake breakdown.
 
