@@ -68,3 +68,27 @@ def test_cors_middleware_is_outermost():
         "CORSMiddleware must stay outermost (added last) or error responses "
         f"lose their CORS headers. Current order: {stack}"
     )
+
+
+def test_health_reports_the_database_failure_class():
+    """`unreachable` alone does not say why. The exception class does.
+
+    Named separately because the distinction between a stale password and a
+    wrong host is the entire diagnostic value of the endpoint.
+    """
+    import inspect
+
+    source = inspect.getsource(main.health)
+    assert "type(exc).__name__" in source
+    assert "database_error" in source
+
+
+def test_health_does_not_expose_the_connection_password():
+    """It parses DATABASE_URL, which contains a live credential."""
+    import inspect
+
+    source = inspect.getsource(main.health)
+    # The host is taken from the right of rpartition("@"), which discards the
+    # userinfo. Returning netloc or the URL itself would publish the password.
+    assert "rpartition" in source
+    assert "DATABASE_URL," not in source.replace(" ", "")

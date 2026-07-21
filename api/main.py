@@ -1,12 +1,12 @@
 import logging
 import os
-import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -831,24 +831,36 @@ async def health(session: AsyncSession = Depends(get_session)):
     """
     try:
         await session.execute(select(1))
-        database = "ok"
     except Exception as exc:  # noqa: BLE001 - health must never itself 500
         logger.error("Health check could not reach the database: %s", exc)
         database = "unreachable"
+        # The exception *class* names the fault exactly -- InvalidPasswordError
+        # is a stale credential, gaierror is a wrong host, TimeoutError is a
+        # network path -- and unlike the message it cannot carry the
+        # connection string, so it is safe on an unauthenticated endpoint.
+        database_error = type(exc).__name__
 
-    # Host only. The password lives in the same string and must never surface,
-    # so this is parsed out rather than echoed.
+    # Structure only, never the password. Parsed with urlsplit rather than a
+    # regex: the regex read `postgres\.([a-z0-9]+)` off the *whole* string and
+    # so could match text that was never the username at all, reporting a
+    # confident wrong ref for a malformed URL -- the failure mode this endpoint
+    # exists to rule out. Reading the username field cannot make that mistake.
     host = ""
-    match = re.search(r"@([^/]+)/", DATABASE_URL)
-    if match:
-        host = match.group(1)
-    ref_match = re.search(r"postgres\.([a-z0-9]+)", DATABASE_URL)
+    project_ref: Optional[str] = None
+    try:
+        parts = urlsplit(DATABASE_URL)
+        # rpartition drops any user:password prefix without needing to parse it.
+        host = parts.netloc.rpartition("@")[2]
+        project_ref = (parts.username or "").partition(".")[2] or None
+    except ValueError as exc:
+        logger.error("DATABASE_URL could not be parsed as a URL: %s", type(exc).__name__)
 
     return {
         "status": "ok",
         "database": database,
+        "database_error": database_error,
         "database_host": host,
-        "supabase_project_ref": ref_match.group(1) if ref_match else None,
+        "supabase_project_ref": project_ref,
     }
 
 
