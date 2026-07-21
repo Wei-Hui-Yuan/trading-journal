@@ -322,14 +322,24 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
 
     # --- 1 & 2: fetch and parse -------------------------------------------
     try:
-        root = await ibkr_client.fetch_statement()
+        statements = await ibkr_client.fetch_statements()
     except ibkr_client.IBKRError as exc:
         # Transient "still compiling" conditions are a 503 so callers retry;
         # everything else is an upstream failure.
         raise HTTPException(status_code=503 if exc.retryable else 502, detail=str(exc))
 
-    executions = ibkr_parser.parse_statement(root)
-    skipped_non_tradeable = ibkr_parser.count_non_tradeable(root)
+    # Several queries can report the same fill -- a Trade Confirmation query
+    # covers today, an Activity query covers history, and they overlap. Merge
+    # on transaction_id here so the batch insert cannot conflict with itself;
+    # the UNIQUE index still guards against overlap with earlier runs.
+    merged: dict[str, object] = {}
+    skipped_non_tradeable = 0
+    for _query_id, root in statements:
+        skipped_non_tradeable += ibkr_parser.count_non_tradeable(root)
+        for execution in ibkr_parser.parse_statement(root):
+            merged.setdefault(execution.transaction_id, execution)
+
+    executions = list(merged.values())
     if not executions:
         return IngestResult(
             executions_parsed=0,
@@ -339,7 +349,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             trades_duplicates=0,
             positions_matched=0,
             symbols_touched=[],
-            skipped_non_tradeable=0,
+            skipped_non_tradeable=skipped_non_tradeable,
         )
 
     # --- 3: stage, skipping anything already seen -------------------------

@@ -36,19 +36,28 @@ class IBKRError(RuntimeError):
         self.retryable = retryable
 
 
-def get_credentials() -> tuple[str, str]:
+def get_credentials() -> tuple[str, list[str]]:
     """Read Flex credentials from the environment.
 
     Accepts IBKR_FLEX_TOKEN or the shorter IBKR_TOKEN already used elsewhere in
     this project, so both naming conventions work.
+
+    IBKR_QUERY_ID takes a comma-separated list, because no single Flex query
+    covers everything: a Trade Confirmation query reports today's fills but
+    drops them once they settle, while an Activity query carries history and
+    commissions but lags by a day or so. Running both and letting the staging
+    table's transaction_id UNIQUE guard absorb the overlap is what gives full
+    coverage. A single id is still valid.
     """
     token = os.environ.get("IBKR_FLEX_TOKEN") or os.environ.get("IBKR_TOKEN")
-    query_id = os.environ.get("IBKR_QUERY_ID")
-    if not token or not query_id:
+    raw_ids = os.environ.get("IBKR_QUERY_ID", "")
+    query_ids = [qid.strip() for qid in raw_ids.split(",") if qid.strip()]
+
+    if not token or not query_ids:
         raise IBKRError(
             "IBKR_FLEX_TOKEN (or IBKR_TOKEN) and IBKR_QUERY_ID must be set in the environment"
         )
-    return token, query_id
+    return token, query_ids
 
 
 def _text(root: ET.Element, tag: str) -> Optional[str]:
@@ -123,9 +132,10 @@ async def download_statement(
 async def fetch_statement(
     token: Optional[str] = None, query_id: Optional[str] = None
 ) -> ET.Element:
-    """Run the full handshake and return the statement's XML root."""
+    """Run the full handshake for one query and return its XML root."""
     if token is None or query_id is None:
-        token, query_id = get_credentials()
+        token, query_ids = get_credentials()
+        query_id = query_id or query_ids[0]
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         try:
@@ -133,3 +143,31 @@ async def fetch_statement(
             return await download_statement(client, token, reference_code)
         except httpx.HTTPError as exc:
             raise IBKRError(f"IBKR request failed: {exc}") from exc
+
+
+async def fetch_statements(
+    token: Optional[str] = None, query_ids: Optional[list[str]] = None
+) -> list[tuple[str, ET.Element]]:
+    """Fetch every configured query, returning (query_id, root) pairs.
+
+    Queries run sequentially rather than concurrently: the Flex service is
+    rate-limited per token, and firing several handshakes at once earns a
+    throttling error rather than a faster sync.
+
+    A failure on any query raises. Skipping the failed one and returning what
+    succeeded would report a healthy sync that quietly omitted a date range --
+    the same silent-loss failure mode that hid the TradeConfirm bug. Ingestion
+    is idempotent, so failing loudly and retrying costs nothing.
+    """
+    if token is None or query_ids is None:
+        token, query_ids = get_credentials()
+
+    statements: list[tuple[str, ET.Element]] = []
+    for query_id in query_ids:
+        try:
+            statements.append((query_id, await fetch_statement(token, query_id)))
+        except IBKRError as exc:
+            raise IBKRError(
+                f"IBKR query {query_id} failed: {exc}", retryable=exc.retryable
+            ) from exc
+    return statements
