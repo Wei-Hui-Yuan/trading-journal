@@ -141,6 +141,38 @@ class TestTradeConfirmNodes:
         assert len(executions) == 2
 
 
+class TestLevelOfDetail:
+    """A broad Flex query reports each fill at several levels of detail."""
+
+    MULTI_LEVEL = """<FlexQueryResponse><FlexStatements><FlexStatement><Trades>
+     <Trade tradeID="88001" symbol="ZZLVL" quantity="3" tradePrice="890"
+            dateTime="20260720;093927" buySell="BUY" levelOfDetail="EXECUTION"/>
+     <Trade tradeID="88999" symbol="ZZLVL" quantity="3" tradePrice="890"
+            dateTime="20260720;093927" buySell="BUY" levelOfDetail="ORDER"/>
+     <Trade tradeID="88500" symbol="ZZLVL" quantity="3" tradePrice="890"
+            dateTime="20260720;093927" buySell="BUY" levelOfDetail="CLOSED_LOT"/>
+    </Trades></FlexStatement></FlexStatements></FlexQueryResponse>"""
+
+    def test_roll_up_rows_do_not_multiply_the_position(self):
+        """Each level carries its own id, so dedup by id cannot catch this."""
+        executions = parse_statement(ET.fromstring(self.MULTI_LEVEL))
+        assert len(executions) == 1
+        assert sum(e.quantity for e in executions) == 3, "3 shares traded, not 9"
+        assert executions[0].transaction_id == "88001"
+
+    def test_layout_without_the_attribute_is_untouched(self):
+        """The TCF statements this account actually gets carry no level."""
+        assert len(parse_statement(ET.fromstring(TCF_XML))) == 2
+
+    def test_order_level_only_still_parses(self):
+        """Filtering must not empty a query configured for order detail."""
+        xml = """<FlexQueryResponse><Trades>
+          <Trade tradeID="1" symbol="AAA" quantity="5" tradePrice="10"
+                 dateTime="20260720;100000" buySell="BUY" levelOfDetail="ORDER"/>
+        </Trades></FlexQueryResponse>"""
+        assert len(parse_statement(ET.fromstring(xml))) == 1
+
+
 class TestUnrecognizedLayout:
     def test_unknown_trade_node_is_logged_loudly(self, caplog):
         """A layout we do not handle must not fail silently."""

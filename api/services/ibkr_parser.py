@@ -37,6 +37,10 @@ MARKET_TZ = ZoneInfo("America/New_York")
 # from this tuple yields no executions at all rather than an error.
 TRADE_NODES = ("Trade", "TradeConfirmation", "TradeConfirm")
 
+# The one level of detail that is an actual fill. ORDER and CLOSED_LOT rows
+# describe the same shares again from another angle.
+LEVEL_EXECUTION = "EXECUTION"
+
 # Attribute fallbacks, most specific first.
 _ID_KEYS = ("transactionID", "tradeID", "ibExecID", "execID")
 _SYMBOL_KEYS = ("symbol", "underlyingSymbol")
@@ -201,23 +205,60 @@ def parse_statement(root: ET.Element) -> list[ParsedExecution]:
     Duplicates within a single payload are dropped here so the batch insert
     cannot conflict with itself.
     """
+    nodes: list[ET.Element] = []
+    for node_name in TRADE_NODES:
+        nodes.extend(root.findall(f".//{node_name}"))
+
+    nodes = _single_detail_level(nodes)
+
     executions: list[ParsedExecution] = []
     seen: set[str] = set()
 
-    for node_name in TRADE_NODES:
-        for node in root.findall(f".//{node_name}"):
-            parsed = parse_execution_node(node)
-            if parsed is None:
-                continue
-            if parsed.transaction_id in seen:
-                continue
-            seen.add(parsed.transaction_id)
-            executions.append(parsed)
+    for node in nodes:
+        parsed = parse_execution_node(node)
+        if parsed is None:
+            continue
+        if parsed.transaction_id in seen:
+            continue
+        seen.add(parsed.transaction_id)
+        executions.append(parsed)
 
     if not executions:
         _warn_if_fills_were_missed(root)
 
     return executions
+
+
+def _single_detail_level(nodes: list[ET.Element]) -> list[ET.Element]:
+    """Keep one row per fill when IBKR reports several levels of detail.
+
+    A broadly-configured Flex query returns the same trade more than once --
+    as EXECUTION, again as ORDER, again as CLOSED_LOT -- each carrying its own
+    id. Deduplication by id cannot catch that, so every position would be
+    inflated by the number of levels enabled.
+
+    Execution level is the ground truth; the others are roll-ups of it. When no
+    row is marked EXECUTION the list is passed through untouched, so both a
+    statement with no levelOfDetail attribute at all (the TCF layout) and one
+    configured purely for order-level detail still parse.
+    """
+    execution_level = [
+        node
+        for node in nodes
+        if (node.get("levelOfDetail") or "").strip().upper() == LEVEL_EXECUTION
+    ]
+
+    if execution_level and len(execution_level) != len(nodes):
+        logger.info(
+            "IBKR statement reports %d fill rows across multiple levels of "
+            "detail; keeping the %d EXECUTION rows and discarding the "
+            "order/lot roll-ups that would otherwise double-count.",
+            len(nodes),
+            len(execution_level),
+        )
+        return execution_level
+
+    return nodes
 
 
 def _warn_if_fills_were_missed(root: ET.Element) -> None:
