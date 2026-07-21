@@ -117,6 +117,15 @@ apiClient.interceptors.response.use(
       const detail = (error.response?.data as { detail?: string } | undefined)?.detail;
       if (detail) {
         error.message = detail;
+      } else if (!error.response) {
+        // No response object at all means the browser never let us see one:
+        // the API is genuinely unreachable, OR it answered without CORS
+        // headers. Axios calls both "Network Error", which reads as "the
+        // server is down" and hides the second case entirely. Naming the
+        // target is what makes this debuggable -- a stale or missing
+        // NEXT_PUBLIC_API_URL is invisible otherwise.
+        const target = error.config?.baseURL ?? 'the API';
+        error.message = `Could not reach ${target}. The server may be down, or it responded with an error that carried no CORS headers.`;
       }
     }
     return Promise.reject(error);

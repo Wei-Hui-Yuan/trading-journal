@@ -10,8 +10,9 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     CHAR,
@@ -279,6 +280,44 @@ def _cors_origin_regex() -> Optional[str]:
     gets a 401 exactly like anyone else.
     """
     return os.environ.get("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+
+
+@app.middleware("http")
+async def unhandled_errors_keep_cors_headers(request: Request, call_next):
+    """Turn a crash into a JSON 500 that still carries CORS headers.
+
+    Starlette builds its own 500 response *outside* the CORS middleware, so an
+    unhandled exception reaches the browser stripped of
+    Access-Control-Allow-Origin. The browser then refuses to expose the
+    response at all, and the fetch fails as a bare "Network Error" -- which
+    reads as "the API is unreachable" when the API in fact answered and said
+    precisely what was wrong.
+
+    That misdirection cost a real debugging session: a rotated database
+    password surfaced in the UI as a network fault, sending the search to
+    hosting and CORS while the API was up the whole time. Catching here, inside
+    the CORS layer, means the status and the reason survive the trip out.
+
+    Registration order matters and is the reason this sits above the
+    add_middleware call below: Starlette treats the last-added middleware as
+    the outermost, so this must be added first to end up *inside* CORS.
+    """
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled error serving %s %s", request.method, request.url.path
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": (
+                    "The server hit an internal error. If this persists, check "
+                    "/health -- a database that has gone unreachable presents "
+                    "this way."
+                )
+            },
+        )
 
 
 app.add_middleware(
