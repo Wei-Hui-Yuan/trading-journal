@@ -207,13 +207,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Trading Journal API", lifespan=lifespan)
 
-# Local dev (localhost:3000) and the production Vercel deployment.
+def _cors_origins() -> list[str]:
+    """Exact origins allowed to call the API.
+
+    Local dev is always permitted; anything else comes from
+    CORS_ALLOW_ORIGINS as a comma-separated list.
+    """
+    configured = os.environ.get("CORS_ALLOW_ORIGINS", "")
+    extra = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return ["http://localhost:3000", *extra]
+
+
+def _cors_origin_regex() -> Optional[str]:
+    """Pattern for origins that change on every deploy.
+
+    Vercel mints a fresh hostname per deployment, so pinning one exact URL
+    breaks the moment anything is redeployed. CORS_ALLOW_ORIGIN_REGEX takes a
+    pattern (e.g. ``https://trading-journal-.*\\.vercel\\.app``) that survives
+    those rotations.
+
+    Widening this is a smaller concession than it looks: CORS governs which
+    *sites* a browser lets call the API, not who may read data. Every route
+    still demands a valid Clerk JWT, so a permitted origin without a token
+    gets a 401 exactly like anyone else.
+    """
+    return os.environ.get("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://trading-journal-seven-ivory.vercel.app",
-    ],
+    allow_origins=_cors_origins(),
+    allow_origin_regex=_cors_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

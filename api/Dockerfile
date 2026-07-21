@@ -25,9 +25,19 @@ COPY --from=builder /root/.local /root/.local
 COPY *.py ./
 COPY services/ ./services/
 
+# Worker count is deliberately low and set via WEB_CONCURRENCY (gunicorn reads
+# that natively) rather than a baked-in --workers flag, so it can be tuned from
+# the Northflank dashboard without a rebuild.
+#
+# These are *async* uvicorn workers: one process already serves many concurrent
+# requests, since the handlers are I/O-bound and yield while awaiting. Extra
+# processes buy little here and cost a full interpreter each -- FastAPI,
+# SQLAlchemy, asyncpg and cryptography are loaded per worker, which is enough
+# to starve a small container.
 ENV PYTHONUNBUFFERED=1 \
-    PATH=/root/.local/bin:$PATH
+    PATH=/root/.local/bin:$PATH \
+    WEB_CONCURRENCY=2
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--workers", "4", "--timeout", "120", "main:app"]
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "120", "main:app"]
