@@ -9,6 +9,7 @@ import {
   createStrategy,
   getDashboardAnalytics,
   getPendingPositions,
+  getPositionFills,
   getStrategies,
   updatePositionReview,
   updateStrategy,
@@ -20,6 +21,7 @@ import type {
   ManualTradePayload,
   ManualTradeResult,
   Position,
+  PositionFill,
   PositionReviewPayload,
   Strategy,
   StrategyCreatePayload,
@@ -31,6 +33,7 @@ import type {
  */
 export const queryKeys = {
   pendingPositions: ['positions', 'pending'] as const,
+  positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
   dashboardStats: ['dashboardStats'] as const,
   advancedMetrics: ['advancedMetrics'] as const,
@@ -41,6 +44,22 @@ export function usePendingPositions() {
   return useQuery<Position[]>({
     queryKey: queryKeys.pendingPositions,
     queryFn: getPendingPositions,
+  });
+}
+
+/**
+ * The executions behind one position, for the drill-down.
+ *
+ * `enabled` gates the request on the row actually being expanded, so opening
+ * the inbox does not fan out a fetch per position. Fills are immutable once
+ * matched, hence the long staleTime.
+ */
+export function usePositionFills(positionId: string, enabled: boolean) {
+  return useQuery<PositionFill[]>({
+    queryKey: queryKeys.positionFills(positionId),
+    queryFn: () => getPositionFills(positionId),
+    enabled,
+    staleTime: 5 * 60_000,
   });
 }
 

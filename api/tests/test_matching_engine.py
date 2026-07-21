@@ -69,7 +69,12 @@ class TestRoundTrips:
 
 
 class TestPartialFills:
-    def test_one_sell_closes_two_lots_fifo_order(self):
+    def test_scaling_in_then_out_is_one_position(self):
+        """Two entries and one exit is one idea, so one position.
+
+        Previously this emitted a position per FIFO pairing, which counted a
+        single trade twice in trade count and win rate.
+        """
         r = match_executions(
             [
                 ex("BUY", 50, 100, at(15, 9)),
@@ -77,19 +82,82 @@ class TestPartialFills:
                 ex("SELL", 100, 120, at(15, 11)),
             ]
         )
-        assert len(r.positions) == 2
-        # Oldest lot pairs first.
-        assert r.positions[0].entry_price == Decimal("100")
-        assert r.positions[1].entry_price == Decimal("110")
-        assert r.total_realized_pnl == Decimal("1500")
+        assert len(r.positions) == 1
+        p = r.positions[0]
+        assert p.quantity == 100
+        assert p.entry_price == Decimal("105")  # quantity-weighted
+        assert p.exit_price == Decimal("120")
+        assert p.realized_pnl == Decimal("1500")
         assert r.open_quantity == 0
 
-    def test_partial_close_leaves_remainder_open(self):
+    def test_aggregation_does_not_change_the_money(self):
+        """Weighted averages are for display; P&L still sums the legs."""
+        r = match_executions(
+            [
+                ex("BUY", 3, "10.3333", at(15, 9)),
+                ex("SELL", 1, "11.1111", at(15, 10)),
+                ex("SELL", 2, "12.2222", at(15, 10, 30)),
+            ]
+        )
+        expected = (Decimal("11.1111") - Decimal("10.3333")) * 1 + (
+            Decimal("12.2222") - Decimal("10.3333")
+        ) * 2
+        assert r.positions[0].realized_pnl == expected
+
+    def test_every_fill_is_retained_for_drill_down(self):
+        r = match_executions(
+            [
+                ex("BUY", 3, 890, at(15, 9)),
+                ex("SELL", 1, 885, at(15, 9, 10)),
+                ex("SELL", 2, 886, at(15, 9, 20)),
+            ]
+        )
+        fills = r.positions[0].fills
+        assert [f.role for f in fills] == ["OPEN", "CLOSE", "CLOSE"]
+        assert [f.quantity for f in fills] == [3, 1, 2]
+        # Individual exit prices survive aggregation.
+        assert {f.price for f in fills if f.role == "CLOSE"} == {
+            Decimal("885"),
+            Decimal("886"),
+        }
+
+    def test_partial_close_stays_open_and_defers_pnl(self):
+        """Scaling out is not finishing: the trade is still on.
+
+        Emitting a position here would put a half-finished idea in the review
+        queue, so it waits -- but the banked P&L is reported rather than lost.
+        """
         r = match_executions(
             [ex("BUY", 100, 100, at(15, 9)), ex("SELL", 30, 105, at(15, 10))]
         )
-        assert r.positions[0].quantity == 30
+        assert r.positions == []
         assert r.open_quantity == 70
+        assert r.open_round_trip_realized_pnl == Decimal("150")
+
+    def test_fifo_order_decides_which_lot_closes(self):
+        """A partial exit must consume the oldest lot, not the cheapest."""
+        r = match_executions(
+            [
+                ex("BUY", 50, 100, at(15, 9)),
+                ex("BUY", 50, 110, at(15, 9, 30)),
+                ex("SELL", 50, 120, at(15, 11)),
+            ]
+        )
+        # FIFO closes the 100 lot: (120-100)*50. LIFO would give 500.
+        assert r.open_round_trip_realized_pnl == Decimal("1000")
+
+    def test_reopening_after_flat_is_a_separate_position(self):
+        """Flat resets the trade; the next entry is a new idea."""
+        r = match_executions(
+            [
+                ex("BUY", 10, 100, at(15, 9)),
+                ex("SELL", 10, 105, at(15, 10)),
+                ex("BUY", 10, 106, at(15, 12)),
+                ex("SELL", 10, 108, at(15, 13)),
+            ]
+        )
+        assert len(r.positions) == 2
+        assert [p.realized_pnl for p in r.positions] == [Decimal("50"), Decimal("20")]
 
     def test_oversell_flips_to_short(self):
         r = match_executions(

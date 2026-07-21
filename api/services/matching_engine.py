@@ -20,7 +20,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
 
 from sqlalchemy import select
@@ -45,6 +45,13 @@ LONG = "LONG"
 SHORT = "SHORT"
 BUY = "BUY"
 SELL = "SELL"
+
+ROLE_OPEN = "OPEN"
+ROLE_CLOSE = "CLOSE"
+
+# Money columns are NUMERIC(_, 4). Weighted averages are quantized to match, so
+# what is stored is what was computed rather than whatever Postgres rounds to.
+PRICE_PRECISION = Decimal("0.0001")
 
 
 @dataclass(frozen=True)
@@ -72,13 +79,34 @@ class _OpenLot:
     remaining: int
 
 
-@dataclass
-class MatchedPosition:
-    """A completed round trip produced by pairing an opening and closing fill."""
+@dataclass(frozen=True)
+class PositionFill:
+    """One execution's contribution to a round trip.
 
-    ticker: str
-    direction: str  # LONG or SHORT
-    quantity: int  # shares actually matched in this pairing
+    A single fill can be split across two round trips -- an oversell closes the
+    long and opens a short with the same execution -- so `quantity` is the
+    portion attributed to *this* position, not the fill's full size.
+    """
+
+    trade_id: uuid.UUID
+    role: str  # OPEN or CLOSE
+    quantity: int
+    price: Decimal
+    executed_at: datetime
+
+
+@dataclass
+class _Leg:
+    """One FIFO pairing: part of an open lot closed by part of a later fill.
+
+    Legs are the unit of correct arithmetic. They are aggregated into a
+    MatchedPosition for presentation, but P&L is always summed from here --
+    never recomputed from the rounded weighted averages -- so display rounding
+    can never leak into the money.
+    """
+
+    direction: str
+    quantity: int
     open_trade_id: uuid.UUID
     close_trade_id: uuid.UUID
     entry_price: Decimal
@@ -86,11 +114,93 @@ class MatchedPosition:
     entry_date: datetime
     exit_date: datetime
     realized_pnl: Decimal
+
+
+@dataclass
+class MatchedPosition:
+    """One round trip: the whole span from flat to flat on a ticker.
+
+    Scaling in or out produces several fills but a single position here, which
+    is how a trader thinks about it and what keeps trade counts and win rate
+    honest -- one idea counted once. The individual executions stay available
+    in `fills` for drill-down and slippage work.
+    """
+
+    ticker: str
+    direction: str  # LONG or SHORT
+    quantity: int  # total shares round-tripped
+    # First entry and last exit. The pair identifies the round trip, which is
+    # what lets uq_positions_open_close keep re-runs idempotent.
+    open_trade_id: uuid.UUID
+    close_trade_id: uuid.UUID
+    entry_price: Decimal  # quantity-weighted
+    exit_price: Decimal  # quantity-weighted
+    entry_date: datetime  # first entry
+    exit_date: datetime  # final exit
+    realized_pnl: Decimal
     style: str
+    fills: list[PositionFill] = field(default_factory=list)
 
     @property
     def holding_period(self) -> timedelta:
         return self.exit_date - self.entry_date
+
+
+def _weighted_average(pairs: list[tuple[Decimal, int]]) -> Decimal:
+    """Quantity-weighted mean price, quantized to the money column's scale."""
+    total_qty = sum(qty for _, qty in pairs)
+    if total_qty == 0:
+        return Decimal("0")
+    total = sum(price * Decimal(qty) for price, qty in pairs)
+    return (total / Decimal(total_qty)).quantize(PRICE_PRECISION, rounding=ROUND_HALF_UP)
+
+
+def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
+    """Fold the legs of one flat-to-flat span into a single position."""
+    # Attribution per execution. A fill closing several lots appears once with
+    # its quantities summed, rather than once per lot it happened to touch.
+    opens: dict[uuid.UUID, PositionFill] = {}
+    closes: dict[uuid.UUID, PositionFill] = {}
+
+    for leg in legs:
+        for bucket, trade_id, role, price, at in (
+            (opens, leg.open_trade_id, "OPEN", leg.entry_price, leg.entry_date),
+            (closes, leg.close_trade_id, "CLOSE", leg.exit_price, leg.exit_date),
+        ):
+            existing = bucket.get(trade_id)
+            bucket[trade_id] = PositionFill(
+                trade_id=trade_id,
+                role=role,
+                quantity=leg.quantity + (existing.quantity if existing else 0),
+                price=price,
+                executed_at=at,
+            )
+
+    entry_date = min(leg.entry_date for leg in legs)
+    exit_date = max(leg.exit_date for leg in legs)
+
+    first_open = min(opens.values(), key=lambda f: (f.executed_at, str(f.trade_id)))
+    last_close = max(closes.values(), key=lambda f: (f.executed_at, str(f.trade_id)))
+
+    return MatchedPosition(
+        ticker=ticker,
+        direction=legs[0].direction,
+        quantity=sum(leg.quantity for leg in legs),
+        open_trade_id=first_open.trade_id,
+        close_trade_id=last_close.trade_id,
+        entry_price=_weighted_average([(l.entry_price, l.quantity) for l in legs]),
+        exit_price=_weighted_average([(l.exit_price, l.quantity) for l in legs]),
+        entry_date=entry_date,
+        exit_date=exit_date,
+        # Summed from the legs, deliberately: deriving this from the weighted
+        # averages above would fold their rounding into reported P&L.
+        realized_pnl=sum((leg.realized_pnl for leg in legs), Decimal("0")),
+        style=classify_style(entry_date, exit_date),
+        fills=sorted(
+            [*opens.values(), *closes.values()],
+            key=lambda f: (f.executed_at, f.role, str(f.trade_id)),
+        ),
+    )
 
 
 @dataclass
@@ -104,6 +214,11 @@ class MatchingResult:
     # Executions that could not be matched because they would close more
     # quantity than was ever opened (e.g. a sync gap or a pre-existing holding).
     unmatched_closing_quantity: int = 0
+    # P&L already banked by scaling out of a round trip that has not gone flat.
+    # No position is emitted for it -- the trade is still open, and emitting one
+    # would count a half-finished idea as a completed trade -- but the figure is
+    # surfaced here so it is visibly deferred rather than silently dropped.
+    open_round_trip_realized_pnl: Decimal = Decimal("0")
 
     @property
     def total_realized_pnl(self) -> Decimal:
@@ -162,6 +277,8 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
 
     result = MatchingResult(ticker=ordered[0].ticker)
     open_lots: deque[_OpenLot] = deque()
+    # Legs of the round trip currently in progress, flushed when it goes flat.
+    legs: list[_Leg] = []
 
     for execution in ordered:
         # Quantity from this fill still looking for a counterparty.
@@ -178,9 +295,8 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
             # The lot direction determines whether this was a long or a short.
             position_direction = LONG if lot.execution.direction == BUY else SHORT
 
-            result.positions.append(
-                MatchedPosition(
-                    ticker=execution.ticker,
+            legs.append(
+                _Leg(
                     direction=position_direction,
                     quantity=matched_qty,
                     open_trade_id=lot.execution.trade_id,
@@ -195,9 +311,6 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
                         execution.price,
                         matched_qty,
                     ),
-                    style=classify_style(
-                        lot.execution.executed_at, execution.executed_at
-                    ),
                 )
             )
 
@@ -208,12 +321,25 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
             if lot.remaining == 0:
                 open_lots.popleft()
 
+        # Going flat ends the round trip. Checked before the leftover opens a
+        # new lot, so an oversell that flips long->short closes the long here
+        # and starts the short cleanly rather than merging the two.
+        if legs and not open_lots:
+            result.positions.append(_aggregate_round_trip(execution.ticker, legs))
+            legs = []
+
         # Leftover quantity opens a new lot. If the queue already held lots on
         # this side, this simply adds to the position; if the queue was drained
         # by this execution, it flips the position to the other side.
         if unallocated > 0:
             open_lots.append(_OpenLot(execution=execution, remaining=unallocated))
 
+    # Legs left here belong to a round trip that never closed. They are not
+    # emitted: a position is only real once it is flat, and the residual shows
+    # up as open_lots instead.
+    result.open_round_trip_realized_pnl = sum(
+        (leg.realized_pnl for leg in legs), Decimal("0")
+    )
     result.open_lots = list(open_lots)
     return result
 
@@ -297,7 +423,8 @@ async def insert_positions(
     if not positions:
         return 0
 
-    from main import Position  # noqa: PLC0415 - deferred to avoid circular import
+    # Deferred to avoid a circular import with the FastAPI app.
+    from main import Position, PositionFill  # noqa: PLC0415
 
     rows = [
         {
@@ -320,6 +447,38 @@ async def insert_positions(
         for position in positions
     ]
 
-    stmt = pg_insert(Position).values(rows).on_conflict_do_nothing()
-    result = await session.execute(stmt)
-    return result.rowcount or 0
+    stmt = (
+        pg_insert(Position)
+        .values(rows)
+        .on_conflict_do_nothing()
+        .returning(Position.id, Position.open_trade_id, Position.close_trade_id)
+    )
+    inserted = (await session.execute(stmt)).fetchall()
+
+    # DO NOTHING returns nothing for rows that already existed, so this maps
+    # only the genuinely new positions. That is what we want: a position present
+    # from an earlier run already has its fills, and re-inserting them would be
+    # a no-op against uq_position_fills_position_trade_role anyway.
+    new_ids = {(row.open_trade_id, row.close_trade_id): row.id for row in inserted}
+
+    fill_rows = [
+        {
+            "id": uuid.uuid4(),
+            "position_id": position_id,
+            "trade_id": fill.trade_id,
+            "role": fill.role,
+            "quantity": fill.quantity,
+            "price": fill.price,
+            "executed_at": fill.executed_at,
+        }
+        for position in positions
+        if (position_id := new_ids.get((position.open_trade_id, position.close_trade_id)))
+        for fill in position.fills
+    ]
+
+    if fill_rows:
+        await session.execute(
+            pg_insert(PositionFill).values(fill_rows).on_conflict_do_nothing()
+        )
+
+    return len(inserted)

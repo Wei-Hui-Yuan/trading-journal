@@ -173,6 +173,36 @@ class Position(Base):
     mistakes = Column(ARRAY(Text), default=list)
 
 
+class PositionFill(Base):
+    """Which executions composed a round trip (migration 009).
+
+    A position aggregates flat-to-flat, so scaling in or out collapses several
+    fills into one row in `positions`. This preserves the individual executions
+    behind it for drill-down and slippage work.
+
+    `quantity` is the share count attributed to this position rather than the
+    fill's full size: one execution can span two round trips when an oversell
+    closes a long and opens a short.
+    """
+
+    __tablename__ = "position_fills"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    position_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("positions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    trade_id = Column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="CASCADE"), nullable=False
+    )
+    role = Column(String(5), nullable=False)  # OPEN | CLOSE
+    quantity = Column(Integer, nullable=False)
+    price = Column(Numeric(10, 4), nullable=False)
+    executed_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class IBKRExecution(Base):
     """Raw broker fills, staged before promotion into `trades`.
 
@@ -693,6 +723,25 @@ class PositionOut(BaseModel):
         from_attributes = True
 
 
+class PositionFillOut(BaseModel):
+    """One execution behind a round trip.
+
+    `quantity` is the share count attributed to this position, which is not
+    always the fill's full size: an oversell closes one position and opens the
+    next with a single execution.
+    """
+
+    id: uuid.UUID
+    trade_id: uuid.UUID
+    role: str  # OPEN | CLOSE
+    quantity: int
+    price: float
+    executed_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 @app.get(
     "/api/positions",
     response_model=list[PositionOut],
@@ -712,6 +761,34 @@ async def list_positions(
 
     result = await session.execute(stmt)
     return [PositionOut.model_validate(p) for p in result.scalars().all()]
+
+
+@app.get(
+    "/api/positions/{position_id}/fills",
+    response_model=list[PositionFillOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_position_fills(
+    position_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """The individual executions behind one round trip, oldest first.
+
+    A position aggregates flat-to-flat, so its entry and exit prices are
+    quantity-weighted. This is where the underlying scale-ins and scale-outs
+    are visible -- the detail that weighted averages hide.
+    """
+    exists = await session.get(Position, position_id)
+    if exists is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    stmt = (
+        select(PositionFill)
+        .where(PositionFill.position_id == position_id)
+        .order_by(PositionFill.executed_at, PositionFill.role)
+    )
+    result = await session.execute(stmt)
+    return [PositionFillOut.model_validate(f) for f in result.scalars().all()]
 
 
 # Both verbs hit the same handler: PUT is the documented route, PATCH is

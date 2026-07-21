@@ -7,6 +7,7 @@ import type {
   ManualTradePayload,
   ManualTradeResult,
   Position,
+  PositionFill,
   PositionReviewPayload,
   Strategy,
   StrategyCreatePayload,
@@ -133,6 +134,17 @@ export async function getPositions(reviewStatus?: string): Promise<Position[]> {
   const { data } = await apiClient.get<Position[]>('/positions', {
     params: reviewStatus ? { review_status: reviewStatus } : undefined,
   });
+  return data;
+}
+
+/**
+ * GET /api/positions/{id}/fills - the executions behind one round trip.
+ *
+ * Fetched on demand rather than embedded in the positions list: the inbox
+ * renders fine without it, and most positions are never expanded.
+ */
+export async function getPositionFills(id: string): Promise<PositionFill[]> {
+  const { data } = await apiClient.get<PositionFill[]>(`/positions/${id}/fills`);
   return data;
 }
 

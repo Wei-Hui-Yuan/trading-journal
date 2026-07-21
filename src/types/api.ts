@@ -88,6 +88,26 @@ export interface Position {
 }
 
 /**
+ * One execution behind a position (GET /api/positions/{id}/fills).
+ *
+ * A position aggregates flat-to-flat, so `entry_price` and `exit_price` above
+ * are quantity-weighted averages. These are the individual scale-ins and
+ * scale-outs those averages are computed from.
+ */
+export interface PositionFill {
+  id: string; // UUID
+  trade_id: string; // UUID of the underlying execution in `trades`
+  role: 'OPEN' | 'CLOSE';
+  /**
+   * Shares attributed to *this* position, which is not always the fill's full
+   * size: one execution can close a long and open a short.
+   */
+  quantity: number;
+  price: number;
+  executed_at: string; // ISO 8601, UTC
+}
+
+/**
  * Body for PATCH /api/positions/{id}/review.
  *
  * Every field is optional: the backend applies only keys present in the

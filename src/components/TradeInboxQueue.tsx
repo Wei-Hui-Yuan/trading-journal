@@ -6,6 +6,7 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   CheckCircle2,
+  ChevronRight,
   Inbox,
   Loader2,
 } from 'lucide-react';
@@ -15,6 +16,7 @@ import {
   useReviewPosition,
   useStrategies,
 } from '@/hooks/useTradeInbox';
+import { PositionFills } from '@/components/PositionFills';
 import type { Position, PositionReviewPayload } from '@/types/api';
 
 const GRADES = ['A', 'B', 'C', 'D', 'F'] as const;
@@ -63,6 +65,8 @@ export function TradeInboxQueue() {
   const [drafts, setDrafts] = useState<Record<string, ReviewDraft>>({});
   // Which card the last mutation error belongs to.
   const [errorFor, setErrorFor] = useState<string | null>(null);
+  // Only one execution drill-down open at a time, so the queue stays scannable.
+  const [expandedFills, setExpandedFills] = useState<string | null>(null);
 
   const draftFor = (id: string): ReviewDraft => drafts[id] ?? emptyDraft;
 
@@ -205,6 +209,25 @@ export function TradeInboxQueue() {
                     {position.quantity} @ {position.entry_price} →{' '}
                     {position.exit_price} · {formatDateTime(position.entry_time)}
                   </p>
+                  {/* Entry/exit above are quantity-weighted, so the underlying
+                      scale-ins and scale-outs need a way to be seen. */}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpandedFills((current) =>
+                        current === position.id ? null : position.id
+                      )
+                    }
+                    className="mt-1 inline-flex items-center space-x-1 text-[10px] uppercase tracking-wider text-obsidian-muted hover:text-slate-300 transition-colors"
+                    aria-expanded={expandedFills === position.id}
+                  >
+                    <ChevronRight
+                      className={`h-3 w-3 transition-transform ${
+                        expandedFills === position.id ? 'rotate-90' : ''
+                      }`}
+                    />
+                    <span>Executions</span>
+                  </button>
                 </div>
               </div>
 
@@ -216,6 +239,11 @@ export function TradeInboxQueue() {
                 {currency(position.realized_pnl)}
               </span>
             </div>
+
+            <PositionFills
+              positionId={position.id}
+              open={expandedFills === position.id}
+            />
 
             {/* Review checklist */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
