@@ -19,7 +19,10 @@ WORKDIR /app
 
 COPY --from=builder /root/.local /root/.local
 
-COPY main.py .
+# Every top-level module, not a hand-listed subset: naming files individually
+# meant a new one (auth.py) silently vanished from the image and the container
+# died on import. The *.py glob still cannot pull in .env, so secrets stay out.
+COPY *.py ./
 COPY services/ ./services/
 
 ENV PYTHONUNBUFFERED=1 \
