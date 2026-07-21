@@ -1,14 +1,19 @@
 """Parse and normalize IBKR Flex statement XML into execution records.
 
-Flex queries emit fills under one of two node types depending on how the saved
+Flex queries emit fills under different node types depending on how the saved
 query was configured:
 
   * `<Trade>`             -- from a "Trades" query
   * `<TradeConfirmation>` -- from a "Trade Confirmation" query
+  * `<TradeConfirm>`      -- from a type="TCF" query, nested in <TradeConfirms>
 
-Both are handled. Attribute names differ slightly between them (tradePrice vs
-price, ibCommission vs commission), so each field is read through a fallback
-list rather than a single key.
+All are handled. Missing one is silent and expensive: an unmatched node type
+parses to zero fills, so the sync reports success while ingesting nothing.
+
+Attribute names differ between the layouts (tradePrice vs price, ibCommission
+vs commission, transactionID vs tradeID), so each field is read through a
+fallback list rather than a single key. Commission is absent entirely from
+some TCF layouts and stays null.
 """
 
 from __future__ import annotations
@@ -28,8 +33,9 @@ logger = logging.getLogger(__name__)
 # analytics session grid.
 MARKET_TZ = ZoneInfo("America/New_York")
 
-# Node types that represent a fill.
-TRADE_NODES = ("Trade", "TradeConfirmation")
+# Node types that represent a fill. Tag matching is exact, so a layout absent
+# from this tuple yields no executions at all rather than an error.
+TRADE_NODES = ("Trade", "TradeConfirmation", "TradeConfirm")
 
 # Attribute fallbacks, most specific first.
 _ID_KEYS = ("transactionID", "tradeID", "ibExecID", "execID")
@@ -208,7 +214,37 @@ def parse_statement(root: ET.Element) -> list[ParsedExecution]:
             seen.add(parsed.transaction_id)
             executions.append(parsed)
 
+    if not executions:
+        _warn_if_fills_were_missed(root)
+
     return executions
+
+
+def _warn_if_fills_were_missed(root: ET.Element) -> None:
+    """Flag fill-shaped nodes that no known layout matched.
+
+    An empty result is ambiguous: it means either "no trades in this period" or
+    "IBKR used a node name we do not recognize". Those look identical to the
+    caller, and the second silently reports a successful sync that ingested
+    nothing. Naming the unmatched tags turns that into something greppable.
+    """
+    containers = {f"{name}s" for name in TRADE_NODES}
+    unmatched = {
+        el.tag
+        for el in root.iter()
+        if "trade" in el.tag.lower()
+        and el.tag not in TRADE_NODES
+        and el.tag not in containers
+        and el.attrib  # containers carry no attributes; fills do
+    }
+    if unmatched:
+        logger.warning(
+            "IBKR statement contained no recognized fills, but has trade-like "
+            "nodes this parser does not handle: %s. Known layouts: %s. "
+            "The sync will report success having ingested nothing.",
+            ", ".join(sorted(unmatched)),
+            ", ".join(TRADE_NODES),
+        )
 
 
 def to_staging_row(execution: ParsedExecution) -> dict[str, Any]:

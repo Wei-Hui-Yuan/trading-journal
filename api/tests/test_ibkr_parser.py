@@ -27,6 +27,22 @@ CONFIRMS_XML = """<FlexQueryResponse><FlexStatements><FlexStatement><TradeConfir
                     commission="-0.9000" buySell="SELL" dateTime="20250311;155900"/>
 </TradeConfirms></FlexStatement></FlexStatements></FlexQueryResponse>"""
 
+# A type="TCF" query emits <TradeConfirm> -- singular, and distinct from
+# <TradeConfirmation>. Missing this tag parsed a real statement to zero fills
+# and reported the sync as successful. No commission attribute at all here,
+# which is how IBKR renders this layout unless the query asks for it.
+TCF_XML = """<FlexQueryResponse queryName="Dashboard_Trades_Sync" type="TCF">
+<FlexStatements count="1"><FlexStatement accountId="U***11111" period="Today">
+<TradeConfirms>
+ <TradeConfirm dateTime="20260720;093927" execID="000a.000b.01.01" tradeID="900001"
+               price="100" quantity="3" currency="USD" symbol="ZZTEST"
+               transactionType="ExchTrade" tradeDate="20260720" buySell="BUY"/>
+ <TradeConfirm dateTime="20260720;094925" execID="000c.000d.01.01" tradeID="900002"
+               price="95.5" quantity="-2" currency="USD" symbol="ZZTEST"
+               transactionType="ExchTrade" tradeDate="20260720" buySell="SELL"/>
+</TradeConfirms>
+</FlexStatement></FlexStatements></FlexQueryResponse>"""
+
 
 class TestDateTimeParsing:
     def test_semicolon_format_localized_to_market_tz(self):
@@ -91,6 +107,58 @@ class TestTradeConfirmationNodes:
         assert executions[0].quantity == 25  # BUY stays positive
         assert executions[1].quantity == -10  # SELL forced negative
         assert executions[1].side == "SELL"
+
+
+class TestTradeConfirmNodes:
+    """type="TCF" layout -- <TradeConfirm>, not <TradeConfirmation>."""
+
+    @pytest.fixture
+    def executions(self):
+        return parse_statement(ET.fromstring(TCF_XML))
+
+    def test_fills_are_found(self, executions):
+        """The regression: this parsed to 0 and the sync claimed success."""
+        assert len(executions) == 2
+
+    def test_falls_back_to_tradeid_for_identity(self, executions):
+        assert sorted(e.transaction_id for e in executions) == ["900001", "900002"]
+
+    def test_sign_and_side(self, executions):
+        buy, sell = executions[0], executions[1]
+        assert (buy.quantity, buy.side) == (3, "BUY")
+        assert (sell.quantity, sell.side) == (-2, "SELL")
+
+    def test_absent_commission_is_null_not_zero(self, executions):
+        """None means unknown; 0 would assert the trade was free."""
+        assert executions[0].commission is None
+
+    def test_price_and_time(self, executions):
+        assert executions[0].price == Decimal("100")
+        assert str(executions[0].execution_time) == "2026-07-20 09:39:27-04:00"
+
+    def test_container_node_is_not_mistaken_for_a_fill(self, executions):
+        """<TradeConfirms> wraps <TradeConfirm>; only the children are fills."""
+        assert len(executions) == 2
+
+
+class TestUnrecognizedLayout:
+    def test_unknown_trade_node_is_logged_loudly(self, caplog):
+        """A layout we do not handle must not fail silently."""
+        xml = """<FlexQueryResponse><TradeSomethingElse tradeID="X1" symbol="AAA"
+                 quantity="5" price="10" dateTime="20260720;100000"/>
+              </FlexQueryResponse>"""
+        with caplog.at_level(logging.WARNING, logger="services.ibkr_parser"):
+            assert parse_statement(ET.fromstring(xml)) == []
+        assert "TradeSomethingElse" in caplog.text
+        assert "ingested nothing" in caplog.text
+
+    def test_genuinely_empty_statement_stays_quiet(self, caplog):
+        """No trades in the period is normal; do not cry wolf."""
+        xml = """<FlexQueryResponse><FlexStatements><FlexStatement>
+                 <TradeConfirms/></FlexStatement></FlexStatements></FlexQueryResponse>"""
+        with caplog.at_level(logging.WARNING, logger="services.ibkr_parser"):
+            assert parse_statement(ET.fromstring(xml)) == []
+        assert "ingested nothing" not in caplog.text
 
 
 class TestFractionalShares:
