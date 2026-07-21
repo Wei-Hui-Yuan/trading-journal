@@ -19,6 +19,7 @@ some TCF layouts and stays null.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -48,6 +49,17 @@ _QUANTITY_KEYS = ("quantity", "shares")
 _PRICE_KEYS = ("tradePrice", "price")
 _COMMISSION_KEYS = ("ibCommission", "commission")
 _DATETIME_KEYS = ("dateTime", "tradeDate", "reportDate")
+_ASSET_CLASS_KEYS = ("assetCategory", "assetClass")
+
+# IBKR asset categories that are not tradeable positions in this journal.
+# CASH is a currency conversion; the rest of an equity account's categories
+# (STK, ETF, OPT, FUT) are deliberately left to pass through, so starting to
+# trade options does not silently drop every fill.
+SKIP_ASSET_CATEGORIES = frozenset({"CASH"})
+
+# Currency pairs are rendered `USD.SGD`. Used only when assetCategory is
+# missing, since no equity ticker takes this shape.
+_CURRENCY_PAIR = re.compile(r"^[A-Z]{3}\.[A-Z]{3}$")
 
 
 @dataclass(frozen=True)
@@ -58,22 +70,47 @@ class ParsedExecution:
     symbol: str
     # Signed: positive = bought, negative = sold. The sign is what carries the
     # side through the staging table, which has no explicit side column.
-    quantity: int
+    # Decimal, not int: fractional fills are the norm on this account, and
+    # rounding them either destroyed the fill or resized it (migration 010).
+    quantity: Decimal
     price: Optional[Decimal]
     commission: Optional[Decimal]
     execution_time: Optional[datetime]
-    # True when IBKR reported a fractional size that had to be rounded to fit
-    # the INTEGER ledger column. Surfaced so callers can report it, not just
-    # bury it in a log line.
-    quantity_was_rounded: bool = False
 
     @property
     def side(self) -> str:
         return "BUY" if self.quantity >= 0 else "SELL"
 
     @property
-    def abs_quantity(self) -> int:
+    def abs_quantity(self) -> Decimal:
         return abs(self.quantity)
+
+
+def _is_non_tradeable(attrs: dict[str, str], symbol: str) -> bool:
+    """Reject rows that are not positions in an instrument.
+
+    A statement covering a multi-currency account is mostly funding: buying
+    USD with SGD to settle a purchase appears as a `USD.SGD` "trade" with a
+    zero price. Left in, each conversion becomes a position in the journal --
+    on this account they outnumbered the real fills, 54 rows to 55.
+
+    Two checks, because the two query layouts carry different evidence.
+    `assetCategory` is authoritative but only present when the Flex query
+    includes Asset Class; the symbol shape is the fallback for when it does
+    not. Currency pairs are `AAA.BBB`, which no equity ticker resembles.
+    """
+    category = (_first(attrs, _ASSET_CLASS_KEYS) or "").strip().upper()
+    if category and category in SKIP_ASSET_CATEGORIES:
+        logger.debug("Skipping %s: asset category %s", symbol, category)
+        return True
+
+    # Only trusted when the authoritative field is absent -- an instrument
+    # genuinely named like a pair should not be dropped on a hunch.
+    if not category and _CURRENCY_PAIR.match(symbol.strip().upper()):
+        logger.debug("Skipping %s: looks like a currency conversion", symbol)
+        return True
+
+    return False
 
 
 def _first(attrs: dict[str, str], keys: tuple[str, ...]) -> Optional[str]:
@@ -127,34 +164,20 @@ def _to_decimal(raw: Optional[str]) -> Optional[Decimal]:
         return None
 
 
-def _to_signed_int_quantity(
-    raw: Optional[str], transaction_id: str
-) -> tuple[Optional[int], bool]:
-    """Coerce a reported quantity to a signed whole number of shares.
+def _to_signed_quantity(raw: Optional[str], transaction_id: str) -> Optional[Decimal]:
+    """Parse a reported quantity, preserving fractional size exactly.
 
-    `trades.quantity` is an INTEGER column, so a fractional fill cannot be
-    stored faithfully. Rather than dropping the execution (which would silently
-    lose a real trade), it is rounded and the discrepancy logged loudly.
+    Kept as Decimal rather than coerced to int: fractional fills are ordinary
+    here, and rounding them to whole shares silently destroyed sub-half-share
+    positions and inflated the rest (see migration 010).
     """
     if raw in (None, ""):
-        return None, False
+        return None
     try:
-        value = Decimal(str(raw))
+        return Decimal(str(raw))
     except (InvalidOperation, ValueError):
         logger.warning("Unparseable quantity %r on execution %s", raw, transaction_id)
-        return None, False
-
-    rounded = int(value.to_integral_value(rounding="ROUND_HALF_UP"))
-    was_rounded = value != rounded
-    if was_rounded:
-        logger.warning(
-            "Fractional share quantity %s on IBKR execution %s rounded to %d "
-            "(trades.quantity is an INTEGER column)",
-            value,
-            transaction_id,
-            rounded,
-        )
-    return rounded, was_rounded
+        return None
 
 
 def parse_execution_node(node: ET.Element) -> Optional[ParsedExecution]:
@@ -171,9 +194,10 @@ def parse_execution_node(node: ET.Element) -> Optional[ParsedExecution]:
         logger.warning("Skipping IBKR execution with no id/symbol: %s", attrs)
         return None
 
-    quantity, was_rounded = _to_signed_int_quantity(
-        _first(attrs, _QUANTITY_KEYS), transaction_id
-    )
+    if _is_non_tradeable(attrs, symbol):
+        return None
+
+    quantity = _to_signed_quantity(_first(attrs, _QUANTITY_KEYS), transaction_id)
     if quantity is None or quantity == 0:
         logger.warning(
             "Skipping IBKR execution %s: quantity missing or zero", transaction_id
@@ -195,7 +219,6 @@ def parse_execution_node(node: ET.Element) -> Optional[ParsedExecution]:
         price=_to_decimal(_first(attrs, _PRICE_KEYS)),
         commission=_to_decimal(_first(attrs, _COMMISSION_KEYS)),
         execution_time=parse_execution_datetime(_first(attrs, _DATETIME_KEYS)),
-        quantity_was_rounded=was_rounded,
     )
 
 
@@ -227,6 +250,21 @@ def parse_statement(root: ET.Element) -> list[ParsedExecution]:
         _warn_if_fills_were_missed(root)
 
     return executions
+
+
+def count_non_tradeable(root: ET.Element) -> int:
+    """How many rows were dropped for not being positions in an instrument.
+
+    Reported by the ingest endpoint so a statement that is mostly funding
+    activity says so, rather than looking like a sync that quietly lost rows.
+    """
+    return sum(
+        1
+        for node_name in TRADE_NODES
+        for node in root.findall(f".//{node_name}")
+        if (symbol := _first(dict(node.attrib), _SYMBOL_KEYS))
+        and _is_non_tradeable(dict(node.attrib), symbol)
+    )
 
 
 def _single_detail_level(nodes: list[ET.Element]) -> list[ET.Element]:

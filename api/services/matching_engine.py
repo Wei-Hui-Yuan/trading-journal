@@ -61,7 +61,8 @@ class Execution:
     trade_id: uuid.UUID
     ticker: str
     direction: str  # BUY or SELL
-    quantity: int
+    # Decimal, not int: fractional fills are ordinary (migration 010).
+    quantity: Decimal
     price: Decimal
     executed_at: datetime
 
@@ -76,7 +77,7 @@ class _OpenLot:
     """
 
     execution: Execution
-    remaining: int
+    remaining: Decimal
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ class PositionFill:
 
     trade_id: uuid.UUID
     role: str  # OPEN or CLOSE
-    quantity: int
+    quantity: Decimal
     price: Decimal
     executed_at: datetime
 
@@ -106,7 +107,7 @@ class _Leg:
     """
 
     direction: str
-    quantity: int
+    quantity: Decimal
     open_trade_id: uuid.UUID
     close_trade_id: uuid.UUID
     entry_price: Decimal
@@ -128,7 +129,7 @@ class MatchedPosition:
 
     ticker: str
     direction: str  # LONG or SHORT
-    quantity: int  # total shares round-tripped
+    quantity: Decimal  # total shares round-tripped
     # First entry and last exit. The pair identifies the round trip, which is
     # what lets uq_positions_open_close keep re-runs idempotent.
     open_trade_id: uuid.UUID
@@ -146,12 +147,12 @@ class MatchedPosition:
         return self.exit_date - self.entry_date
 
 
-def _weighted_average(pairs: list[tuple[Decimal, int]]) -> Decimal:
+def _weighted_average(pairs: list[tuple[Decimal, Decimal]]) -> Decimal:
     """Quantity-weighted mean price, quantized to the money column's scale."""
-    total_qty = sum(qty for _, qty in pairs)
+    total_qty = sum((qty for _, qty in pairs), Decimal("0"))
     if total_qty == 0:
         return Decimal("0")
-    total = sum(price * Decimal(qty) for price, qty in pairs)
+    total = sum((price * qty for price, qty in pairs), Decimal("0"))
     return (total / Decimal(total_qty)).quantize(PRICE_PRECISION, rounding=ROUND_HALF_UP)
 
 
@@ -171,7 +172,7 @@ def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
             bucket[trade_id] = PositionFill(
                 trade_id=trade_id,
                 role=role,
-                quantity=leg.quantity + (existing.quantity if existing else 0),
+                quantity=leg.quantity + (existing.quantity if existing else Decimal("0")),
                 price=price,
                 executed_at=at,
             )
@@ -185,7 +186,7 @@ def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
     return MatchedPosition(
         ticker=ticker,
         direction=legs[0].direction,
-        quantity=sum(leg.quantity for leg in legs),
+        quantity=sum((leg.quantity for leg in legs), Decimal("0")),
         open_trade_id=first_open.trade_id,
         close_trade_id=last_close.trade_id,
         entry_price=_weighted_average([(l.entry_price, l.quantity) for l in legs]),
@@ -225,8 +226,8 @@ class MatchingResult:
         return sum((p.realized_pnl for p in self.positions), Decimal("0"))
 
     @property
-    def open_quantity(self) -> int:
-        return sum(lot.remaining for lot in self.open_lots)
+    def open_quantity(self) -> Decimal:
+        return sum((lot.remaining for lot in self.open_lots), Decimal("0"))
 
 
 def classify_style(entry_date: datetime, exit_date: datetime) -> str:
@@ -249,7 +250,7 @@ def classify_style(entry_date: datetime, exit_date: datetime) -> str:
 
 
 def _realized_pnl(
-    direction: str, entry_price: Decimal, exit_price: Decimal, quantity: int
+    direction: str, entry_price: Decimal, exit_price: Decimal, quantity: Decimal
 ) -> Decimal:
     """P&L for `quantity` shares of a closed position.
 
@@ -259,7 +260,7 @@ def _realized_pnl(
         move = exit_price - entry_price
     else:
         move = entry_price - exit_price
-    return move * Decimal(quantity)
+    return move * quantity
 
 
 def match_executions(executions: Iterable[Execution]) -> MatchingResult:
@@ -369,7 +370,7 @@ async def load_executions_for_ticker(
             trade_id=row.id,
             ticker=row.ticker,
             direction=(row.direction or "").upper(),
-            quantity=int(row.quantity),
+            quantity=Decimal(str(row.quantity)),
             # Numeric(10, 4) comes back as Decimal; keep it exact for money math.
             price=Decimal(str(row.actual_entry)),
             executed_at=row.entry_date,
@@ -431,7 +432,7 @@ async def insert_positions(
             "id": uuid.uuid4(),
             "symbol": position.ticker,
             "style": position.style,
-            "quantity": Decimal(position.quantity),
+            "quantity": position.quantity,
             "entry_price": position.entry_price,
             "exit_price": position.exit_price,
             "entry_time": position.entry_date,

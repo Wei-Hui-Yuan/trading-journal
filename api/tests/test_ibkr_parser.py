@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from services.ibkr_parser import (
+    count_non_tradeable,
     parse_execution_datetime,
     parse_statement,
     to_staging_row,
@@ -194,22 +195,93 @@ class TestUnrecognizedLayout:
 
 
 class TestFractionalShares:
-    def test_rounded_and_flagged(self, caplog):
-        xml = """<FlexQueryResponse><Trade transactionID="F1" symbol="VOO"
-          quantity="2.6" tradePrice="500.00" dateTime="20250311;120000"/>
+    """Fractional fills are the norm on this account, not an edge case."""
+
+    def _one(self, quantity):
+        xml = f"""<FlexQueryResponse><Trade transactionID="F1" symbol="VOO"
+          quantity="{quantity}" tradePrice="500.00" dateTime="20250311;120000"/>
         </FlexQueryResponse>"""
-        with caplog.at_level(logging.WARNING, logger="services.ibkr_parser"):
-            executions = parse_statement(ET.fromstring(xml))
+        return parse_statement(ET.fromstring(xml))
 
-        assert len(executions) == 1, "a fractional fill is a real trade, not a skip"
-        assert executions[0].quantity == 3
-        assert executions[0].quantity_was_rounded is True
-        assert "Fractional share" in caplog.text
-        assert "F1" in caplog.text
+    @pytest.mark.parametrize(
+        "raw", ["2.6", "0.5", "0.25", "0.1", "0.13", "0.27", "0.00927925"]
+    )
+    def test_size_is_preserved_exactly(self, raw):
+        executions = self._one(raw)
+        assert len(executions) == 1
+        assert executions[0].quantity == Decimal(raw)
 
-    def test_whole_shares_not_flagged(self):
-        executions = parse_statement(ET.fromstring(TRADES_XML))
-        assert executions[0].quantity_was_rounded is False
+    def test_sub_half_share_is_not_discarded(self):
+        """Rounding half-up turned these into zero, and zero was skipped.
+
+        A 0.1 MELI fill is a real four-figure position; it used to vanish with
+        only a log line to show for it.
+        """
+        assert len(self._one("0.1")) == 1
+
+    def test_no_silent_resizing(self):
+        """0.65 was stored as 1 -- a 54% overstatement of the position."""
+        assert self._one("0.65")[0].quantity == Decimal("0.65")
+
+    def test_sign_survives_on_fractional_sells(self):
+        xml = """<FlexQueryResponse><Trade transactionID="F2" symbol="ZZFRC"
+          quantity="-0.8" tradePrice="20.00" dateTime="20260702;093501"
+          buySell="SELL"/></FlexQueryResponse>"""
+        execution = parse_statement(ET.fromstring(xml))[0]
+        assert execution.quantity == Decimal("-0.8")
+        assert execution.side == "SELL"
+        assert execution.abs_quantity == Decimal("0.8")
+
+    def test_whole_shares_unaffected(self):
+        assert parse_statement(ET.fromstring(TRADES_XML))[0].quantity == Decimal("100")
+
+
+class TestNonTradeableRows:
+    """Funding activity is not a trade."""
+
+    FOREX = """<FlexQueryResponse><Trades>
+     <Trade tradeID="C1" symbol="USD.SGD" quantity="100" closePrice="0"
+            currency="SGD" dateTime="20250729;103915" buySell="BUY"/>
+     <Trade tradeID="E1" symbol="ZZEQ" quantity="0.5" tradePrice="100.00"
+            currency="USD" dateTime="20250923;115854" buySell="BUY"/>
+    </Trades></FlexQueryResponse>"""
+
+    def test_currency_pair_is_skipped_without_asset_class(self):
+        executions = parse_statement(ET.fromstring(self.FOREX))
+        assert [e.symbol for e in executions] == ["ZZEQ"]
+
+    def test_asset_category_is_authoritative_when_present(self):
+        xml = """<FlexQueryResponse><Trades>
+         <Trade tradeID="C2" symbol="ZZCASH" assetCategory="CASH" quantity="10"
+                tradePrice="1.35" dateTime="20250729;103915" buySell="BUY"/>
+        </Trades></FlexQueryResponse>"""
+        assert parse_statement(ET.fromstring(xml)) == []
+
+    def test_equities_pass_through_on_asset_class(self):
+        xml = """<FlexQueryResponse><Trades>
+         <Trade tradeID="S1" symbol="ZZEQ" assetCategory="STK" quantity="0.5"
+                tradePrice="100.00" dateTime="20250923;115854" buySell="BUY"/>
+        </Trades></FlexQueryResponse>"""
+        assert len(parse_statement(ET.fromstring(xml))) == 1
+
+    def test_other_categories_are_not_dropped(self):
+        """Only CASH is excluded; trading options later must not silently fail."""
+        xml = """<FlexQueryResponse><Trades>
+         <Trade tradeID="O1" symbol="ZZOPT" assetCategory="OPT" quantity="1"
+                tradePrice="3.50" dateTime="20250923;115854" buySell="BUY"/>
+        </Trades></FlexQueryResponse>"""
+        assert len(parse_statement(ET.fromstring(xml))) == 1
+
+    def test_ticker_shaped_like_a_pair_survives_when_class_says_stock(self):
+        """The symbol heuristic must defer to the authoritative field."""
+        xml = """<FlexQueryResponse><Trades>
+         <Trade tradeID="W1" symbol="ABC.DEF" assetCategory="STK" quantity="1"
+                tradePrice="10" dateTime="20250923;115854" buySell="BUY"/>
+        </Trades></FlexQueryResponse>"""
+        assert len(parse_statement(ET.fromstring(xml))) == 1
+
+    def test_skipped_rows_are_counted_for_reporting(self):
+        assert count_non_tradeable(ET.fromstring(self.FOREX)) == 1
 
 
 class TestResilience:

@@ -2,6 +2,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -108,7 +109,9 @@ class Trade(Base):
     exit_date = Column(DateTime(timezone=True), nullable=True)
     actual_entry = Column(Numeric(10, 4), nullable=False)
     exit_price = Column(Numeric(10, 4), nullable=True)
-    quantity = Column(Integer, nullable=False)
+    # NUMERIC not INTEGER: fractional fills are ordinary on this account, and
+    # rounding them destroyed sub-half-share positions outright (migration 010).
+    quantity = Column(Numeric(18, 8), nullable=False)
     planned_entry = Column(Numeric(10, 4), nullable=True)
     stop_loss = Column(Numeric(10, 4), nullable=True)
     target = Column(Numeric(10, 4), nullable=True)
@@ -139,7 +142,7 @@ class Position(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     symbol = Column(String(20), nullable=False)
     style = Column(String(50), nullable=False)
-    quantity = Column(Numeric(12, 4), nullable=False)
+    quantity = Column(Numeric(18, 8), nullable=False)
     entry_price = Column(Numeric(10, 4), nullable=False)
     exit_price = Column(Numeric(10, 4), nullable=False)
     entry_time = Column(DateTime(timezone=True), nullable=False)
@@ -197,7 +200,7 @@ class PositionFill(Base):
         UUID(as_uuid=True), ForeignKey("trades.id", ondelete="CASCADE"), nullable=False
     )
     role = Column(String(5), nullable=False)  # OPEN | CLOSE
-    quantity = Column(Integer, nullable=False)
+    quantity = Column(Numeric(18, 8), nullable=False)
     price = Column(Numeric(10, 4), nullable=False)
     executed_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -216,7 +219,7 @@ class IBKRExecution(Base):
     transaction_id = Column(Text, nullable=False, unique=True)
     symbol = Column(Text, nullable=False)
     # Signed as IBKR reports it: positive bought, negative sold.
-    quantity = Column(Integer, nullable=False)
+    quantity = Column(Numeric(18, 8), nullable=False)
     price = Column(Numeric(14, 6), nullable=True)
     commission = Column(Numeric(14, 6), nullable=True)
     execution_time = Column(DateTime(timezone=True), nullable=True)
@@ -289,7 +292,10 @@ class IngestResult(BaseModel):
     trades_duplicates: int
     positions_matched: int
     symbols_touched: list[str]
-    fractional_quantities: int
+    # Rows the statement carried that were not tradeable positions -- chiefly
+    # currency conversions in a multi-currency account, which outnumbered the
+    # real fills and would otherwise each become a position.
+    skipped_non_tradeable: int
 
 
 @app.post(
@@ -323,6 +329,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         raise HTTPException(status_code=503 if exc.retryable else 502, detail=str(exc))
 
     executions = ibkr_parser.parse_statement(root)
+    skipped_non_tradeable = ibkr_parser.count_non_tradeable(root)
     if not executions:
         return IngestResult(
             executions_parsed=0,
@@ -332,7 +339,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             trades_duplicates=0,
             positions_matched=0,
             symbols_touched=[],
-            fractional_quantities=0,
+            skipped_non_tradeable=0,
         )
 
     # --- 3: stage, skipping anything already seen -------------------------
@@ -404,11 +411,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         trades_duplicates=len(trade_rows) - len(created_ids),
         positions_matched=positions_matched,
         symbols_touched=symbols,
-        # Fills IBKR reported fractionally that had to be rounded to satisfy
-        # the INTEGER ledger column; each one is also logged as a warning.
-        fractional_quantities=sum(
-            1 for e in new_executions if e.quantity_was_rounded
-        ),
+        skipped_non_tradeable=skipped_non_tradeable,
     )
 
 
@@ -454,24 +457,13 @@ class ManualTradeCreate(BaseModel):
             raise ValueError("side must be 'BUY' or 'SELL'")
         return side
 
-    @field_validator("quantity")
-    @classmethod
-    def _whole_shares(cls, value: float) -> float:
-        # trades.quantity is an INTEGER column. Reject fractional input rather
-        # than silently truncating 0.5 shares to 0.
-        if value != int(value):
-            raise ValueError(
-                "quantity must be a whole number of shares "
-                "(the trades table stores an integer quantity)"
-            )
-        return value
 
 
 class ManualTradeResult(BaseModel):
     trade_id: uuid.UUID
     ticker: str
     direction: str
-    quantity: int
+    quantity: float
     price: float
     execution_time: datetime
     planned_entry: Optional[float]
@@ -480,7 +472,7 @@ class ManualTradeResult(BaseModel):
     exit_price: Optional[float]
     # Round trips the FIFO engine closed as a result of this execution.
     positions_created: int
-    open_quantity: int
+    open_quantity: float
 
 
 @app.post(
@@ -518,7 +510,7 @@ async def create_manual_trade(
         entry_date=executed_at,
         # The form's price field is explicitly the fill actually received.
         actual_entry=params.price,
-        quantity=int(params.quantity),
+        quantity=Decimal(str(params.quantity)),
         # Planning fields map onto the ledger's existing columns; stop_loss and
         # target are the canonical homes for the planned stop and take-profit,
         # and are what PUT /api/trades/{id} reads and writes.
@@ -734,7 +726,7 @@ class PositionFillOut(BaseModel):
     id: uuid.UUID
     trade_id: uuid.UUID
     role: str  # OPEN | CLOSE
-    quantity: int
+    quantity: float
     price: float
     executed_at: datetime
 

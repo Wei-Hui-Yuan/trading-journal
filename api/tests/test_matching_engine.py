@@ -168,6 +168,56 @@ class TestPartialFills:
         assert r.open_lots[0].execution.direction == "SELL"
 
 
+class TestFractionalQuantities:
+    """Most fills on this account are fractions of a share."""
+
+    def test_fractional_round_trip(self):
+        r = match_executions(
+            [
+                ex("BUY", Decimal("0.25"), "100.00", at(15, 9)),
+                ex("SELL", Decimal("0.25"), "120.00", at(15, 12)),
+            ]
+        )
+        p = r.positions[0]
+        assert p.quantity == Decimal("0.25")
+        assert p.realized_pnl == (Decimal("120.00") - Decimal("100.00")) * Decimal("0.25")
+
+    def test_scaling_in_fractionally_weights_the_entry(self):
+        r = match_executions(
+            [
+                ex("BUY", Decimal("0.1"), 1000, at(15, 9)),
+                ex("BUY", Decimal("0.1"), 1200, at(16, 9)),
+                ex("SELL", Decimal("0.2"), 1150, at(17, 9)),
+            ]
+        )
+        assert len(r.positions) == 1
+        p = r.positions[0]
+        assert p.quantity == Decimal("0.2")
+        assert p.entry_price == Decimal("1100")  # (1000 + 1200) / 2
+
+    def test_partial_fractional_exit_leaves_a_fractional_remainder(self):
+        r = match_executions(
+            [
+                ex("BUY", Decimal("0.5"), 100, at(15, 9)),
+                ex("SELL", Decimal("0.2"), 110, at(15, 10)),
+            ]
+        )
+        assert r.positions == []
+        assert r.open_quantity == Decimal("0.3")
+
+    def test_no_binary_float_drift(self):
+        """0.1 + 0.2 must be 0.3 exactly; this is why quantity is Decimal."""
+        r = match_executions(
+            [
+                ex("BUY", Decimal("0.1"), 100, at(15, 9)),
+                ex("BUY", Decimal("0.2"), 100, at(15, 9, 30)),
+                ex("SELL", Decimal("0.3"), 100, at(15, 11)),
+            ]
+        )
+        assert r.positions[0].quantity == Decimal("0.3")
+        assert r.open_quantity == Decimal("0")
+
+
 class TestOrdering:
     def test_unsorted_input_is_sorted_chronologically(self):
         later = ex("SELL", 100, 155, at(15, 10))

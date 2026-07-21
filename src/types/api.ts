@@ -146,8 +146,12 @@ export interface IngestResult {
   trades_duplicates: number;
   positions_matched: number;
   symbols_touched: string[];
-  /** Fractional fills rounded to satisfy the INTEGER quantity column. */
-  fractional_quantities: number;
+  /**
+   * Statement rows that were not tradeable positions — chiefly currency
+   * conversions in a multi-currency account, which can outnumber the real
+   * fills and would otherwise each become a position.
+   */
+  skipped_non_tradeable: number;
 }
 
 // ---------------------------------------------------------------------------
