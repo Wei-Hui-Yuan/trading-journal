@@ -247,10 +247,48 @@ export interface ManualTradePayload {
   /** Left null while the trade is still running. */
   exit_price?: number | null;
 
+  /**
+   * What the position-size calculator sized this trade against, captured at
+   * entry rather than looked up later — account size drifts, and a trade sized
+   * against $2,500 must keep reading as 1% of $2,500.
+   *
+   * `risk_amount` is the figure that turns an R-multiple back into dollars.
+   * Note the asymmetry server-side: omitting `risk_percent` falls back to the
+   * column default of 1.00, so only `risk_amount` reliably distinguishes a
+   * sized trade from an unsized one.
+   */
+  risk_percent?: number | null;
+  risk_amount?: number | null;
+
   /** Playbook entry this trade follows. */
   strategy_id?: string | null;
   /** Why the trade was taken, recorded at entry. */
   thesis?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Trader-level defaults (GET /api/settings) — one row, server-side.
+ *
+ * Current state only, not a history. What each trade actually risked lives on
+ * the trade itself; this is what the calculator opens with.
+ */
+export interface AppSettings {
+  /** Net liquidation value. Null means never set — not zero. */
+  account_size: number | null;
+  /** Percent, not fraction: 1.0 means 1%. */
+  risk_percent: number;
+  updated_at: string | null; // ISO 8601
+}
+
+/** Body for PUT /api/settings. Only keys present are applied. */
+export interface AppSettingsPayload {
+  /** Explicit null clears it; risk_percent may not be nulled. */
+  account_size?: number | null;
+  risk_percent?: number;
 }
 
 /**

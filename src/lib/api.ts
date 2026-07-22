@@ -2,6 +2,8 @@ import axios from 'axios';
 
 import type {
   AdvancedMetrics,
+  AppSettings,
+  AppSettingsPayload,
   DashboardStats,
   Discipline,
   DisciplineCreatePayload,
@@ -209,6 +211,20 @@ export async function createStrategy(
   payload: StrategyCreatePayload
 ): Promise<Strategy> {
   const { data } = await apiClient.post<Strategy>('/strategies', payload);
+  return data;
+}
+
+/** GET /api/settings - account size and default risk for the calculator. */
+export async function getSettings(): Promise<AppSettings> {
+  const { data } = await apiClient.get<AppSettings>('/settings');
+  return data;
+}
+
+/** PUT /api/settings - partial; only the keys sent are applied. */
+export async function updateSettings(
+  payload: AppSettingsPayload
+): Promise<AppSettings> {
+  const { data } = await apiClient.put<AppSettings>('/settings', payload);
   return data;
 }
 

@@ -93,9 +93,13 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
 
           <SyncBrokerButton />
 
-          <button className="p-2 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition">
+          <Link
+            href="/settings"
+            aria-label="Settings"
+            className="p-2 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition"
+          >
             <SlidersHorizontal className="h-4 w-4" />
-          </button>
+          </Link>
           
           <div className="h-8 w-8 rounded-lg bg-slate-800 border border-obsidian-border flex items-center justify-center text-slate-300 font-semibold text-xs">
             <User className="h-4 w-4 text-slate-400" />

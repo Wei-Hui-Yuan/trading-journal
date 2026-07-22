@@ -15,14 +15,18 @@ import {
   getPendingPositions,
   getPositionFills,
   getRoundTrips,
+  getSettings,
   getStrategies,
   getTrades,
   ingestIBKR,
   updatePositionReview,
+  updateSettings,
   updateStrategy,
 } from '@/lib/api';
 import type {
   AdvancedMetrics,
+  AppSettings,
+  AppSettingsPayload,
   DashboardStats,
   Discipline,
   DisciplineCreatePayload,
@@ -53,6 +57,7 @@ export const queryKeys = {
   disciplines: ['disciplines'] as const,
   dashboardStats: ['dashboardStats'] as const,
   advancedMetrics: ['advancedMetrics'] as const,
+  settings: ['settings'] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -108,6 +113,34 @@ export function useAnnotateTrade() {
       queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
       queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
     },
+  });
+}
+
+/**
+ * Account size and default risk, backing the position-size calculator.
+ *
+ * `retry: false` because the calculator degrades to hand-typed values when
+ * this fails — spending three retries before the form becomes usable is worse
+ * than showing the fallback immediately.
+ */
+export function useSettings() {
+  return useQuery<AppSettings>({
+    queryKey: queryKeys.settings,
+    queryFn: getSettings,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+/** Persist account size / default risk so the next trade opens with them. */
+export function useUpdateSettings() {
+  const queryClient = useQueryClient();
+  return useMutation<AppSettings, Error, AppSettingsPayload>({
+    mutationFn: updateSettings,
+    // Written straight into the cache rather than invalidated: the modal reads
+    // these while the user is still typing into the same form, and a refetch
+    // round trip would briefly restore the old account size under the cursor.
+    onSuccess: (saved) => queryClient.setQueryData(queryKeys.settings, saved),
   });
 }
 

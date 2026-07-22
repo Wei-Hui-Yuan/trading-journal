@@ -1,10 +1,16 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertCircle, Check, Loader2, PlusCircle, X } from 'lucide-react';
+import Link from 'next/link';
+import { AlertCircle, Calculator, Check, Loader2, PlusCircle, X } from 'lucide-react';
 
-import { useCreateManualTrade, useStrategies } from '@/hooks/useTradeInbox';
+import {
+  useCreateManualTrade,
+  useSettings,
+  useStrategies,
+} from '@/hooks/useTradeInbox';
+import { computeSizing, sizingHint } from '@/lib/positionSizing';
 import type { TradeSide } from '@/types/api';
 
 interface ManualTradeModalProps {
@@ -34,6 +40,14 @@ interface FormState {
   // The idea
   strategyId: string; // '' means none chosen
   thesis: string;
+  /**
+   * Risk for THIS trade, seeded from the saved default but editable — a
+   * lower-conviction setup gets sized smaller without changing the default.
+   *
+   * Account size is deliberately absent: it belongs to the account, not to a
+   * trade, so it is read from Settings rather than retyped here.
+   */
+  riskPercent: string;
 }
 
 /** '' / whitespace / unparseable -> null, so the API never receives NaN. */
@@ -88,7 +102,20 @@ const blankForm = (): FormState => ({
   exitPrice: '',
   strategyId: '',
   thesis: '',
+  riskPercent: '',
 });
+
+/** Money, to the cent. */
+const money = (n: number) =>
+  n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+
+/**
+ * A price, at the precision the instrument warrants.
+ *
+ * Sub-dollar tickers need more than two decimals or every R target rounds to
+ * the same number and the ladder reads as though it has no spacing.
+ */
+const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
 
 export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
   const [form, setForm] = useState<FormState>(blankForm);
@@ -100,6 +127,9 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
   const mutation = useCreateManualTrade();
   // Offered straight from the playbook, so the two cannot drift apart.
   const { data: strategies } = useStrategies();
+  // Read-only here. Editing lives on /settings so account size is set
+  // occasionally rather than retyped for every trade.
+  const { data: settings } = useSettings();
 
   // The portal target only exists in the browser.
   useEffect(() => setMounted(true), []);
@@ -115,6 +145,19 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
     }
   }, [open]);
 
+  // Seed the per-trade risk from the saved default once settings arrive.
+  // Guarded on the field being untouched, because settings can resolve after
+  // the user has started typing and overwriting mid-keystroke would be worse
+  // than not prefilling. Blanking on open means reopening picks it back up.
+  useEffect(() => {
+    if (!open || !settings) return;
+    setForm((prev) =>
+      prev.riskPercent === ''
+        ? { ...prev, riskPercent: String(settings.risk_percent) }
+        : prev
+    );
+  }, [open, settings]);
+
   // Escape closes, matching standard dialog behaviour.
   useEffect(() => {
     if (!open) return;
@@ -124,6 +167,41 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose, mutation.isPending]);
+
+  // The calculator reads the plan rather than duplicating it. Entry and stop
+  // are the same two numbers the form already collects; a second copy of them
+  // could disagree with the first, and you would size against one while
+  // logging the other.
+  // Account size comes from Settings, never from this form: it belongs to the
+  // account rather than to a trade, and retyping it per trade is exactly the
+  // friction the settings page exists to remove.
+  const accountSize = settings?.account_size ?? null;
+  const sizingInputs = useMemo(
+    () => ({
+      side: form.side,
+      entry: toNullableNumber(form.plannedEntry),
+      stop: toNullableNumber(form.plannedStopLoss),
+      accountSize,
+      riskPercent: toNullableNumber(form.riskPercent),
+    }),
+    [form.side, form.plannedEntry, form.plannedStopLoss, accountSize, form.riskPercent]
+  );
+  const sizing = useMemo(() => computeSizing(sizingInputs), [sizingInputs]);
+  const hint = useMemo(() => sizingHint(sizingInputs), [sizingInputs]);
+
+  // Dollars actually at risk on the quantity being logged, which is not
+  // necessarily the quantity the calculator suggested — taking half size is a
+  // deliberate act and the ledger should record it as half the risk. Derived
+  // from the entered quantity so the two can never disagree.
+  const enteredQty = toNullableNumber(form.quantity);
+  const actualRisk =
+    sizing !== null && enteredQty !== null && enteredQty > 0
+      ? enteredQty * sizing.riskPerShare
+      : null;
+  const actualRiskPercent =
+    actualRisk !== null && accountSize
+      ? (actualRisk / accountSize) * 100
+      : null;
 
   if (!open || !mounted) return null;
 
@@ -181,6 +259,11 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
         execution_time: form.executionTime ? `${form.executionTime}:00` : null,
         strategy_id: form.strategyId || null,
         thesis: form.thesis.trim() || null,
+        // Only sent when a stop makes them meaningful. Without one there is no
+        // risk per share, so any figure here would be invented rather than
+        // measured — and a null is honest where a zero would not be.
+        risk_amount: actualRisk,
+        risk_percent: actualRiskPercent,
         ...optional,
       },
       {
@@ -226,7 +309,10 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
         onClick={() => !isSaving && onClose()}
       />
 
-      <div className="relative w-full max-w-md rounded-xl border border-obsidian-border bg-obsidian-card shadow-2xl">
+      {/* Wider and taller than a plain entry form needs, because the sizing
+          section is meant to be read alongside the plan it consumes rather
+          than scrolled to. */}
+      <div className="relative w-full max-w-xl rounded-xl border border-obsidian-border bg-obsidian-card shadow-2xl">
         <div className="flex items-center justify-between px-5 py-4 border-b border-obsidian-border">
           <div className="flex items-center gap-2">
             <PlusCircle className="h-4 w-4 text-win" />
@@ -247,7 +333,7 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
 
         <form
           onSubmit={handleSubmit}
-          className="px-5 py-5 space-y-4 max-h-[75vh] overflow-y-auto"
+          className="px-5 py-5 space-y-4 max-h-[82vh] overflow-y-auto"
         >
           {/* ---- Section 1: core details ---- */}
           <label className="block">
@@ -393,6 +479,202 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
             <p className="mt-1.5 text-[10px] text-obsidian-muted">
               Optional — leave blank if you did not pre-plan the trade.
             </p>
+          </fieldset>
+
+          {/* ---- Section 2b: position sizing ----
+              Sits directly under the plan because it consumes it: entry and
+              stop above are its only price inputs. */}
+          <fieldset className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 px-3 pb-3 pt-2">
+            <legend className="flex items-center gap-1.5 px-1.5 text-[10px] font-semibold uppercase tracking-wider text-obsidian-muted">
+              <Calculator className="h-3 w-3" />
+              Position Sizing
+            </legend>
+
+            <div className="grid grid-cols-2 gap-2">
+              {/* Read-only, from Settings. Shown rather than hidden so it is
+                  obvious which balance the sizing below is against. */}
+              <div>
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Account Size
+                </span>
+                <div className="mt-1 flex h-[38px] items-center justify-between rounded-lg border border-obsidian-border bg-obsidian-bg/60 px-3">
+                  <span className="font-mono text-xs text-slate-300">
+                    {accountSize === null ? 'not set' : money(accountSize)}
+                  </span>
+                  <Link
+                    href="/settings"
+                    className="text-[10px] text-obsidian-muted hover:text-slate-200 transition-colors"
+                  >
+                    Edit
+                  </Link>
+                </div>
+              </div>
+
+              <label className="block">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Risk % This Trade
+                </span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.05"
+                  min="0"
+                  value={form.riskPercent}
+                  onChange={(e) => patch({ riskPercent: e.target.value })}
+                  disabled={isSaving}
+                  placeholder="1"
+                  className={`mt-1 font-mono text-xs ${fieldClass}`}
+                />
+              </label>
+            </div>
+
+            {accountSize === null && (
+              <p className="mt-2 text-[10px] text-obsidian-muted">
+                <Link href="/settings" className="text-slate-300 underline">
+                  Set your account size
+                </Link>{' '}
+                to get a share count. Target prices work without it.
+              </p>
+            )}
+
+            {/* Outputs. A reason is shown rather than an empty panel — an
+                inverted stop is a mistake worth naming, not hiding. */}
+            {sizing === null ? (
+              <p className="mt-2.5 text-[10px] text-obsidian-muted">{hint}</p>
+            ) : (
+              <div className="mt-2.5 space-y-2.5">
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-obsidian-muted">1R / share</span>
+                    <span className="font-mono text-slate-200">
+                      {money(sizing.riskPerShare)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-obsidian-muted">Risk budget</span>
+                    <span className="font-mono text-slate-200">
+                      {sizing.riskAmount === null ? '—' : money(sizing.riskAmount)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-obsidian-muted">Shares</span>
+                    <span className="font-mono text-slate-200">
+                      {sizing.wholeShares === null ? '—' : sizing.wholeShares}
+                      {sizing.exactShares !== null && (
+                        <span className="ml-1 text-obsidian-muted">
+                          ({sizing.exactShares.toFixed(2)})
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-obsidian-muted">Cost</span>
+                    <span className="font-mono text-slate-200">
+                      {sizing.positionCost === null ? '—' : money(sizing.positionCost)}
+                      {sizing.accountFraction !== null && (
+                        <span
+                          className={`ml-1 ${
+                            sizing.accountFraction > 1 ? 'text-loss' : 'text-obsidian-muted'
+                          }`}
+                        >
+                          ({(sizing.accountFraction * 100).toFixed(0)}%)
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Above 100% of the account the position needs margin. Not an
+                    error — the account has it — but it should be a decision
+                    rather than a surprise noticed after the fill. */}
+                {sizing.accountFraction !== null && sizing.accountFraction > 1 && (
+                  <p className="text-[10px] text-loss">
+                    Costs more than the account holds — needs margin.
+                  </p>
+                )}
+
+                {sizing.wholeShares === 0 && (
+                  <p className="text-[10px] text-loss">
+                    Risk budget is smaller than one share&apos;s risk. Widen the
+                    account size, raise the risk %, or tighten the stop.
+                  </p>
+                )}
+
+                {/* The R ladder. Clicking one writes it into Take Profit
+                    above, because the ledger stores a single target — these
+                    are the options, and the field records which was chosen. */}
+                <div>
+                  <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                    Take Profit Targets
+                  </span>
+                  <div className="mt-1 grid grid-cols-3 gap-2">
+                    {sizing.targets.map((t) => {
+                      const chosen =
+                        toNullableNumber(form.takeProfitPrice) !== null &&
+                        Math.abs(
+                          (toNullableNumber(form.takeProfitPrice) as number) - t.price
+                        ) < 0.005;
+                      return (
+                        <button
+                          key={t.r}
+                          type="button"
+                          onClick={() => patch({ takeProfitPrice: price(t.price) })}
+                          disabled={isSaving}
+                          aria-pressed={chosen}
+                          // The visible label is three separate spans of
+                          // numbers, which reads as an unnamed button to a
+                          // screen reader. Spelled out here instead.
+                          aria-label={`Set take profit to ${price(t.price)} (${t.r}R)`}
+                          className={`rounded-lg border px-2 py-1.5 text-left transition-colors disabled:opacity-50 ${
+                            chosen
+                              ? 'border-win/50 bg-win/15'
+                              : 'border-obsidian-border bg-obsidian-bg hover:border-slate-600'
+                          }`}
+                        >
+                          <span
+                            className={`block text-[10px] font-semibold ${
+                              chosen ? 'text-win' : 'text-obsidian-muted'
+                            }`}
+                          >
+                            {t.r}R
+                          </span>
+                          <span className="block font-mono text-[11px] text-slate-200">
+                            {price(t.price)}
+                          </span>
+                          {t.profit !== null && (
+                            <span className="block font-mono text-[10px] text-obsidian-muted">
+                              +{money(t.profit)}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {sizing.wholeShares !== null && sizing.wholeShares > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => patch({ quantity: String(sizing.wholeShares) })}
+                    disabled={isSaving}
+                    className="w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-1.5 text-[11px] text-slate-300 hover:border-slate-600 hover:text-slate-100 transition-colors disabled:opacity-50"
+                  >
+                    Use {sizing.wholeShares} shares as quantity
+                  </button>
+                )}
+
+                {/* What will actually be recorded, which follows the quantity
+                    field rather than the suggestion above it. */}
+                {actualRisk !== null && (
+                  <p className="text-[10px] text-obsidian-muted">
+                    Logging {enteredQty} share{enteredQty === 1 ? '' : 's'} — risking{' '}
+                    <span className="text-slate-300">{money(actualRisk)}</span>
+                    {actualRiskPercent !== null && ` (${actualRiskPercent.toFixed(2)}% of account)`}
+                    . Saved with the trade.
+                  </p>
+                )}
+              </div>
+            )}
           </fieldset>
 
           {/* ---- Section 3: the execution ---- */}
