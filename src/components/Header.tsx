@@ -2,13 +2,72 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BarChart3, BookOpen, BookText, ShieldCheck, Zap, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { ManualTradeModal } from './ManualTradeModal';
+import { useLastSync } from '@/hooks/useTradeInbox';
 
 interface HeaderProps {
   pendingCount: number;
 }
+
+/** Wall-clock time of the sync, in the market timezone the app reports in. */
+const syncTimeFormatter = new Intl.DateTimeFormat('en-US', {
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+  timeZone: 'America/New_York',
+});
+
+/**
+ * What the last broker sync actually did.
+ *
+ * Replaces a hardcoded "CONNECTED" that was never derived from anything — it
+ * showed green while the sync was silently duplicating fills, and would have
+ * shown green with the API down. Before any sync runs this session it says so
+ * rather than asserting a health it has not verified.
+ */
+const SyncStatusBadge: React.FC = () => {
+  const lastSync = useLastSync();
+
+  if (!lastSync) {
+    return (
+      <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-obsidian-border text-xs font-mono">
+        <span className="h-2 w-2 rounded-full bg-slate-600" />
+        <span className="text-slate-300">IBKR Sync:</span>
+        <span className="text-obsidian-muted">not run yet</span>
+      </div>
+    );
+  }
+
+  const tone =
+    lastSync.outcome === 'success'
+      ? { dot: 'bg-win', text: 'text-win', border: 'border-obsidian-border' }
+      : lastSync.outcome === 'partial'
+        ? { dot: 'bg-amber-400', text: 'text-amber-300', border: 'border-amber-500/40' }
+        : { dot: 'bg-loss', text: 'text-loss', border: 'border-loss/40' };
+
+  const at = syncTimeFormatter.format(new Date(lastSync.at));
+  // The status code only means something when the server answered. A failure
+  // with no response is a different problem and must not read as "HTTP null".
+  const code = lastSync.status !== null ? ` · ${lastSync.status}` : ' · no response';
+
+  return (
+    <div
+      className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border ${tone.border} text-xs font-mono`}
+      title={`${lastSync.summary}${
+        lastSync.status !== null ? ` (HTTP ${lastSync.status})` : ' (no response)'
+      } — ${new Date(lastSync.at).toLocaleString()}`}
+    >
+      <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
+      <span className="text-slate-300">IBKR Sync:</span>
+      <span className={`${tone.text} font-semibold`}>
+        {at} ET{code}
+      </span>
+      <span className="text-obsidian-muted">{lastSync.summary}</span>
+    </div>
+  );
+};
 
 export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   const [isManualLogOpen, setIsManualLogOpen] = useState(false);
@@ -31,22 +90,11 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
           </div>
         </div>
 
-        {/* Center Indicators */}
+        {/* Center Indicators.
+            The "Regime: Bull Trending" badge that used to sit here was static
+            text — it never consulted anything and read as live market state. */}
         <div className="hidden md:flex items-center space-x-6">
-          <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-obsidian-border text-xs font-mono">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-win opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-win"></span>
-            </span>
-            <span className="text-slate-300">IBKR Sync:</span>
-            <span className="text-win font-semibold">CONNECTED</span>
-          </div>
-
-          <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-obsidian-border text-xs">
-            <Zap className="h-3.5 w-3.5 text-amber-400" />
-            <span className="text-obsidian-muted">Regime:</span>
-            <span className="text-slate-200 font-medium">Bull Trending</span>
-          </div>
+          <SyncStatusBadge />
 
           {pendingCount > 0 && (
             <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-mono animate-pulse">

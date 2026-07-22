@@ -266,6 +266,24 @@ export interface ManualTradePayload {
   thesis?: string | null;
 }
 
+/**
+ * Outcome of the most recent broker sync attempt.
+ *
+ * Held in the React Query cache rather than component state so the header
+ * badge and the sync button read the same fact. Local state in the button
+ * could not be seen by the badge, which is why the badge used to claim
+ * "CONNECTED" unconditionally — a status that was never checked.
+ */
+export interface LastSyncState {
+  /** ISO timestamp of the attempt, successful or not. */
+  at: string;
+  outcome: 'success' | 'partial' | 'error';
+  /** HTTP status when the server answered. Null when it never did. */
+  status: number | null;
+  /** Short human summary: "12 new", "up to date", or the error message. */
+  summary: string;
+}
+
 // ---------------------------------------------------------------------------
 // Correcting the execution ledger
 // ---------------------------------------------------------------------------

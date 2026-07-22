@@ -141,6 +141,17 @@ apiClient.interceptors.response.use(
   }
 );
 
+/**
+ * The HTTP status behind a failed request, when the server answered at all.
+ *
+ * Null means no response reached us — unreachable host, or a reply stripped of
+ * CORS headers. That distinction is worth keeping: "500" and "never answered"
+ * point at completely different problems.
+ */
+export function httpStatusOf(error: unknown): number | null {
+  return axios.isAxiosError(error) ? (error.response?.status ?? null) : null;
+}
+
 /** GET /api/positions?review_status=pending â€” the Trade Inbox queue. */
 export async function getPendingPositions(): Promise<Position[]> {
   const { data } = await apiClient.get<Position[]>('/positions', {

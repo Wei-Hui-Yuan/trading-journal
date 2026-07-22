@@ -20,6 +20,7 @@ import {
   getSettings,
   getStrategies,
   getTrades,
+  httpStatusOf,
   ingestIBKR,
   updateExecution,
   updatePositionReview,
@@ -36,6 +37,7 @@ import type {
   ExecutionUpdatePayload,
   ExecutionUpdateResult,
   IngestResult,
+  LastSyncState,
   PositionDeleteResult,
   ManualTradePayload,
   ManualTradeResult,
@@ -64,6 +66,9 @@ export const queryKeys = {
   dashboardStats: ['dashboardStats'] as const,
   advancedMetrics: ['advancedMetrics'] as const,
   settings: ['settings'] as const,
+  // Written by the sync mutation, read by the header badge. Not a fetched
+  // resource — the cache is being used as the one place both can see.
+  lastSync: ['lastSync'] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -188,11 +193,60 @@ export function useSyncBroker() {
 
   return useMutation<IngestResult, Error, void>({
     mutationFn: ingestIBKR,
-    onSuccess: () => {
+    onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+
+      // A run where some Flex queries did not return is NOT a success. IBKR
+      // rate-limits report generation per token, and its cooldown outlasts a
+      // request, so a partial run reports fewer fills than exist — reporting
+      // it as green is how "no new trades" comes to mean "IBKR refused us".
+      const partial = result.queries_failed.length > 0;
+      queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, {
+        at: new Date().toISOString(),
+        outcome: partial ? 'partial' : 'success',
+        status: 200,
+        summary: partial
+          ? `${result.queries_failed.length} quer${
+              result.queries_failed.length === 1 ? 'y' : 'ies'
+            } unavailable`
+          : result.trades_created > 0
+            ? `${result.trades_created} new`
+            : result.staged_duplicates > 0
+              ? 'up to date'
+              : 'no fills',
+      });
+    },
+    onError: (error) => {
+      queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, {
+        at: new Date().toISOString(),
+        outcome: 'error',
+        status: httpStatusOf(error),
+        summary: error.message,
+      });
     },
   });
+}
+
+/**
+ * The last sync attempt, or undefined if none has run this session.
+ *
+ * Read-only view of a cache entry the sync mutation writes. Deliberately not
+ * persisted: after a reload the honest answer is "not since you opened this",
+ * and a remembered timestamp from yesterday would imply a freshness the app
+ * cannot vouch for.
+ */
+export function useLastSync(): LastSyncState | undefined {
+  const queryClient = useQueryClient();
+  // Subscribes to the cache key so the badge re-renders when a sync lands.
+  const { data } = useQuery<LastSyncState | null>({
+    queryKey: queryKeys.lastSync,
+    // Never fetched; the mutation is the only writer.
+    queryFn: () => queryClient.getQueryData<LastSyncState>(queryKeys.lastSync) ?? null,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  return data ?? undefined;
 }
 
 /**
