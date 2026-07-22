@@ -71,6 +71,11 @@ export const SyncResultToast: React.FC = () => {
           hint: 'Fills you deleted. IBKR re-sent them; the tombstone held.',
         },
         {
+          label: 'Trade plans attached',
+          value: result.plans_attached ?? 0,
+          hint: 'A plan you wrote beforehand met the fill it was waiting for.',
+        },
+        {
           label: 'Non-tradeable rows',
           value: result.skipped_non_tradeable,
           hint: 'Currency conversions and similar, which are not positions.',
@@ -134,6 +139,20 @@ export const SyncResultToast: React.FC = () => {
               {result.symbols_touched.length > 0 && (
                 <p className="mt-2 text-[10px] text-obsidian-muted">
                   Tickers rebuilt: {result.symbols_touched.join(', ')}
+                </p>
+              )}
+
+              {/* Called out rather than left as a number in the list: this is
+                  the one outcome that changed a trade's recorded intent, and
+                  it is worth checking the sync matched the plan you meant. */}
+              {(result.plans_attached ?? 0) > 0 && (
+                <p className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-2.5 py-2 text-[11px] leading-relaxed text-amber-200/90">
+                  <span className="font-semibold">
+                    {result.plans_attached} trade plan
+                    {result.plans_attached === 1 ? '' : 's'} attached.
+                  </span>{' '}
+                  Your planned stop and target are now on the fill. Check it in
+                  the Journal if more than one plan could have matched.
                 </p>
               )}
             </>

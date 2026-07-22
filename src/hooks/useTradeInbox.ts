@@ -4,13 +4,19 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   annotateTrade,
+  attachPlan,
+  cancelPlan,
   createDiscipline,
   createManualTrade,
+  createPlan,
   createStrategy,
   deleteDiscipline,
   deletePosition,
   deleteTrade,
+  detachPlan,
   dismissPosition,
+  getPlans,
+  updatePlan,
   getAdvancedMetrics,
   getDashboardAnalytics,
   getDisciplines,
@@ -43,6 +49,12 @@ import type {
   PositionDeleteResult,
   ManualTradePayload,
   ManualTradeResult,
+  PlanAttachResult,
+  PlanDetachResult,
+  PlanStatus,
+  TradePlan,
+  TradePlanPayload,
+  TradePlanUpdatePayload,
   Position,
   PositionFill,
   PositionReviewPayload,
@@ -74,6 +86,11 @@ export const queryKeys = {
   // resource — the cache is being used as the one place both can see.
   lastSync: ['lastSync'] as const,
   suppressed: ['suppressedExecutions'] as const,
+  // Prefix, so invalidating plans clears every status filter at once — a
+  // cancelled plan has to leave the OPEN list and appear in the ALL list, and
+  // those are two different cache entries.
+  plansRoot: ['plans'] as const,
+  plans: (status: string) => ['plans', status] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -275,6 +292,105 @@ export function useCreateManualTrade() {
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
       // The ledger always gains a row, even when the fill opens rather than
       // closes a position — which is the case the inbox cannot show.
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+    },
+  });
+}
+
+/**
+ * Trade plans. Defaults to OPEN — the only status you can act on.
+ *
+ * Deliberately does NOT invalidate anything on the dashboard: a plan is not an
+ * execution, so nothing about it can move P&L, win rate or exposure.
+ */
+export function usePlans(status: PlanStatus | 'ALL' = 'OPEN') {
+  return useQuery<TradePlan[], Error>({
+    queryKey: queryKeys.plans(status),
+    queryFn: () => getPlans(status),
+  });
+}
+
+/**
+ * Record a trade you intend to take.
+ *
+ * Only the plan lists are invalidated. If creating a plan ever caused the
+ * dashboard to change, that would be the bug this whole feature exists to
+ * prevent — so the absence of those invalidations is deliberate, not an
+ * oversight.
+ */
+export function useCreatePlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation<TradePlan, Error, TradePlanPayload>({
+    mutationFn: createPlan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+    },
+  });
+}
+
+/** Edit a plan that has not been attached yet. */
+export function useUpdatePlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    TradePlan,
+    Error,
+    { planId: string; payload: TradePlanUpdatePayload }
+  >({
+    mutationFn: ({ planId, payload }) => updatePlan(planId, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+    },
+  });
+}
+
+/** Cancel a plan you did not take. It stays in the record as CANCELLED. */
+export function useCancelPlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation<TradePlan, Error, string>({
+    mutationFn: cancelPlan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+    },
+  });
+}
+
+/**
+ * Link a plan to a fill the sync did not match on its own.
+ *
+ * This one DOES touch the ledger: attaching copies the plan's stop, target and
+ * sizing onto the opening fill, so the round trip's planned R changes.
+ */
+export function useAttachPlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation<PlanAttachResult, Error, { tradeId: string; planId: string }>({
+    mutationFn: ({ tradeId, planId }) => attachPlan(tradeId, planId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+    },
+  });
+}
+
+/**
+ * Unlink a wrongly attached plan, returning it to OPEN.
+ *
+ * The values it copied stay on the trade. They may have been edited since, and
+ * nothing distinguishes an untouched copy from a corrected one — so clearing
+ * them could silently discard the user's own work.
+ */
+export function useDetachPlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation<PlanDetachResult, Error, string>({
+    mutationFn: detachPlan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
       queryClient.invalidateQueries({ queryKey: queryKeys.trades });
     },
   });

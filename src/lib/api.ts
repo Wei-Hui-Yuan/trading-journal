@@ -15,10 +15,16 @@ import type {
   IngestResult,
   ManualTradePayload,
   ManualTradeResult,
+  PlanAttachResult,
+  PlanDetachResult,
+  PlanStatus,
   Position,
   PositionFill,
   PositionReviewPayload,
   RoundTrip,
+  TradePlan,
+  TradePlanPayload,
+  TradePlanUpdatePayload,
   Strategy,
   StrategyCreatePayload,
   StrategyUpdatePayload,
@@ -288,6 +294,77 @@ export async function unsuppressExecution(
 ): Promise<UnsuppressResult> {
   const { data } = await apiClient.delete<UnsuppressResult>(
     `/trades/suppressed/${encodeURIComponent(execId)}`
+  );
+  return data;
+}
+
+/**
+ * GET /api/plans - trade plans, newest first.
+ *
+ * Defaults to OPEN because that is the only actionable status: the dock exists
+ * to show what you are still waiting to be filled on. Pass 'ALL' for history.
+ */
+export async function getPlans(
+  status: PlanStatus | 'ALL' = 'OPEN'
+): Promise<TradePlan[]> {
+  const { data } = await apiClient.get<TradePlan[]>('/plans', {
+    params: { status },
+  });
+  return data;
+}
+
+/**
+ * POST /api/plans - record a trade you intend to take.
+ *
+ * Writes to `planned_trades` and nowhere else. No row reaches `trades`, so
+ * nothing here moves P&L, win rate or exposure until a real fill arrives.
+ */
+export async function createPlan(payload: TradePlanPayload): Promise<TradePlan> {
+  const { data } = await apiClient.post<TradePlan>('/plans', payload);
+  return data;
+}
+
+/** PATCH /api/plans/{id} - edit a plan that has not been attached yet. */
+export async function updatePlan(
+  planId: string,
+  payload: TradePlanUpdatePayload
+): Promise<TradePlan> {
+  const { data } = await apiClient.patch<TradePlan>(`/plans/${planId}`, payload);
+  return data;
+}
+
+/**
+ * DELETE /api/plans/{id} - cancel a plan you did not take.
+ *
+ * Marked CANCELLED rather than removed: the setups you talked yourself out of
+ * are evidence about your process, and a row that vanishes takes that with it.
+ */
+export async function cancelPlan(planId: string): Promise<TradePlan> {
+  const { data } = await apiClient.delete<TradePlan>(`/plans/${planId}`);
+  return data;
+}
+
+/**
+ * POST /api/trades/{id}/attach-plan - link a plan the sync did not match.
+ *
+ * Attaches to every fill in the same opening leg, not only the one named.
+ */
+export async function attachPlan(
+  tradeId: string,
+  planId: string
+): Promise<PlanAttachResult> {
+  const { data } = await apiClient.post<PlanAttachResult>(
+    `/trades/${tradeId}/attach-plan`,
+    null,
+    { params: { plan_id: planId } }
+  );
+  return data;
+}
+
+/** POST /api/trades/{id}/detach-plan - unlink, returning the plan to OPEN. */
+export async function detachPlan(tradeId: string): Promise<PlanDetachResult> {
+  const { data } = await apiClient.post<PlanDetachResult>(
+    `/trades/${tradeId}/detach-plan`
   );
   return data;
 }

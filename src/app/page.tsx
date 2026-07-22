@@ -7,6 +7,7 @@ import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
+import { OpenPlansDock } from '@/components/OpenPlansDock';
 import type { KPIStats } from '@/types/api';
 import {
   usePendingPositions,
@@ -90,6 +91,12 @@ export default function Home() {
             error={dashboardQuery.error as Error | null}
           />
         </section>
+
+        {/* Plans you have committed to but not yet entered. Sits above the
+            inbox because it is the forward-looking half: the inbox is trades
+            that already happened and need reviewing. Renders nothing at all
+            when no plans are open. */}
+        <OpenPlansDock />
 
         {/* Trade Inbox Queue */}
         <section>

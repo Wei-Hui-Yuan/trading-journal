@@ -2,9 +2,9 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BarChart3, BookOpen, BookText, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, ClipboardList, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
-import { ManualTradeModal } from './ManualTradeModal';
+import { CreatePlanModal } from './CreatePlanModal';
 import { SyncResultToast } from './SyncResultToast';
 import { useLastSync } from '@/hooks/useTradeInbox';
 
@@ -71,7 +71,7 @@ const SyncStatusBadge: React.FC = () => {
 };
 
 export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
-  const [isManualLogOpen, setIsManualLogOpen] = useState(false);
+  const [isPlanOpen, setIsPlanOpen] = useState(false);
 
   return (
     <header className="border-b border-obsidian-border bg-obsidian-card/80 backdrop-blur-md sticky top-0 z-50">
@@ -131,13 +131,17 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
             <span className="hidden sm:inline">Strategies</span>
           </Link>
 
+          {/* Was "Manual Log", which wrote straight into `trades` and so could
+              duplicate a fill the sync was about to import. It records a plan
+              now — the same form, minus the execution fields it had no way to
+              know yet. */}
           <button
             type="button"
-            onClick={() => setIsManualLogOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-obsidian-bg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:text-white hover:border-slate-500 hover:bg-white/[0.04] transition-colors"
+            onClick={() => setIsPlanOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
           >
-            <Plus className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Manual Log</span>
+            <ClipboardList className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Plan Trade</span>
           </button>
 
           <SyncBrokerButton />
@@ -157,10 +161,7 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
 
       </div>
 
-      <ManualTradeModal
-        open={isManualLogOpen}
-        onClose={() => setIsManualLogOpen(false)}
-      />
+      <CreatePlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
 
       {/* Mounted here so the summary survives navigating between pages while a
           sync is still in flight — the request outlives any one route. */}

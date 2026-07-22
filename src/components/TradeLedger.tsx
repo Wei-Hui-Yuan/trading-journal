@@ -6,25 +6,29 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   ChevronRight,
+  ClipboardList,
   Loader2,
   NotebookPen,
   Pencil,
   Plus,
   Search,
   Trash2,
+  Unlink,
+  Wrench,
   X,
 } from 'lucide-react';
 
 import {
   useAnnotateTrade,
   useDeleteTrade,
+  useDetachPlan,
   useReviewPosition,
   useRoundTrips,
   useStrategies,
   useUpdateExecution,
 } from '@/hooks/useTradeInbox';
 import type { PositionFill, RoundTrip, TradeSide } from '@/types/api';
-import { ManualTradeModal } from './ManualTradeModal';
+import { RepairFillModal } from './RepairFillModal';
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
   year: 'numeric',
@@ -225,6 +229,119 @@ const RBadge: React.FC<{ value: number | null; label?: string }> = ({ value, lab
   );
 };
 
+const planTimeFormatter = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+  timeZone: 'America/New_York',
+});
+
+/**
+ * What you committed to, against what the broker actually did.
+ *
+ * Only rendered when a plan is attached, and that condition is the whole
+ * point. The same `planned_entry` column can hold two very different things: a
+ * number committed to before the outcome was known, or one typed into this
+ * form afterwards. Only the first is evidence about your process, and only an
+ * attached plan carries a timestamp proving which it is.
+ */
+const PlanVsExecution: React.FC<{
+  rt: RoundTrip;
+  onUnlink: () => void;
+  unlinking: boolean;
+}> = ({ rt, onUnlink, unlinking }) => {
+  const slip = rt.entry_slippage;
+  const price = (n: number | null | undefined) =>
+    n === null || n === undefined ? '—' : n < 1 ? n.toFixed(4) : n.toFixed(2);
+
+  return (
+    <section className="rounded-lg border border-amber-500/25 bg-amber-500/[0.03] p-3">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <ClipboardList className="h-3.5 w-3.5 text-amber-400" />
+        <h4 className="text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+          Planned before entry
+        </h4>
+        {rt.plan_created_at && (
+          <span className="font-mono text-[10px] text-obsidian-muted">
+            written {planTimeFormatter.format(new Date(rt.plan_created_at))} ET
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onUnlink}
+          disabled={unlinking}
+          title="Unlink this plan. It returns to the dock and can attach elsewhere; the values it copied stay on the trade."
+          className="ml-auto inline-flex items-center gap-1 rounded border border-obsidian-border px-2 py-0.5 text-[10px] text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200 disabled:opacity-50"
+        >
+          {unlinking ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Unlink className="h-3 w-3" />
+          )}
+          Unlink plan
+        </button>
+      </div>
+
+      <div className="grid gap-x-6 gap-y-2 text-[11px] sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <div className="flex justify-between font-mono">
+            <span className="text-obsidian-muted">Planned entry</span>
+            <span className="text-slate-300">{price(rt.planned_entry)}</span>
+          </div>
+          <div className="flex justify-between font-mono">
+            <span className="text-obsidian-muted">Actual entry</span>
+            <span className="text-slate-100">{price(rt.entry_price)}</span>
+          </div>
+          {slip !== null && slip !== undefined && (
+            <div className="flex justify-between font-mono">
+              <span className="text-obsidian-muted">Slippage</span>
+              {/* Signed so positive always means better than planned — which
+                  is the opposite arithmetic on a short, and is why this is
+                  computed server-side rather than subtracted here. */}
+              <span className={slip >= 0 ? 'text-win' : 'text-loss'}>
+                {slip >= 0 ? '+' : ''}
+                {slip.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}
+                <span className="ml-1 text-obsidian-muted">
+                  {slip >= 0 ? 'better' : 'worse'}
+                </span>
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex justify-between font-mono">
+            <span className="text-obsidian-muted">Planned R</span>
+            <span className="text-slate-300">
+              {rt.planned_r_multiple === null
+                ? '—'
+                : `${rt.planned_r_multiple.toFixed(2)}R`}
+            </span>
+          </div>
+          <div className="flex justify-between font-mono">
+            <span className="text-obsidian-muted">Realised R</span>
+            <span
+              className={
+                rt.r_multiple === null
+                  ? 'text-obsidian-muted'
+                  : rt.r_multiple >= 0
+                    ? 'text-win'
+                    : 'text-loss'
+              }
+            >
+              {rt.r_multiple === null
+                ? 'still open'
+                : `${rt.r_multiple >= 0 ? '+' : ''}${rt.r_multiple.toFixed(2)}R`}
+            </span>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};
+
 /**
  * The journal, grouped by trade idea rather than by execution.
  *
@@ -251,6 +368,8 @@ export const TradeLedger: React.FC = () => {
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
 
   const [expanded, setExpanded] = useState<string | null>(null);
+  const detachMutation = useDetachPlan();
+  const [planError, setPlanError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
   // Which fill is being corrected, and the in-progress values. Kept as strings
@@ -474,6 +593,27 @@ export const TradeLedger: React.FC = () => {
                     <NotebookPen className="hidden h-3 w-3 shrink-0 text-slate-500 sm:block" />
                   )}
 
+                  {/* Visible without expanding, because "was this planned?" is
+                      the question you scan the ledger for. */}
+                  {rt.plan_id && (
+                    <span
+                      className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300"
+                      title="Entered from a pre-trade plan"
+                    >
+                      <ClipboardList className="h-2.5 w-2.5" />
+                      Planned
+                    </span>
+                  )}
+                  {rt.has_hand_added_fills && (
+                    <span
+                      className="inline-flex shrink-0 items-center gap-1 rounded bg-slate-700/40 px-1.5 py-0.5 text-[10px] text-slate-400"
+                      title="Contains a fill typed in by hand, not reported by IBKR"
+                    >
+                      <Wrench className="h-2.5 w-2.5" />
+                      Hand-added
+                    </span>
+                  )}
+
                   <span className="ml-auto shrink-0 font-mono text-[10px] text-obsidian-muted">
                     {dateFormatter.format(new Date(rt.exit_time ?? rt.entry_time))}
                   </span>
@@ -481,11 +621,39 @@ export const TradeLedger: React.FC = () => {
 
                 {expanded === rt.key && (
                   <div className="space-y-6 border-t border-obsidian-border px-4 py-4">
+                    {/* ------- PLAN vs EXECUTION (only when linked) ------- */}
+                    {rt.plan_id && (
+                      <PlanVsExecution
+                        rt={rt}
+                        unlinking={
+                          detachMutation.isPending &&
+                          detachMutation.variables === rt.plan_trade_id
+                        }
+                        onUnlink={() => {
+                          if (!rt.plan_trade_id) return;
+                          setPlanError(null);
+                          detachMutation.mutate(rt.plan_trade_id, {
+                            onError: (err) => setPlanError(err.message),
+                          });
+                        }}
+                      />
+                    )}
+                    {planError && (
+                      <div className="flex items-start text-xs text-loss">
+                        <AlertCircle className="mr-1.5 mt-px h-3.5 w-3.5 shrink-0" />
+                        <span>{planError}</span>
+                      </div>
+                    )}
+
                     {/* ---------------- THE PLAN ---------------- */}
                     <section>
                       <SectionHeading
-                        title="The Plan"
-                        blurb="Written at entry. Saved on this round trip's opening execution, so a scale-in has one stop, not several."
+                        title={rt.plan_id ? 'The Plan · as recorded' : 'The Plan'}
+                        blurb={
+                          rt.plan_id
+                            ? 'Filled in from the attached plan. Editing here changes the trade, not the plan it came from.'
+                            : 'Written at entry. Saved on this round trip’s opening execution, so a scale-in has one stop, not several.'
+                        }
                       />
 
                       <div className="grid gap-3 sm:grid-cols-2">
@@ -1029,7 +1197,7 @@ export const TradeLedger: React.FC = () => {
 
       {/* Prefilled with the ticker whose Add button was pressed. Mounted once
           at the root rather than per row, so only one can ever be open. */}
-      <ManualTradeModal
+      <RepairFillModal
         open={addingFor !== null}
         presetSymbol={addingFor ?? undefined}
         onClose={() => setAddingFor(null)}

@@ -223,6 +223,92 @@ export interface IngestResult {
    * Only throttling is worth retrying — a bad token fails identically forever.
    */
   rate_limited?: boolean;
+  /**
+   * Pre-trade plans this sync matched to the fills that finally arrived — the
+   * moment the two halves of the journal meet.
+   */
+  plans_attached?: number;
+}
+
+/** Where a plan is in its life. Mirrors a CHECK constraint in the database. */
+export type PlanStatus = 'OPEN' | 'ATTACHED' | 'CANCELLED';
+
+/**
+ * A trade you intend to take, before the broker knows anything about it.
+ *
+ * Deliberately carries no fill price. `trades` deduplicates on the broker's
+ * execution id, so a hand-logged fill and IBKR's copy of the same execution
+ * had no shared identifier and could never recognise each other — logging a
+ * trade here and then syncing produced two rows for one real trade. A plan
+ * lives in its own table so that collision cannot be expressed at all.
+ */
+export interface TradePlan {
+  id: string;
+  ticker: string;
+  /** BUY or SELL. LONG/SHORT are accepted on write and normalised to these. */
+  direction: TradeSide;
+  quantity: number | null;
+  planned_entry: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  /**
+   * Computed by Postgres from the three prices above, never sent by a client.
+   * Null when the triangle is incomplete or the entry equals the stop — which
+   * is honest, where a zero would be a claim.
+   */
+  planned_r: number | null;
+  risk_percent: number | null;
+  risk_amount: number | null;
+  strategy_id: string | null;
+  thesis: string | null;
+  status: PlanStatus;
+  created_at: string | null; // ISO 8601
+  updated_at: string | null;
+  /**
+   * Every fill this plan ended up covering. A list, not a single id: IBKR
+   * splits one order into several executions, and the plan describes the
+   * position rather than one slice of it.
+   */
+  attached_trade_ids: string[];
+}
+
+/** POST /api/plans. Every price is optional — a ticker and a bias is enough. */
+export interface TradePlanPayload {
+  ticker: string;
+  direction: TradeSide;
+  quantity?: number | null;
+  planned_entry?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  risk_percent?: number | null;
+  risk_amount?: number | null;
+  strategy_id?: string | null;
+  thesis?: string | null;
+}
+
+/** PATCH /api/plans/{id}. Only keys present are applied. */
+export type TradePlanUpdatePayload = Partial<TradePlanPayload> & {
+  status?: PlanStatus;
+};
+
+/** Result of linking a plan to a fill by hand. */
+export interface PlanAttachResult {
+  plan_id: string;
+  ticker: string;
+  /** Every fill the plan now covers, not only the one named in the request. */
+  trade_ids: string[];
+  /** Journal columns the plan filled in. Existing values are never replaced. */
+  fields_copied: string[];
+  status: PlanStatus;
+}
+
+/** Result of unlinking a plan from a fill. */
+export interface PlanDetachResult {
+  plan_id: string;
+  ticker: string;
+  trades_unlinked: number;
+  /** Back to OPEN, so it can attach elsewhere. */
+  status: PlanStatus;
 }
 
 /**
@@ -480,6 +566,30 @@ export interface RoundTrip {
   risk_amount: number | null;
   conviction: number | null;
   emotional_state: string | null;
+
+  /**
+   * Set when the opening fill was matched to a pre-trade plan.
+   *
+   * The distinction is the point: `planned_entry` filled in by an attached
+   * plan was committed to before the outcome was known, while the same column
+   * typed into the journal afterwards is a recollection. Only one of those is
+   * evidence about your process, so the UI labels them differently.
+   */
+  plan_id: string | null;
+  /** When the plan was written — the proof that it predates the fill. */
+  plan_created_at: string | null;
+  /**
+   * Per-share difference between the fill and the plan, signed so positive
+   * always means BETTER than planned. That requires knowing the side: a short
+   * filled above its planned entry got a better price, where a long paid up.
+   */
+  entry_slippage: number | null;
+  /**
+   * True when any fill here was typed in by hand to repair a gap in the broker
+   * feed. A hand-typed price is an assertion, and should look like one next to
+   * figures IBKR vouched for.
+   */
+  has_hand_added_fills: boolean;
 
   review_status: string | null;
   trade_grade: string | null;

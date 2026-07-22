@@ -3,24 +3,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
-import { AlertCircle, Calculator, Check, Loader2, PlusCircle, X } from 'lucide-react';
+import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucide-react';
 
-import {
-  useCreateManualTrade,
-  useSettings,
-  useStrategies,
-} from '@/hooks/useTradeInbox';
+import { useCreatePlan, useSettings, useStrategies } from '@/hooks/useTradeInbox';
 import { computeSizing, sizingHint } from '@/lib/positionSizing';
 import type { TradeSide } from '@/types/api';
 
-interface ManualTradeModalProps {
+interface CreatePlanModalProps {
   open: boolean;
   onClose: () => void;
-  /**
-   * Ticker to open with, when adding a missing fill to a position that already
-   * exists. Still editable — the symbol is a starting point, not a lock.
-   */
-  presetSymbol?: string;
 }
 
 /**
@@ -34,14 +25,10 @@ interface FormState {
   symbol: string;
   side: TradeSide;
   quantity: string;
-  executionTime: string;
   // The plan
   plannedEntry: string;
   plannedStopLoss: string;
   takeProfitPrice: string;
-  // The execution
-  price: string; // actual entry — required
-  exitPrice: string; // blank while the trade is still running
   // The idea
   strategyId: string; // '' means none chosen
   thesis: string;
@@ -66,45 +53,17 @@ function toNullableNumber(raw: string): number | null {
 /** Payload key -> the form field it came from, for targeted error messages. */
 const fieldForKey = {
   planned_entry: 'plannedEntry',
-  planned_stop_loss: 'plannedStopLoss',
-  take_profit_price: 'takeProfitPrice',
-  exit_price: 'exitPrice',
+  stop_loss: 'plannedStopLoss',
+  take_profit: 'takeProfitPrice',
 } as const satisfies Record<string, keyof FormState>;
-
-/**
- * "now" formatted for a datetime-local input, in US market time.
- *
- * The field is labelled ET because the backend reads a naive timestamp as
- * America/New_York and the heatmap buckets sessions the same way. Defaulting
- * to browser-local would silently mis-file trades for anyone outside ET.
- */
-function nowInMarketTz(): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/New_York',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(new Date());
-
-  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '00';
-  // en-CA yields ISO-ordered parts; hour can come back as "24" at midnight.
-  const hour = get('hour') === '24' ? '00' : get('hour');
-  return `${get('year')}-${get('month')}-${get('day')}T${hour}:${get('minute')}`;
-}
 
 const blankForm = (): FormState => ({
   symbol: '',
   side: 'BUY',
   quantity: '',
-  executionTime: nowInMarketTz(),
   plannedEntry: '',
   plannedStopLoss: '',
   takeProfitPrice: '',
-  price: '',
-  exitPrice: '',
   strategyId: '',
   thesis: '',
   riskPercent: '',
@@ -122,18 +81,33 @@ const money = (n: number) =>
  */
 const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
 
-export function ManualTradeModal({
-  open,
-  onClose,
-  presetSymbol,
-}: ManualTradeModalProps) {
+/**
+ * Everything you decide before entering a trade — and nothing you cannot know yet.
+ *
+ * This was the Manual Log form. It had a REQUIRED actual-entry field, so
+ * recording a plan meant typing a fill price for a trade that had not
+ * executed. One real PANW plan was saved with its actual entry set to its
+ * take-profit for exactly that reason, leaving the journal carrying an open
+ * position that was never bought.
+ *
+ * Worse, a hand-logged fill and IBKR's copy of the same execution shared no
+ * identifier — `trades` deduplicates on the broker's id — so planning here and
+ * then syncing produced two rows for one real trade: double the position,
+ * wrong average cost, phantom shares left open after the real ones were sold.
+ *
+ * A plan now goes to `planned_trades` instead. It cannot reach P&L, win rate
+ * or exposure, and the collision it used to cause is no longer expressible.
+ * The sizing calculator is unchanged: working out what to risk is planning,
+ * which is what this form was always really for.
+ */
+export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
   const [form, setForm] = useState<FormState>(blankForm);
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
   const symbolRef = useRef<HTMLInputElement>(null);
 
-  const mutation = useCreateManualTrade();
+  const mutation = useCreatePlan();
   // Offered straight from the playbook, so the two cannot drift apart.
   const { data: strategies } = useStrategies();
   // Read-only here. Editing lives on /settings so account size is set
@@ -143,21 +117,20 @@ export function ManualTradeModal({
   // The portal target only exists in the browser.
   useEffect(() => setMounted(true), []);
 
-  // Reset to a clean form (with a fresh timestamp) each time it opens.
   useEffect(() => {
     if (open) {
-      setForm({ ...blankForm(), symbol: (presetSymbol ?? '').toUpperCase() });
+      setForm(blankForm());
       setError(null);
       setSavedSummary(null);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
     }
-  }, [open, presetSymbol]);
+  }, [open]);
 
   // Seed the per-trade risk from the saved default once settings arrive.
   // Guarded on the field being untouched, because settings can resolve after
   // the user has started typing and overwriting mid-keystroke would be worse
-  // than not prefilling. Blanking on open means reopening picks it back up.
+  // than not prefilling.
   useEffect(() => {
     if (!open || !settings) return;
     setForm((prev) =>
@@ -167,7 +140,6 @@ export function ManualTradeModal({
     );
   }, [open, settings]);
 
-  // Escape closes, matching standard dialog behaviour.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -180,10 +152,7 @@ export function ManualTradeModal({
   // The calculator reads the plan rather than duplicating it. Entry and stop
   // are the same two numbers the form already collects; a second copy of them
   // could disagree with the first, and you would size against one while
-  // logging the other.
-  // Account size comes from Settings, never from this form: it belongs to the
-  // account rather than to a trade, and retyping it per trade is exactly the
-  // friction the settings page exists to remove.
+  // recording the other.
   const accountSize = settings?.account_size ?? null;
   const sizingInputs = useMemo(
     () => ({
@@ -198,19 +167,16 @@ export function ManualTradeModal({
   const sizing = useMemo(() => computeSizing(sizingInputs), [sizingInputs]);
   const hint = useMemo(() => sizingHint(sizingInputs), [sizingInputs]);
 
-  // Dollars actually at risk on the quantity being logged, which is not
-  // necessarily the quantity the calculator suggested — taking half size is a
-  // deliberate act and the ledger should record it as half the risk. Derived
-  // from the entered quantity so the two can never disagree.
+  // Dollars at risk on the quantity actually planned, which is not necessarily
+  // the quantity the calculator suggested — taking half size is a deliberate
+  // act and the plan should record it as half the risk.
   const enteredQty = toNullableNumber(form.quantity);
-  const actualRisk =
+  const plannedRisk =
     sizing !== null && enteredQty !== null && enteredQty > 0
       ? enteredQty * sizing.riskPerShare
       : null;
-  const actualRiskPercent =
-    actualRisk !== null && accountSize
-      ? (actualRisk / accountSize) * 100
-      : null;
+  const plannedRiskPercent =
+    plannedRisk !== null && accountSize ? (plannedRisk / accountSize) * 100 : null;
 
   if (!open || !mounted) return null;
 
@@ -224,30 +190,28 @@ export function ManualTradeModal({
     e.preventDefault();
 
     const symbol = form.symbol.trim().toUpperCase();
-    const quantity = Number(form.quantity);
-    const price = Number(form.price);
 
     if (!symbol) return setError('Ticker is required.');
     if (symbol.length > 10) return setError('Ticker must be 10 characters or fewer.');
-    if (!Number.isFinite(quantity) || quantity <= 0)
-      return setError('Quantity must be a positive number.');
-    if (!Number.isFinite(price) || price <= 0)
-      return setError('Actual entry price must be greater than zero.');
 
-    // Optional fields: blank stays blank (null). A value that is present must
-    // still be a positive number, or the API would reject it with a less
-    // specific message.
+    // Everything else is optional. A plan is worth recording the moment you
+    // have a ticker and a bias — requiring the full price triangle is what
+    // pushed people into inventing numbers to get the form to save.
+    const quantity = toNullableNumber(form.quantity);
+    if (quantity === null && form.quantity.trim() !== '')
+      return setError('Quantity must be a number.');
+    if (quantity !== null && quantity <= 0)
+      return setError('Quantity must be greater than zero.');
+
     const optional = {
       planned_entry: toNullableNumber(form.plannedEntry),
-      planned_stop_loss: toNullableNumber(form.plannedStopLoss),
-      take_profit_price: toNullableNumber(form.takeProfitPrice),
-      exit_price: toNullableNumber(form.exitPrice),
+      stop_loss: toNullableNumber(form.plannedStopLoss),
+      take_profit: toNullableNumber(form.takeProfitPrice),
     };
     const labels: Record<keyof typeof optional, string> = {
       planned_entry: 'Planned entry',
-      planned_stop_loss: 'Planned stop loss',
-      take_profit_price: 'Take profit price',
-      exit_price: 'Exit price',
+      stop_loss: 'Planned stop loss',
+      take_profit: 'Take profit price',
     };
     for (const [key, value] of Object.entries(optional)) {
       const typedKey = key as keyof typeof optional;
@@ -260,34 +224,27 @@ export function ManualTradeModal({
 
     mutation.mutate(
       {
-        symbol,
-        side: form.side,
+        ticker: symbol,
+        direction: form.side,
         quantity,
-        price,
-        // Sent without an offset; the backend anchors it to America/New_York.
-        execution_time: form.executionTime ? `${form.executionTime}:00` : null,
         strategy_id: form.strategyId || null,
         thesis: form.thesis.trim() || null,
         // Only sent when a stop makes them meaningful. Without one there is no
         // risk per share, so any figure here would be invented rather than
         // measured — and a null is honest where a zero would not be.
-        risk_amount: actualRisk,
-        risk_percent: actualRiskPercent,
+        risk_amount: plannedRisk,
+        risk_percent: plannedRiskPercent,
         ...optional,
       },
       {
-        onSuccess: (result) => {
+        onSuccess: (plan) => {
           setSavedSummary(
-            result.positions_created > 0
-              ? `Logged. ${result.positions_created} position${
-                  result.positions_created === 1 ? '' : 's'
-                } closed by FIFO matching.`
-              : `Logged. ${result.open_quantity} share${
-                  result.open_quantity === 1 ? '' : 's'
-                } open on ${result.ticker}.`
+            `Plan saved for ${plan.ticker}. It will attach itself to the fill ` +
+              'when your next broker sync brings it in — nothing has been ' +
+              'added to the ledger.'
           );
-          // Keep the modal open briefly so the outcome is readable.
-          window.setTimeout(onClose, 1400);
+          // Held open a moment so the outcome is readable.
+          window.setTimeout(onClose, 2200);
         },
         onError: (err) => setError(err.message),
       }
@@ -310,7 +267,7 @@ export function ManualTradeModal({
       className="fixed inset-0 z-[100] flex items-center justify-center p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Log a manual trade"
+      aria-label="Create a trade plan"
     >
       {/* Backdrop */}
       <div
@@ -324,10 +281,15 @@ export function ManualTradeModal({
       <div className="relative w-full max-w-xl rounded-xl border border-obsidian-border bg-obsidian-card shadow-2xl">
         <div className="flex items-center justify-between px-5 py-4 border-b border-obsidian-border">
           <div className="flex items-center gap-2">
-            <PlusCircle className="h-4 w-4 text-win" />
-            <h2 className="text-sm font-semibold tracking-wide text-slate-100">
-              LOG MANUAL TRADE
-            </h2>
+            <ClipboardList className="h-4 w-4 text-amber-400" />
+            <div>
+              <h2 className="text-sm font-semibold tracking-wide text-slate-100">
+                CREATE TRADE PLAN
+              </h2>
+              <p className="text-[10px] text-obsidian-muted">
+                Before you enter. No fill price — the broker supplies that.
+              </p>
+            </div>
           </div>
           <button
             type="button"
@@ -364,7 +326,7 @@ export function ManualTradeModal({
 
           <div>
             <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-              Action
+              Direction
             </span>
             <div className="mt-1 grid grid-cols-2 gap-2">
               {(['BUY', 'SELL'] as const).map((side) => {
@@ -386,47 +348,33 @@ export function ManualTradeModal({
                         : 'border-obsidian-border bg-obsidian-bg text-obsidian-muted hover:text-slate-200 hover:border-slate-600'
                     }`}
                   >
-                    {side === 'BUY' ? 'Buy' : 'Sell'}
+                    {side === 'BUY' ? 'Long / Buy' : 'Short / Sell'}
                   </button>
                 );
               })}
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <label className="block">
-              <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-                Quantity
-              </span>
-              <input
-                type="number"
-                inputMode="numeric"
-                step="1"
-                min="1"
-                value={form.quantity}
-                onChange={(e) => patch({ quantity: e.target.value })}
-                disabled={isSaving}
-                placeholder="100"
-                className={`mt-1 font-mono ${fieldClass}`}
-              />
-            </label>
-
-            <label className="block">
-              <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
-                Execution Time (ET)
-              </span>
-              <input
-                type="datetime-local"
-                value={form.executionTime}
-                onChange={(e) => patch({ executionTime: e.target.value })}
-                disabled={isSaving}
-                className={`mt-1 font-mono ${fieldClass}`}
-              />
-            </label>
-          </div>
-          <span className="block -mt-2 text-[10px] text-obsidian-muted">
-            Times are US market time — matches how sessions are bucketed.
-          </span>
+          <label className="block">
+            <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
+              Planned Quantity
+            </span>
+            <input
+              type="number"
+              inputMode="numeric"
+              step="1"
+              min="1"
+              value={form.quantity}
+              onChange={(e) => patch({ quantity: e.target.value })}
+              disabled={isSaving}
+              placeholder="100"
+              className={`mt-1 font-mono ${fieldClass}`}
+            />
+            <span className="mt-1.5 block text-[10px] text-obsidian-muted">
+              What you intend to take. The fill you actually get is whatever
+              IBKR reports — often split across several executions.
+            </span>
+          </label>
 
           {/* ---- Section 2: the plan ---- */}
           <fieldset className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 px-3 pb-3 pt-2">
@@ -486,7 +434,8 @@ export function ManualTradeModal({
               </label>
             </div>
             <p className="mt-1.5 text-[10px] text-obsidian-muted">
-              Optional — leave blank if you did not pre-plan the trade.
+              Entry and stop drive the sizing below. All optional — a ticker and
+              a direction is enough to save a plan.
             </p>
           </fieldset>
 
@@ -610,8 +559,8 @@ export function ManualTradeModal({
                 )}
 
                 {/* The R ladder. Clicking one writes it into Take Profit
-                    above, because the ledger stores a single target — these
-                    are the options, and the field records which was chosen. */}
+                    above, because a plan stores a single target — these are
+                    the options, and the field records which was chosen. */}
                 <div>
                   <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
                     Take Profit Targets
@@ -668,72 +617,31 @@ export function ManualTradeModal({
                     disabled={isSaving}
                     className="w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-1.5 text-[11px] text-slate-300 hover:border-slate-600 hover:text-slate-100 transition-colors disabled:opacity-50"
                   >
-                    Use {sizing.wholeShares} shares as quantity
+                    Use {sizing.wholeShares} shares as planned quantity
                   </button>
                 )}
 
                 {/* What will actually be recorded, which follows the quantity
                     field rather than the suggestion above it. */}
-                {actualRisk !== null && (
+                {plannedRisk !== null && (
                   <p className="text-[10px] text-obsidian-muted">
-                    Logging {enteredQty} share{enteredQty === 1 ? '' : 's'} — risking{' '}
-                    <span className="text-slate-300">{money(actualRisk)}</span>
-                    {actualRiskPercent !== null && ` (${actualRiskPercent.toFixed(2)}% of account)`}
-                    . Saved with the trade.
+                    Planning {enteredQty} share{enteredQty === 1 ? '' : 's'} —
+                    risking{' '}
+                    <span className="text-slate-300">{money(plannedRisk)}</span>
+                    {plannedRiskPercent !== null &&
+                      ` (${plannedRiskPercent.toFixed(2)}% of account)`}
+                    . Saved with the plan.
                   </p>
                 )}
               </div>
             )}
           </fieldset>
 
-          {/* ---- Section 3: the execution ---- */}
-          <fieldset className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 px-3 pb-3 pt-2">
-            <legend className="px-1.5 text-[10px] font-semibold uppercase tracking-wider text-obsidian-muted">
-              The Execution
-            </legend>
-            <div className="grid grid-cols-2 gap-2">
-              <label className="block">
-                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                  Actual Entry <span className="text-loss">*</span>
-                </span>
-                <input
-                  type="number"
-                  inputMode="decimal"
-                  step="0.0001"
-                  min="0"
-                  value={form.price}
-                  onChange={(e) => patch({ price: e.target.value })}
-                  disabled={isSaving}
-                  placeholder="150.25"
-                  className={`mt-1 font-mono text-xs ${fieldClass}`}
-                />
-              </label>
-
-              <label className="block">
-                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                  Exit Price
-                </span>
-                <input
-                  type="number"
-                  inputMode="decimal"
-                  step="0.0001"
-                  min="0"
-                  value={form.exitPrice}
-                  onChange={(e) => patch({ exitPrice: e.target.value })}
-                  disabled={isSaving}
-                  placeholder="still open"
-                  className={`mt-1 font-mono text-xs ${fieldClass}`}
-                />
-              </label>
-            </div>
-            <p className="mt-1.5 text-[10px] text-obsidian-muted">
-              Leave Exit Price blank while the trade is still running.
-            </p>
-          </fieldset>
-
           {/* The idea. Captured now, before the outcome is known — a thesis
               written after the fact is just the result with reasoning bolted
-              on, which is the bias a journal exists to catch. */}
+              on, which is the bias a journal exists to catch. Recording it
+              here rather than in the ledger is what makes it verifiable: the
+              plan carries a timestamp that predates the fill. */}
           <fieldset className="rounded-lg border border-obsidian-border p-3">
             <legend className="px-1.5 text-[10px] uppercase tracking-wider text-obsidian-muted">
               The Idea
@@ -778,7 +686,8 @@ export function ManualTradeModal({
               />
             </label>
             <p className="mt-1.5 text-[10px] text-obsidian-muted">
-              Written at entry. The post-trade review comes later, in the Journal.
+              Written before entry. The post-trade review comes later, in the
+              Journal.
             </p>
           </fieldset>
 
@@ -808,17 +717,17 @@ export function ManualTradeModal({
             <button
               type="submit"
               disabled={isSaving}
-              className="inline-flex items-center gap-2 rounded-lg border border-win-border bg-win-glow px-4 py-2 text-xs font-medium text-win hover:bg-win/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              className="inline-flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-xs font-medium text-amber-300 hover:bg-amber-500/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
             >
               {isSaving ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Logging…
+                  Saving…
                 </>
               ) : (
                 <>
-                  <Check className="h-3.5 w-3.5" />
-                  Log Trade
+                  <ClipboardList className="h-3.5 w-3.5" />
+                  Save Plan
                 </>
               )}
             </button>
@@ -830,4 +739,4 @@ export function ManualTradeModal({
   );
 }
 
-export default ManualTradeModal;
+export default CreatePlanModal;

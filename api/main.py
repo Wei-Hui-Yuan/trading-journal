@@ -2,7 +2,8 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
@@ -18,6 +19,7 @@ from sqlalchemy import (
     CHAR,
     Boolean,
     Column,
+    Computed,
     DateTime,
     ForeignKey,
     Integer,
@@ -26,6 +28,7 @@ from sqlalchemy import (
     Text,
     delete,
     func,
+    or_,
     select,
     update,
 )
@@ -248,7 +251,94 @@ class Trade(Base):
     waited_retest = Column(Boolean, default=True)
     followed_plan = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Which pre-trade plan this fill came from, once a sync matched one
+    # (migration 018). NULL means the fill arrived unplanned, which is the
+    # normal state for everything imported before plans existed.
+    plan_id = Column(
+        UUID(as_uuid=True), ForeignKey("planned_trades.id", ondelete="SET NULL"), nullable=True
+    )
 
+
+# Plan lifecycle. Mirrored by a CHECK constraint in migration 018, so a typo
+# here fails loudly at write time instead of quietly emptying the dock.
+PLAN_OPEN = "OPEN"
+PLAN_ATTACHED = "ATTACHED"
+PLAN_CANCELLED = "CANCELLED"
+
+# Every execution id records where the row came from. `trades` carries a CHECK
+# permitting only these two, which is what makes hand-logging a duplicate of a
+# broker fill unrepresentable rather than merely discouraged.
+EXEC_PREFIX_BROKER = "IBKR-"
+EXEC_PREFIX_REPAIR = "REPAIR-"
+
+# How long an unattached plan stays eligible for auto-attachment. Without a
+# bound, a plan written months ago and forgotten would silently claim the next
+# fill on that ticker -- and the mis-attribution would look like a feature
+# working rather than a stale row.
+PLAN_ATTACH_MAX_AGE = timedelta(days=30)
+
+
+class PlannedTrade(Base):
+    """A trade you intend to take, before the broker knows anything about it.
+
+    This exists so that planning a trade cannot create an execution. `trades`
+    deduplicates on `ibkr_exec_id`, so a hand-logged row and the broker's copy
+    of the same fill had no way to recognise each other -- planning here and
+    executing at IBKR produced two rows for one real trade. Content matching
+    cannot fix that: IBKR splits an order into several executions (one position
+    on this account arrived as 11), so there is often no single quantity to
+    match, and matching loosely merges genuine scale-ins instead.
+
+    A plan holds no fill price and never enters P&L. It is joined to reality
+    only when a sync imports an execution it can belong to.
+    """
+
+    __tablename__ = "planned_trades"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Widths deliberately match `trades`: attaching copies these across, and a
+    # plan holding a value the ledger cannot store would fail at attach time.
+    ticker = Column(String(10), nullable=False)
+    direction = Column(String(5), nullable=False)
+    quantity = Column(Numeric(18, 8), nullable=True)
+
+    planned_entry = Column(Numeric(10, 4), nullable=True)
+    stop_loss = Column(Numeric(10, 4), nullable=True)
+    take_profit = Column(Numeric(10, 4), nullable=True)
+
+    # Computed by Postgres (GENERATED ALWAYS ... STORED), never by this code:
+    # writing it from Python is exactly what lets an edited stop leave a stale
+    # R behind. `Computed` is not decoration -- it is what makes SQLAlchemy
+    # omit the column from every INSERT and UPDATE it builds. Without it,
+    # Postgres rejects the write, because a generated column cannot be
+    # assigned. The expression must stay identical to migration 018's.
+    planned_r = Column(
+        Numeric(12, 2),
+        Computed(
+            "round((take_profit - planned_entry) "
+            "/ NULLIF(planned_entry - stop_loss, 0), 2)",
+            persisted=True,
+        ),
+        nullable=True,
+    )
+
+    risk_percent = Column(Numeric(6, 2), nullable=True)
+    risk_amount = Column(Numeric(12, 2), nullable=True)
+
+    strategy_id = Column(
+        UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
+    )
+    thesis = Column(Text, nullable=True)
+
+    status = Column(String(20), nullable=False, default=PLAN_OPEN)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # planned_r and the timestamps are all filled in by the database, so the
+    # ORM has to re-read them after an INSERT rather than assume what it wrote.
+    __mapper_args__ = {"eager_defaults": True}
 
 
 class Position(Base):
@@ -506,6 +596,10 @@ class IngestResult(BaseModel):
     # The distinction is the whole point of showing it: a throttle clears on
     # its own and is worth retrying in a few minutes, a bad token never is.
     rate_limited: bool = False
+    # Pre-trade plans this sync matched to the fills that finally arrived.
+    # Worth its own line because it is the moment the two halves of the
+    # journal meet: the plan you wrote, and what the broker actually did.
+    plans_attached: int = 0
 
 
 @app.post(
@@ -631,6 +725,11 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             .values(processed=True)
         )
 
+    # --- 4b: match new fills against open plans ---------------------------
+    # Before matching, so a position is built from trades that already carry
+    # the stop and target their plan specified.
+    plans_attached = await _auto_attach_plans(session, created_ids)
+
     await session.commit()
 
     # --- 5: re-run FIFO for every affected symbol -------------------------
@@ -652,12 +751,28 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         queries_failed=query_failures,
         rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
         suppressed_skipped=resurrected,
+        plans_attached=plans_attached,
     )
 
 
 # ---------------------------------------------------------------------------
-# Manual trade entry
+# Repairing the execution ledger by hand
 # ---------------------------------------------------------------------------
+#
+# This was general-purpose manual entry. It is now narrower on purpose: the
+# only legitimate reason to type an execution into `trades` is that IBKR did
+# not send one it should have, and you are looking at the position that is
+# short a fill.
+#
+# Planning a trade no longer comes through here at all -- see /api/plans. That
+# separation is the whole point: a plan and the broker's copy of the same trade
+# used to be two rows in one table with no shared identifier, so they could
+# never recognise each other, and syncing after hand-logging double-counted the
+# position.
+#
+# The route keeps its `/manual` path deliberately. Renaming it would break the
+# ledger's add-fill button during any window where the frontend and API deploy
+# out of step, which buys nothing a docstring cannot say.
 
 # Naive timestamps from the client are interpreted as US market time, matching
 # how the analytics service buckets sessions.
@@ -665,7 +780,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 
 
 class ManualTradeCreate(BaseModel):
-    """One hand-logged execution, for traders not on an automated broker sync."""
+    """One execution added by hand to repair a gap in the broker feed."""
 
     symbol: str = Field(..., min_length=1, max_length=10)
     side: str = Field(..., description="BUY or SELL")
@@ -742,10 +857,13 @@ class ManualTradeResult(BaseModel):
 async def create_manual_trade(
     params: ManualTradeCreate, session: AsyncSession = Depends(get_session)
 ):
-    """Log an execution by hand and re-run FIFO matching for its ticker.
+    """Add a fill the broker never sent, and re-run FIFO for its ticker.
 
     The execution lands in `trades` exactly like a synced fill, so the matching
-    engine treats hand-logged and broker-sourced fills identically.
+    engine treats hand-added and broker-sourced fills identically. The REPAIR-
+    prefix is the only thing that distinguishes them afterwards, which is why
+    the ledger surfaces it: a hand-typed price is an assertion, and it should
+    be visible as one next to figures the broker vouched for.
     """
     from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
         UNCLASSIFIED_STYLE,
@@ -759,9 +877,11 @@ async def create_manual_trade(
 
     trade = Trade(
         id=uuid.uuid4(),
-        # Synthetic id keeps manual fills traceable and distinct from broker
-        # rows, while still satisfying the UNIQUE constraint.
-        ibkr_exec_id=f"MANUAL-{uuid.uuid4()}",
+        # Synthetic id, distinct from broker rows and satisfying the UNIQUE
+        # constraint. The prefix is also load-bearing: migration 018 added a
+        # CHECK permitting only IBKR- and REPAIR-, so this is what keeps the
+        # row insertable at all.
+        ibkr_exec_id=f"{EXEC_PREFIX_REPAIR}{uuid.uuid4()}",
         ticker=params.symbol,
         direction=params.side,
         style=UNCLASSIFIED_STYLE,
@@ -788,7 +908,7 @@ async def create_manual_trade(
         risk_amount=params.risk_amount,
         strategy_id=params.strategy_id,
         thesis=params.thesis,
-        source_tag="Manual",
+        source_tag="Repair",
     )
     session.add(trade)
     await session.commit()
@@ -812,6 +932,654 @@ async def create_manual_trade(
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
         positions_created=len(result.positions),
         open_quantity=result.open_quantity,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trade plans
+# ---------------------------------------------------------------------------
+
+
+def to_decimal(value: Optional[float]) -> Optional[Decimal]:
+    """Money and quantities are Decimal in the database, float on the wire.
+
+    Via str() rather than Decimal(float): Decimal(0.1) is 0.1000000000000000055,
+    while Decimal("0.1") is exactly 0.1.
+    """
+    return Decimal(str(value)) if value is not None else None
+
+
+# Journal fields a plan hands to the fill it attaches to. Keys are the plan's
+# attribute, values are the trade's -- `take_profit` and `target` are the same
+# idea under two names, which the ledger has always called `target`.
+#
+# Copied onto the trade rather than read through the FK on every query, for two
+# reasons: every existing analytic already reads these columns and would
+# otherwise need rewriting, and a plan later deleted would take the trade's
+# recorded intent with it. The plan is frozen once attached, so the copy cannot
+# drift from its source.
+PLAN_TO_TRADE_FIELDS = {
+    "planned_entry": "planned_entry",
+    "stop_loss": "stop_loss",
+    "take_profit": "target",
+    "strategy_id": "strategy_id",
+    "thesis": "thesis",
+}
+
+
+async def _opening_leg_fills(
+    session: AsyncSession, trade: Trade, plan_id: Optional[uuid.UUID] = None
+) -> list[Trade]:
+    """Every fill belonging to the same entry as `trade`, earliest first.
+
+    IBKR splits one order into several executions -- 49 of this account's 265
+    ticker/side/day groups are multi-fill, one of them 11 fills deep -- so
+    "the trade you entered" is usually several rows. Same ticker, same side,
+    same market day is the boundary the ledger already groups on.
+
+    Fills already claimed by a different plan are excluded, so attaching one
+    plan can never quietly steal another's.
+    """
+    day_start = trade.entry_date.astimezone(MARKET_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    rows = (
+        await session.execute(
+            select(Trade)
+            .where(
+                Trade.ticker == trade.ticker,
+                Trade.direction == trade.direction,
+                Trade.entry_date >= day_start,
+                Trade.entry_date < day_start + timedelta(days=1),
+                or_(Trade.plan_id.is_(None), Trade.plan_id == plan_id),
+            )
+            .order_by(Trade.entry_date, Trade.id)
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+def _plan_can_claim(
+    plan: PlannedTrade,
+    ticker: str,
+    direction: Optional[str],
+    executed_at: datetime,
+) -> bool:
+    """Whether an open plan is allowed to claim a fill that just arrived.
+
+    Separated from the allocation loop because this rule, not the loop, is what
+    decides whether an attachment is trustworthy.
+
+    A plan must predate the fill: one written after a trade executed cannot be
+    that trade's plan, whatever it says. And it must be recent -- without
+    PLAN_ATTACH_MAX_AGE, a setup written months ago and never cancelled would
+    silently claim the next fill on that ticker, and the mis-attribution would
+    look exactly like the feature working.
+    """
+    return (
+        plan.status == PLAN_OPEN
+        and plan.ticker == ticker
+        and (plan.direction or "").upper() == (direction or "").upper()
+        and plan.created_at is not None
+        and plan.created_at <= executed_at
+        and executed_at - plan.created_at <= PLAN_ATTACH_MAX_AGE
+    )
+
+
+def _apply_plan_to_fills(plan: PlannedTrade, fills: Sequence[Trade]) -> list[str]:
+    """Link a plan to its fills and hand its numbers to the earliest one.
+
+    `plan_id` goes on every fill: that is the provenance link, and putting it
+    everywhere keeps it correct no matter which fill FIFO later treats as the
+    position's opener.
+
+    The journal values go on the earliest fill ALONE. The ledger reads them
+    from the opening trade, and prices copied across seven rows would be
+    redundant -- but `risk_amount` would be actively wrong, because it is an
+    absolute figure and anything that summed it would report seven times the
+    risk actually taken.
+
+    Existing values are never overwritten. A field already filled in was
+    either edited by hand or copied by an earlier attach, and there is no way
+    to tell those apart, so the safe reading is that it is yours.
+    """
+    if not fills:
+        return []
+
+    for fill in fills:
+        fill.plan_id = plan.id
+
+    anchor = fills[0]
+    copied: list[str] = []
+
+    for plan_attr, trade_attr in PLAN_TO_TRADE_FIELDS.items():
+        value = getattr(plan, plan_attr)
+        if value is not None and getattr(anchor, trade_attr) is None:
+            setattr(anchor, trade_attr, value)
+            copied.append(trade_attr)
+
+    # risk_amount is the honest test for "was this sized at all": it has no
+    # column default, unlike risk_percent, which silently reads 1.00 on every
+    # row that never went near a calculator. So it gates both.
+    if anchor.risk_amount is None and plan.risk_amount is not None:
+        anchor.risk_amount = plan.risk_amount
+        copied.append("risk_amount")
+        if plan.risk_percent is not None:
+            anchor.risk_percent = plan.risk_percent
+            copied.append("risk_percent")
+
+    plan.status = PLAN_ATTACHED
+    plan.updated_at = datetime.now(timezone.utc)
+    return copied
+
+
+async def _auto_attach_plans(
+    session: AsyncSession, created_exec_ids: Sequence[str]
+) -> int:
+    """Match freshly imported fills against open plans. Returns plans attached.
+
+    Runs on the fills this sync actually created, never on the whole ledger:
+    re-examining old fills would let a plan written today claim a trade from
+    last month.
+
+    Two rules keep a stale plan from claiming a fill it has nothing to do with:
+    a plan must have been written BEFORE the fill executed -- a plan cannot
+    describe a trade that already happened -- and it must be no older than
+    PLAN_ATTACH_MAX_AGE, so a setup you wrote up and forgot stops competing.
+
+    When several plans qualify, the most recent wins, and each is used once.
+    Getting that choice wrong mislabels a trade; it cannot duplicate one,
+    because the plan never becomes a row in `trades`. Quantity and P&L are
+    correct either way, and the attachment is reversible from the journal.
+    """
+    if not created_exec_ids:
+        return 0
+
+    new_fills = (
+        await session.execute(
+            select(Trade)
+            .where(Trade.ibkr_exec_id.in_(list(created_exec_ids)))
+            .order_by(Trade.entry_date, Trade.id)
+        )
+    ).scalars().all()
+    if not new_fills:
+        return 0
+
+    # Same grouping the ledger uses: one entry, however many executions the
+    # broker split it into.
+    groups: dict[tuple[str, str, object], list[Trade]] = {}
+    for fill in new_fills:
+        day = fill.entry_date.astimezone(MARKET_TZ).date()
+        groups.setdefault((fill.ticker, fill.direction, day), []).append(fill)
+
+    candidates = (
+        await session.execute(
+            select(PlannedTrade)
+            .where(
+                PlannedTrade.status == PLAN_OPEN,
+                PlannedTrade.ticker.in_({t for t, _, _ in groups}),
+            )
+            .order_by(PlannedTrade.created_at.desc())
+        )
+    ).scalars().all()
+    if not candidates:
+        return 0
+
+    # Allocated in Python rather than re-querying per group, so a plan claimed
+    # by one group is not offered to the next before the flush lands.
+    used: set[uuid.UUID] = set()
+    attached = 0
+
+    for (ticker, direction, _day), fills in sorted(
+        groups.items(), key=lambda kv: kv[1][0].entry_date
+    ):
+        executed_at = fills[0].entry_date
+        match = next(
+            (
+                plan
+                for plan in candidates
+                if plan.id not in used
+                and _plan_can_claim(plan, ticker, direction, executed_at)
+            ),
+            None,
+        )
+        if match is None:
+            continue
+
+        _apply_plan_to_fills(match, fills)
+        used.add(match.id)
+        attached += 1
+
+    return attached
+
+
+class PlanCreate(BaseModel):
+    """A trade you intend to take. Deliberately carries no fill price."""
+
+    ticker: str = Field(..., min_length=1, max_length=10)
+    direction: str = Field(..., description="BUY or SELL")
+
+    # All optional: a plan is worth recording the moment you have a ticker and
+    # a bias. Requiring a full price triangle is what pushed people into
+    # inventing numbers to get the form to save.
+    quantity: Optional[float] = Field(None, gt=0)
+    planned_entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    take_profit: Optional[float] = Field(None, gt=0)
+
+    # Bounds match planned_trades' NUMERIC widths, so an oversized figure fails
+    # as a 422 naming the field rather than a 500 from the driver.
+    risk_percent: Optional[float] = Field(None, ge=0, le=9999.99)
+    risk_amount: Optional[float] = Field(None, ge=0)
+
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("direction")
+    @classmethod
+    def _valid_direction(cls, value: str) -> str:
+        # BUY/SELL only, matching trades.direction. Accepting LONG/SHORT as
+        # well would mean every query needed equivalence handling, and the
+        # first one to forget would silently miss half the rows.
+        raw = value.strip().upper()
+        alias = {"LONG": "BUY", "SHORT": "SELL"}.get(raw, raw)
+        if alias not in {"BUY", "SELL"}:
+            raise ValueError("direction must be BUY or SELL (LONG/SHORT accepted)")
+        return alias
+
+
+class PlanUpdate(BaseModel):
+    """A partial edit. Only keys actually present are applied."""
+
+    ticker: Optional[str] = Field(None, min_length=1, max_length=10)
+    direction: Optional[str] = None
+    quantity: Optional[float] = Field(None, gt=0)
+    planned_entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    take_profit: Optional[float] = Field(None, gt=0)
+    risk_percent: Optional[float] = Field(None, ge=0, le=9999.99)
+    risk_amount: Optional[float] = Field(None, ge=0)
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+    status: Optional[str] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() if value else value
+
+    @field_validator("direction")
+    @classmethod
+    def _valid_direction(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        raw = value.strip().upper()
+        alias = {"LONG": "BUY", "SHORT": "SELL"}.get(raw, raw)
+        if alias not in {"BUY", "SELL"}:
+            raise ValueError("direction must be BUY or SELL (LONG/SHORT accepted)")
+        return alias
+
+    @field_validator("status")
+    @classmethod
+    def _valid_status(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        status = value.strip().upper()
+        if status not in {PLAN_OPEN, PLAN_ATTACHED, PLAN_CANCELLED}:
+            raise ValueError(f"status must be one of {PLAN_OPEN}, {PLAN_CANCELLED}")
+        return status
+
+
+class PlanOut(BaseModel):
+    id: uuid.UUID
+    ticker: str
+    direction: str
+    quantity: Optional[float] = None
+    planned_entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    # Computed by Postgres from the three prices above; never sent by a client.
+    planned_r: Optional[float] = None
+    risk_percent: Optional[float] = None
+    risk_amount: Optional[float] = None
+    strategy_id: Optional[uuid.UUID] = None
+    thesis: Optional[str] = None
+    status: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Fills this plan ended up attached to. Derived rather than stored: one
+    # plan covers every fill of its opening leg, so a single id column could
+    # not represent it, and a second copy of the link would be free to
+    # disagree with trades.plan_id.
+    attached_trade_ids: list[uuid.UUID] = []
+
+
+def _plan_out(plan: PlannedTrade, attached_ids: Sequence[uuid.UUID] = ()) -> PlanOut:
+    """Serialise a plan, converting Decimal to float at the boundary."""
+    def num(value) -> Optional[float]:
+        return float(value) if value is not None else None
+
+    return PlanOut(
+        id=plan.id,
+        ticker=plan.ticker,
+        direction=plan.direction,
+        quantity=num(plan.quantity),
+        planned_entry=num(plan.planned_entry),
+        stop_loss=num(plan.stop_loss),
+        take_profit=num(plan.take_profit),
+        planned_r=num(plan.planned_r),
+        risk_percent=num(plan.risk_percent),
+        risk_amount=num(plan.risk_amount),
+        strategy_id=plan.strategy_id,
+        thesis=plan.thesis,
+        status=plan.status,
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+        attached_trade_ids=list(attached_ids),
+    )
+
+
+async def _attached_ids_by_plan(
+    session: AsyncSession, plan_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Reverse of trades.plan_id, in one query rather than one per plan."""
+    if not plan_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Trade.plan_id, Trade.id).where(Trade.plan_id.in_(plan_ids))
+        )
+    ).all()
+    out: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for plan_id, trade_id in rows:
+        out.setdefault(plan_id, []).append(trade_id)
+    return out
+
+
+@app.get(
+    "/api/plans",
+    response_model=list[PlanOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_plans(
+    status: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Trade plans, newest first.
+
+    Defaults to OPEN because that is the only status that is actionable --
+    the dock exists to show what you are still waiting to be filled on.
+    Pass `status=ALL` to see cancelled and attached plans too.
+    """
+    wanted = (status or PLAN_OPEN).strip().upper()
+
+    stmt = select(PlannedTrade).order_by(PlannedTrade.created_at.desc())
+    if wanted != "ALL":
+        if wanted not in {PLAN_OPEN, PLAN_ATTACHED, PLAN_CANCELLED}:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"status must be one of {PLAN_OPEN}, {PLAN_ATTACHED}, "
+                    f"{PLAN_CANCELLED}, ALL"
+                ),
+            )
+        stmt = stmt.where(PlannedTrade.status == wanted)
+
+    plans = (await session.execute(stmt)).scalars().all()
+    attached = await _attached_ids_by_plan(session, [p.id for p in plans])
+    return [_plan_out(p, attached.get(p.id, [])) for p in plans]
+
+
+@app.post(
+    "/api/plans",
+    response_model=PlanOut,
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_plan(
+    params: PlanCreate, session: AsyncSession = Depends(get_session)
+):
+    """Record a trade you intend to take.
+
+    Writes to `planned_trades` and nowhere else. No row reaches `trades`, so
+    nothing here moves P&L, win rate, exposure or any other statistic until a
+    real fill arrives and the plan attaches to it.
+
+    `planned_r` is not accepted or computed here -- Postgres generates it from
+    entry, stop and target, so it cannot drift out of step with them.
+    """
+    plan = PlannedTrade(
+        id=uuid.uuid4(),
+        ticker=params.ticker,
+        direction=params.direction,
+        quantity=to_decimal(params.quantity),
+        planned_entry=to_decimal(params.planned_entry),
+        stop_loss=to_decimal(params.stop_loss),
+        take_profit=to_decimal(params.take_profit),
+        risk_percent=to_decimal(params.risk_percent),
+        risk_amount=to_decimal(params.risk_amount),
+        strategy_id=params.strategy_id,
+        thesis=params.thesis,
+        status=PLAN_OPEN,
+    )
+    session.add(plan)
+    await session.commit()
+    # planned_r and the timestamps were produced by the database; re-read
+    # rather than report what we sent, which did not include them.
+    await session.refresh(plan)
+    return _plan_out(plan)
+
+
+@app.patch(
+    "/api/plans/{plan_id}",
+    response_model=PlanOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_plan(
+    plan_id: uuid.UUID,
+    params: PlanUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Edit a plan that has not been attached yet.
+
+    An ATTACHED plan is frozen. Once a fill has copied the plan's numbers onto
+    itself, editing the plan would leave the two disagreeing about what was
+    intended, with nothing to say which came first. Detach it if the
+    attachment was wrong -- that is the operation that makes it editable
+    again, and it says so.
+    """
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    changes = params.model_dump(exclude_unset=True)
+
+    if plan.status == PLAN_ATTACHED and set(changes) - {"status"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This plan is attached to a filled trade and cannot be edited. "
+                "Detach it first, or edit the trade itself in the journal."
+            ),
+        )
+
+    # ATTACHED is reached by attaching, never by asserting it. Allowing it here
+    # would let a plan claim a fill that does not point back at it.
+    if changes.get("status") == PLAN_ATTACHED:
+        raise HTTPException(
+            status_code=422,
+            detail="Attach a plan to a trade instead of setting its status directly.",
+        )
+
+    decimal_fields = {
+        "quantity", "planned_entry", "stop_loss", "take_profit",
+        "risk_percent", "risk_amount",
+    }
+    for key, value in changes.items():
+        setattr(plan, key, to_decimal(value) if key in decimal_fields else value)
+
+    plan.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(plan)
+
+    attached = await _attached_ids_by_plan(session, [plan.id])
+    return _plan_out(plan, attached.get(plan.id, []))
+
+
+@app.delete(
+    "/api/plans/{plan_id}",
+    response_model=PlanOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def cancel_plan(
+    plan_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Cancel a plan you did not take.
+
+    Marked CANCELLED rather than deleted. The setups you talked yourself out
+    of are evidence about your process, and a row that vanishes takes that
+    with it -- but a cancelled plan must stop competing for incoming fills,
+    which the status change is what accomplishes.
+    """
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    if plan.status == PLAN_ATTACHED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This plan is attached to a filled trade. Detach it first if "
+                "the attachment was wrong."
+            ),
+        )
+
+    plan.status = PLAN_CANCELLED
+    plan.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(plan)
+    return _plan_out(plan)
+
+
+class PlanAttachResult(BaseModel):
+    plan_id: uuid.UUID
+    ticker: str
+    # Every fill the plan now covers, not just the one named in the request:
+    # attaching to a single fill of a multi-fill position would describe a
+    # fraction of the trade and read as though the rest were unplanned.
+    trade_ids: list[uuid.UUID]
+    fields_copied: list[str]
+    status: str
+
+
+@app.post(
+    "/api/trades/{trade_id}/attach-plan",
+    response_model=PlanAttachResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def attach_plan(
+    trade_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Link an open plan to a fill the sync did not match automatically.
+
+    Attaches to every fill in the same opening leg, not only the one named --
+    IBKR splits an order into several executions, and a plan describes the
+    position rather than one slice of it.
+    """
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if plan.status == PLAN_ATTACHED:
+        raise HTTPException(
+            status_code=409, detail="That plan is already attached to a trade."
+        )
+    if plan.ticker != trade.ticker:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Plan is for {plan.ticker}, but this trade is {trade.ticker}.",
+        )
+    if (plan.direction or "").upper() != (trade.direction or "").upper():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Plan is a {plan.direction} and this fill is a {trade.direction}."
+            ),
+        )
+
+    fills = await _opening_leg_fills(session, trade, plan_id=plan.id)
+    copied = _apply_plan_to_fills(plan, fills)
+    await session.commit()
+
+    attached = await _attached_ids_by_plan(session, [plan.id])
+    return PlanAttachResult(
+        plan_id=plan.id,
+        ticker=plan.ticker,
+        trade_ids=attached.get(plan.id, []),
+        fields_copied=copied,
+        status=plan.status,
+    )
+
+
+class PlanDetachResult(BaseModel):
+    plan_id: uuid.UUID
+    ticker: str
+    trades_unlinked: int
+    status: str
+
+
+@app.post(
+    "/api/trades/{trade_id}/detach-plan",
+    response_model=PlanDetachResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def detach_plan(
+    trade_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Unlink a wrongly attached plan and make it available again.
+
+    The values the plan copied onto the trade are deliberately left in place.
+    They may have been edited since, and there is no way to tell an untouched
+    copy from a corrected one -- so clearing them could silently discard your
+    own work. The plan returns to OPEN and can attach elsewhere.
+    """
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+    if trade.plan_id is None:
+        raise HTTPException(status_code=404, detail="This trade has no plan attached.")
+
+    plan = await session.get(PlannedTrade, trade.plan_id)
+
+    result = await session.execute(
+        update(Trade)
+        .where(Trade.plan_id == trade.plan_id)
+        .values(plan_id=None)
+        .returning(Trade.id)
+    )
+    unlinked = len(result.fetchall())
+
+    if plan is not None:
+        plan.status = PLAN_OPEN
+        plan.updated_at = datetime.now(timezone.utc)
+
+    await session.commit()
+
+    return PlanDetachResult(
+        plan_id=plan.id if plan else trade_id,
+        ticker=plan.ticker if plan else (trade.ticker or ""),
+        trades_unlinked=unlinked,
+        status=plan.status if plan else PLAN_OPEN,
     )
 
 
@@ -1782,12 +2550,12 @@ async def delete_trade(
         # position_fills.position_id cascades, so the fills go with them.
         await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
 
-    # Tombstone broker fills so the next sync does not resurrect them. Manual
-    # entries are skipped: their MANUAL-<uuid> key is generated fresh each time
-    # and no sync will ever re-send it, so suppressing it would only grow a
-    # table nothing reads.
+    # Tombstone broker fills so the next sync does not resurrect them.
+    # Hand-added repairs are skipped: their REPAIR-<uuid> key is generated
+    # fresh each time and no sync will ever re-send it, so suppressing one
+    # would only grow a table nothing reads.
     suppressed = False
-    if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith("IBKR-"):
+    if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith(EXEC_PREFIX_BROKER):
         await session.execute(
             pg_insert(SuppressedExecution)
             .values(
@@ -1883,7 +2651,7 @@ async def delete_position(
             await session.execute(select(Trade).where(Trade.id.in_(trade_ids)))
         ).scalars().all()
         for trade in trades:
-            if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith("IBKR-"):
+            if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith(EXEC_PREFIX_BROKER):
                 await session.execute(
                     pg_insert(SuppressedExecution)
                     .values(
@@ -2060,6 +2828,21 @@ class RoundTripOut(BaseModel):
     conviction: Optional[int] = None
     emotional_state: Optional[str] = None
 
+    # --- did this come from a plan? -----------------------------------
+    # Set when the opening fill was matched to a pre-trade plan. The
+    # difference matters: planned_entry filled in by an attached plan was
+    # committed to before the outcome was known, while the same column typed
+    # into the journal afterwards is a recollection. The UI labels them
+    # differently for that reason.
+    plan_id: Optional[uuid.UUID] = None
+    plan_created_at: Optional[datetime] = None
+    # Per-share, and signed so positive always means better than planned --
+    # which is the opposite arithmetic on a short. See _entry_slippage.
+    entry_slippage: Optional[float] = None
+    # True when any fill in this round trip was typed in by hand to repair a
+    # gap in the broker feed, rather than coming from IBKR.
+    has_hand_added_fills: bool = False
+
     # --- the review, from the position (closed only) ------------------
     review_status: Optional[str] = None
     trade_grade: Optional[str] = None
@@ -2132,7 +2915,34 @@ def _plan_fields(trade: Optional[Trade]) -> dict:
         "risk_amount": trade.risk_amount,
         "conviction": trade.conviction,
         "emotional_state": trade.emotional_state,
+        # Provenance, not a value: whether these numbers came from a plan
+        # written before the fill, or were typed into the journal afterwards.
+        # Both are legitimate; only one is evidence about your process.
+        "plan_id": trade.plan_id,
     }
+
+
+def _entry_slippage(
+    direction: Optional[str],
+    planned_entry: Optional[Decimal],
+    actual_entry: Optional[Decimal],
+) -> Optional[float]:
+    """Per-share difference between the fill and the plan, signed by intent.
+
+    Positive is always BETTER than planned, negative always worse -- which
+    requires knowing the side. A long filled above its planned entry paid up;
+    a short filled above its planned entry got a better price for the same
+    trade. Returning a raw subtraction would read correctly on longs and
+    backwards on every short.
+    """
+    if planned_entry is None or actual_entry is None:
+        return None
+    delta = (
+        planned_entry - actual_entry
+        if (direction or "BUY").upper() == "BUY"
+        else actual_entry - planned_entry
+    )
+    return float(delta)
 
 
 @app.get(
@@ -2165,6 +2975,22 @@ async def list_round_trips(
     fills = (await session.execute(select(PositionFill))).scalars().all()
 
     trade_by_id = {t.id: t for t in trades}
+    # When each attached plan was written. Loaded once for the whole page --
+    # it is the evidence that a plan predates its fill, which is the only
+    # thing separating a plan from a post-hoc annotation.
+    plan_created_at: dict[uuid.UUID, datetime] = {}
+    plan_ids = {t.plan_id for t in trades if t.plan_id is not None}
+    if plan_ids:
+        plan_created_at = {
+            row[0]: row[1]
+            for row in (
+                await session.execute(
+                    select(PlannedTrade.id, PlannedTrade.created_at).where(
+                        PlannedTrade.id.in_(plan_ids)
+                    )
+                )
+            ).all()
+        }
     disciplines_by_position = await _disciplines_by_position(
         session, [p.id for p in positions]
     )
@@ -2198,6 +3024,15 @@ async def list_round_trips(
             fills_by_position.get(position.id, []),
             key=lambda f: (f.executed_at, f.role),
         )
+        # Measured against the position's realised entry, which on a multi-fill
+        # entry is the average of every opening fill -- not the first one.
+        # Slippage is a property of the position you ended up with.
+        slippage = _entry_slippage(direction, plan.get("planned_entry"), entry)
+        hand_added = any(
+            (t := trade_by_id.get(f.trade_id)) is not None
+            and (t.ibkr_exec_id or "").startswith(EXEC_PREFIX_REPAIR)
+            for f in position_fills
+        )
         rows.append(
             RoundTripOut(
                 kind="closed",
@@ -2208,6 +3043,9 @@ async def list_round_trips(
                 direction=direction,
                 quantity=float(position.quantity or 0),
                 entry_price=float(entry or 0),
+                plan_created_at=plan_created_at.get(plan.get("plan_id")),
+                entry_slippage=slippage,
+                has_hand_added_fills=hand_added,
                 exit_price=float(position.exit_price) if position.exit_price is not None else None,
                 entry_time=position.entry_time,
                 exit_time=position.exit_time,
@@ -2283,6 +3121,16 @@ async def list_round_trips(
                 entry_price=float(avg_entry),
                 entry_time=opening.entry_date,
                 execution_count=len(group),
+                plan_created_at=plan_created_at.get(plan.get("plan_id")),
+                # Against the replayed cost basis, for the same reason the
+                # closed branch uses the position's entry: what you are still
+                # holding is what the plan should be judged against.
+                entry_slippage=_entry_slippage(
+                    net_direction, plan.get("planned_entry"), avg_entry
+                ),
+                has_hand_added_fills=any(
+                    (t.ibkr_exec_id or "").startswith(EXEC_PREFIX_REPAIR) for t in group
+                ),
                 planned_r_multiple=_score_r(
                     net_direction, plan.get("planned_entry") or avg_entry,
                     plan.get("target"), plan.get("stop_loss"),
