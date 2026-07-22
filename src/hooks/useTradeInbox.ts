@@ -8,7 +8,9 @@ import {
   createManualTrade,
   createStrategy,
   deleteDiscipline,
+  deletePosition,
   deleteTrade,
+  dismissPosition,
   getAdvancedMetrics,
   getDashboardAnalytics,
   getDisciplines,
@@ -19,6 +21,7 @@ import {
   getStrategies,
   getTrades,
   ingestIBKR,
+  updateExecution,
   updatePositionReview,
   updateSettings,
   updateStrategy,
@@ -30,7 +33,10 @@ import type {
   DashboardStats,
   Discipline,
   DisciplineCreatePayload,
+  ExecutionUpdatePayload,
+  ExecutionUpdateResult,
   IngestResult,
+  PositionDeleteResult,
   ManualTradePayload,
   ManualTradeResult,
   Position,
@@ -287,6 +293,57 @@ export function useDeleteTrade() {
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
       queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
       queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+    },
+  });
+}
+
+/**
+ * Everything a correction can move, invalidated together.
+ *
+ * Editing or removing one fill re-runs FIFO for its ticker, which can dissolve
+ * or create round trips — so P&L, R-multiples and the review queue all shift,
+ * not just the row that was touched.
+ */
+function invalidateLedger(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+  queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+  queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+  queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+  queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+}
+
+/** Correct the facts of a fill — quantity, price, side or time. */
+export function useUpdateExecution() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    ExecutionUpdateResult,
+    Error,
+    { id: string; payload: ExecutionUpdatePayload }
+  >({
+    mutationFn: ({ id, payload }) => updateExecution(id, payload),
+    onSuccess: () => invalidateLedger(queryClient),
+  });
+}
+
+/** Remove a round trip and the executions under it — for a trade that never happened. */
+export function useDeletePosition() {
+  const queryClient = useQueryClient();
+  return useMutation<PositionDeleteResult, Error, { id: string; reason?: string }>({
+    mutationFn: ({ id, reason }) => deletePosition(id, reason),
+    onSuccess: () => invalidateLedger(queryClient),
+  });
+}
+
+/** Take a round trip out of the queue without reviewing it. Keeps the P&L. */
+export function useDismissPosition() {
+  const queryClient = useQueryClient();
+  return useMutation<Position, Error, string>({
+    mutationFn: dismissPosition,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+      // The round trip itself is unchanged, but its review_status drives the
+      // badge the ledger renders.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
     },
   });
 }

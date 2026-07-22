@@ -16,6 +16,11 @@ import type { TradeSide } from '@/types/api';
 interface ManualTradeModalProps {
   open: boolean;
   onClose: () => void;
+  /**
+   * Ticker to open with, when adding a missing fill to a position that already
+   * exists. Still editable — the symbol is a starting point, not a lock.
+   */
+  presetSymbol?: string;
 }
 
 /**
@@ -117,7 +122,11 @@ const money = (n: number) =>
  */
 const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
 
-export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
+export function ManualTradeModal({
+  open,
+  onClose,
+  presetSymbol,
+}: ManualTradeModalProps) {
   const [form, setForm] = useState<FormState>(blankForm);
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
@@ -137,13 +146,13 @@ export function ManualTradeModal({ open, onClose }: ManualTradeModalProps) {
   // Reset to a clean form (with a fresh timestamp) each time it opens.
   useEffect(() => {
     if (open) {
-      setForm(blankForm());
+      setForm({ ...blankForm(), symbol: (presetSymbol ?? '').toUpperCase() });
       setError(null);
       setSavedSummary(null);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
     }
-  }, [open]);
+  }, [open, presetSymbol]);
 
   // Seed the per-trade risk from the saved default once settings arrive.
   // Guarded on the field being untouched, because settings can resolve after

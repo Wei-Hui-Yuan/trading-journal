@@ -267,6 +267,58 @@ export interface ManualTradePayload {
 }
 
 // ---------------------------------------------------------------------------
+// Correcting the execution ledger
+// ---------------------------------------------------------------------------
+
+/**
+ * Body for PATCH /api/trades/{id}/execution — the facts of a fill.
+ *
+ * Distinct from `TradeAnnotationPayload`, which records what you *thought* and
+ * deliberately locks these fields. Changing a quantity re-runs FIFO and can
+ * dissolve or create round trips; no annotation ever does that.
+ */
+export interface ExecutionUpdatePayload {
+  direction?: TradeSide;
+  quantity?: number;
+  price?: number;
+  /** Naive local string; the backend anchors it to America/New_York. */
+  execution_time?: string | null;
+}
+
+export interface ExecutionUpdateResult {
+  trade_id: string;
+  ticker: string;
+  direction: TradeSide;
+  quantity: number;
+  price: number;
+  execution_time: string;
+  /** Null while the fill is untouched since it arrived. */
+  edited_at: string | null;
+  /**
+   * What IBKR originally reported, captured on the first edit and never
+   * overwritten. Null on manual entries, which had no broker value.
+   */
+  broker_original: {
+    direction?: string;
+    quantity?: string;
+    price?: string;
+    execution_time?: string | null;
+  } | null;
+  positions_removed: number;
+  positions_rebuilt: number;
+  reviews_discarded: number;
+}
+
+/** Result of DELETE /api/positions/{id} — removes the executions underneath. */
+export interface PositionDeleteResult {
+  position_id: string;
+  ticker: string;
+  executions_deleted: number;
+  positions_rebuilt: number;
+  suppressed_from_future_syncs: number;
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -391,6 +443,12 @@ export interface TradeDeleteResult {
   positions_removed: number;
   positions_rebuilt: number;
   reviews_discarded: number;
+  /**
+   * True when a tombstone was written — this was a broker fill and the next
+   * sync will not bring it back. False for manual entries, which no sync would
+   * re-send anyway.
+   */
+  suppressed_from_future_syncs?: boolean;
 }
 
 /** Body for PATCH /api/trades/{id}. Only present keys are applied. */

@@ -5,6 +5,9 @@ import type {
   AppSettings,
   AppSettingsPayload,
   DashboardStats,
+  ExecutionUpdatePayload,
+  ExecutionUpdateResult,
+  PositionDeleteResult,
   Discipline,
   DisciplineCreatePayload,
   IngestResult,
@@ -211,6 +214,46 @@ export async function createStrategy(
   payload: StrategyCreatePayload
 ): Promise<Strategy> {
   const { data } = await apiClient.post<Strategy>('/strategies', payload);
+  return data;
+}
+
+/**
+ * PATCH /api/trades/{id}/execution - correct the facts of a fill.
+ *
+ * Separate from annotateTrade, which locks these fields. The backend re-runs
+ * FIFO afterwards, so the response reports what that rebuild removed.
+ */
+export async function updateExecution(
+  id: string,
+  payload: ExecutionUpdatePayload
+): Promise<ExecutionUpdateResult> {
+  const { data } = await apiClient.patch<ExecutionUpdateResult>(
+    `/trades/${id}/execution`,
+    payload
+  );
+  return data;
+}
+
+/**
+ * DELETE /api/positions/{id} - remove a round trip AND its executions.
+ *
+ * For a trade that never happened. Broker fills are tombstoned so the next
+ * sync cannot re-add them.
+ */
+export async function deletePosition(
+  id: string,
+  reason?: string
+): Promise<PositionDeleteResult> {
+  const { data } = await apiClient.delete<PositionDeleteResult>(
+    `/positions/${id}`,
+    { params: reason ? { reason } : undefined }
+  );
+  return data;
+}
+
+/** POST /api/positions/{id}/dismiss - leave the queue, keep the P&L. */
+export async function dismissPosition(id: string): Promise<Position> {
+  const { data } = await apiClient.post<Position>(`/positions/${id}/dismiss`);
   return data;
 }
 

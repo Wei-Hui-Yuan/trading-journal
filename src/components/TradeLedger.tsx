@@ -8,8 +8,11 @@ import {
   ChevronRight,
   Loader2,
   NotebookPen,
+  Pencil,
+  Plus,
   Search,
   Trash2,
+  X,
 } from 'lucide-react';
 
 import {
@@ -18,8 +21,10 @@ import {
   useReviewPosition,
   useRoundTrips,
   useStrategies,
+  useUpdateExecution,
 } from '@/hooks/useTradeInbox';
-import type { RoundTrip } from '@/types/api';
+import type { PositionFill, RoundTrip, TradeSide } from '@/types/api';
+import { ManualTradeModal } from './ManualTradeModal';
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
   year: 'numeric',
@@ -34,6 +39,65 @@ const dateFormatter = new Intl.DateTimeFormat('en-US', {
 /** Trailing zeros on a fractional size are noise; 0.25 should read as 0.25. */
 function formatQuantity(quantity: number): string {
   return Number(quantity.toFixed(8)).toString();
+}
+
+/** In-progress correction to one fill. Strings, so "empty" is representable. */
+interface ExecutionDraft {
+  direction: TradeSide;
+  quantity: string;
+  price: string;
+  executedAt: string; // datetime-local, US market time
+}
+
+const BLANK_EXECUTION: ExecutionDraft = {
+  direction: 'BUY',
+  quantity: '',
+  price: '',
+  executedAt: '',
+};
+
+/**
+ * An ISO instant as a datetime-local value in US market time.
+ *
+ * The field must round-trip: the backend reads a bare timestamp as
+ * America/New_York, so rendering it in browser-local time would shift every
+ * fill the moment it was saved from outside ET.
+ */
+function toMarketDateTimeLocal(iso: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date(iso));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '00';
+  const hour = get('hour') === '24' ? '00' : get('hour');
+  return `${get('year')}-${get('month')}-${get('day')}T${hour}:${get('minute')}`;
+}
+
+/**
+ * The side a fill actually was.
+ *
+ * `PositionFill` carries a role, not a direction: OPEN means "moved into the
+ * position", which is a BUY on a long and a SELL on a short. Deriving it keeps
+ * one source of truth rather than storing the same fact twice.
+ */
+function fillDirection(role: string, tradeDirection: string): TradeSide {
+  const entry = (tradeDirection || 'BUY').toUpperCase() === 'BUY' ? 'BUY' : 'SELL';
+  if (role === 'OPEN') return entry;
+  return entry === 'BUY' ? 'SELL' : 'BUY';
+}
+
+function draftFromFill(fill: PositionFill, tradeDirection: string): ExecutionDraft {
+  return {
+    direction: fillDirection(fill.role, tradeDirection),
+    quantity: formatQuantity(fill.quantity),
+    price: String(fill.price),
+    executedAt: toMarketDateTimeLocal(fill.executed_at),
+  };
 }
 
 /** Empty means "not recorded" and must reach the API as null, never as 0. */
@@ -181,6 +245,7 @@ export const TradeLedger: React.FC = () => {
   const annotate = useAnnotateTrade();
   const review = useReviewPosition();
   const deleteTradeMutation = useDeleteTrade();
+  const updateExecutionMutation = useUpdateExecution();
   // What a deletion actually did. Surfaced because the side effects reach
   // beyond the row that was clicked.
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
@@ -188,6 +253,13 @@ export const TradeLedger: React.FC = () => {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
+  // Which fill is being corrected, and the in-progress values. Kept as strings
+  // for the same reason the manual form does: a controlled number input has to
+  // represent "empty" and mid-typing states that Number() would mangle.
+  const [editingFillId, setEditingFillId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<ExecutionDraft>(BLANK_EXECUTION);
+  // Ticker to prefill the Add-fill form with, or null when it is closed.
+  const [addingFor, setAddingFor] = useState<string | null>(null);
   const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
   const [reviewDrafts, setReviewDrafts] = useState<Record<string, ReviewDraft>>({});
 
@@ -589,7 +661,123 @@ export const TradeLedger: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="font-mono text-slate-300">
-                            {rt.fills.map((f) => (
+                            {rt.fills.map((f) =>
+                              editingFillId === f.id ? (
+                                <tr
+                                  key={f.id}
+                                  className="border-t border-obsidian-border/60 bg-obsidian-bg/40"
+                                >
+                                  <td className="py-1.5 pr-2">
+                                    <select
+                                      value={editDraft.direction}
+                                      onChange={(e) =>
+                                        setEditDraft({
+                                          ...editDraft,
+                                          direction: e.target.value as TradeSide,
+                                        })
+                                      }
+                                      className="w-full rounded border border-obsidian-border bg-obsidian-bg px-1 py-0.5 text-[10px] text-slate-200"
+                                    >
+                                      <option value="BUY">BUY</option>
+                                      <option value="SELL">SELL</option>
+                                    </select>
+                                  </td>
+                                  <td className="py-1.5 pr-2">
+                                    <input
+                                      type="number"
+                                      step="0.00000001"
+                                      min="0"
+                                      value={editDraft.quantity}
+                                      onChange={(e) =>
+                                        setEditDraft({ ...editDraft, quantity: e.target.value })
+                                      }
+                                      className="w-20 rounded border border-obsidian-border bg-obsidian-bg px-1 py-0.5 text-[11px] text-slate-200"
+                                    />
+                                  </td>
+                                  <td className="py-1.5 pr-2">
+                                    <input
+                                      type="number"
+                                      step="0.0001"
+                                      min="0"
+                                      value={editDraft.price}
+                                      onChange={(e) =>
+                                        setEditDraft({ ...editDraft, price: e.target.value })
+                                      }
+                                      className="w-24 rounded border border-obsidian-border bg-obsidian-bg px-1 py-0.5 text-[11px] text-slate-200"
+                                    />
+                                  </td>
+                                  <td className="py-1.5 pr-2">
+                                    <input
+                                      type="datetime-local"
+                                      value={editDraft.executedAt}
+                                      onChange={(e) =>
+                                        setEditDraft({ ...editDraft, executedAt: e.target.value })
+                                      }
+                                      className="rounded border border-obsidian-border bg-obsidian-bg px-1 py-0.5 text-[10px] text-slate-200"
+                                    />
+                                  </td>
+                                  <td className="py-1.5 text-right">
+                                    <div className="inline-flex gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const quantity = Number(editDraft.quantity);
+                                          const price = Number(editDraft.price);
+                                          if (!Number.isFinite(quantity) || quantity <= 0) {
+                                            setDeleteNotice('Quantity must be greater than zero.');
+                                            return;
+                                          }
+                                          if (!Number.isFinite(price) || price <= 0) {
+                                            setDeleteNotice('Price must be greater than zero.');
+                                            return;
+                                          }
+                                          updateExecutionMutation.mutate(
+                                            {
+                                              id: f.trade_id,
+                                              payload: {
+                                                direction: editDraft.direction,
+                                                quantity,
+                                                price,
+                                                // Sent bare; the backend anchors
+                                                // it to America/New_York.
+                                                execution_time: editDraft.executedAt
+                                                  ? `${editDraft.executedAt}:00`
+                                                  : undefined,
+                                              },
+                                            },
+                                            {
+                                              onSuccess: (result) => {
+                                                setEditingFillId(null);
+                                                setDeleteNotice(
+                                                  `${result.ticker}: fill corrected. ` +
+                                                    `${result.positions_removed} round trip(s) rebuilt as ${result.positions_rebuilt}` +
+                                                    (result.reviews_discarded > 0
+                                                      ? `, ${result.reviews_discarded} review(s) discarded.`
+                                                      : '.')
+                                                );
+                                              },
+                                              onError: (err) => setDeleteNotice(err.message),
+                                            }
+                                          );
+                                        }}
+                                        disabled={updateExecutionMutation.isPending}
+                                        className="rounded bg-win-glow px-2 py-0.5 text-[10px] text-win border border-win-border hover:bg-win/20 transition-colors disabled:opacity-50 font-sans"
+                                      >
+                                        {updateExecutionMutation.isPending ? 'Saving…' : 'Save'}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingFillId(null)}
+                                        disabled={updateExecutionMutation.isPending}
+                                        aria-label="Cancel edit"
+                                        className="rounded border border-obsidian-border px-1.5 py-0.5 text-obsidian-muted hover:text-slate-200 transition-colors disabled:opacity-50"
+                                      >
+                                        <X className="h-3 w-3" />
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              ) : (
                               <tr key={f.id} className="border-t border-obsidian-border/60">
                                 <td className="py-1.5">
                                   <span
@@ -606,6 +794,20 @@ export const TradeLedger: React.FC = () => {
                                   {dateFormatter.format(new Date(f.executed_at))}
                                 </td>
                                 <td className="py-1.5 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingFillId(f.id);
+                                      setEditDraft(draftFromFill(f, rt.direction));
+                                      setDeleteNotice(null);
+                                    }}
+                                    disabled={updateExecutionMutation.isPending}
+                                    className="mr-1 inline-flex items-center gap-1 rounded border border-obsidian-border px-2 py-0.5 text-[10px] text-obsidian-muted hover:text-slate-200 hover:border-slate-600 transition-colors disabled:opacity-50 font-sans"
+                                    title="Correct this fill"
+                                  >
+                                    <Pencil className="h-3 w-3" />
+                                    <span>Edit</span>
+                                  </button>
                                   <button
                                     type="button"
                                     onClick={() => {
@@ -646,10 +848,24 @@ export const TradeLedger: React.FC = () => {
                                   </button>
                                 </td>
                               </tr>
-                            ))}
+                              )
+                            )}
                           </tbody>
                         </table>
                       </div>
+
+                      {/* A missing fill is corrected by adding it to the
+                          ticker, not to this round trip: positions are derived
+                          from executions, so FIFO decides which trip it joins.
+                          Reuses the manual form, calculator and all. */}
+                      <button
+                        type="button"
+                        onClick={() => setAddingFor(rt.symbol)}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-obsidian-border bg-obsidian-bg px-2.5 py-1 text-[10px] text-obsidian-muted hover:text-slate-200 hover:border-slate-600 transition-colors"
+                      >
+                        <Plus className="h-3 w-3" />
+                        Add a missing {rt.symbol} fill
+                      </button>
                     </section>
 
                     {/* ---------------- THE REVIEW ---------------- */}
@@ -810,6 +1026,14 @@ export const TradeLedger: React.FC = () => {
           })}
         </div>
       )}
+
+      {/* Prefilled with the ticker whose Add button was pressed. Mounted once
+          at the root rather than per row, so only one can ever be open. */}
+      <ManualTradeModal
+        open={addingFor !== null}
+        presetSymbol={addingFor ?? undefined}
+        onClose={() => setAddingFor(null)}
+      />
     </div>
   );
 };

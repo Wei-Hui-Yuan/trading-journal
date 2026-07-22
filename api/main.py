@@ -29,7 +29,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from asyncpg.exceptions import UndefinedTableError
 from sqlalchemy.exc import IntegrityError, ProgrammingError
@@ -170,6 +170,26 @@ class AppSetting(Base):
     )
 
 
+class SuppressedExecution(Base):
+    """A broker fill the user deleted on purpose (migration 016).
+
+    Ingest is idempotent through ON CONFLICT DO NOTHING, which skips rows that
+    still exist -- a deleted row does not, so the next sync would re-insert it
+    and the delete would silently undo itself. This is the tombstone that makes
+    a deletion permanent.
+
+    Keyed by the broker id rather than a foreign key precisely because the row
+    it names is gone; a FK would cascade away with it and suppress nothing.
+    """
+
+    __tablename__ = "suppressed_executions"
+
+    ibkr_exec_id = Column(Text, primary_key=True)
+    ticker = Column(Text, nullable=True)
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Trade(Base):
     __tablename__ = "trades"
 
@@ -196,6 +216,12 @@ class Trade(Base):
     risk_percent = Column(Numeric(6, 2), default=1.00)
     # The absolute figure, which is what turns an R-multiple back into money.
     risk_amount = Column(Numeric(12, 2), nullable=True)
+    # Provenance for hand-corrected fills (migration 016). NULL edited_at means
+    # untouched since it arrived. broker_original snapshots what the broker
+    # said before the FIRST edit and is never overwritten, so a second edit
+    # cannot quietly replace the original with the first edit's values.
+    edited_at = Column(DateTime(timezone=True), nullable=True)
+    broker_original = Column(JSONB, nullable=True)
     strategy_id = Column(
         UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
     )
@@ -465,6 +491,10 @@ class IngestResult(BaseModel):
     # generation per token, and its cooldown outlasts a request. Reported
     # rather than swallowed so a partial sync never looks like a full one.
     queries_failed: list[str] = []
+    # Fills the broker re-sent that the user had deliberately deleted. Surfaced
+    # rather than silently dropped: a number that keeps climbing means the Flex
+    # query is still returning something the journal does not want.
+    suppressed_skipped: int = 0
 
 
 @app.post(
@@ -556,6 +586,19 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         if e.price is not None
     ]
 
+    # Fills the user has deleted on purpose. ON CONFLICT DO NOTHING cannot
+    # express this: it skips rows that still EXIST, and a deleted row does not,
+    # so without this filter every sync would resurrect what was just removed
+    # and the delete button would silently undo itself.
+    suppressed = set(
+        (await session.execute(select(SuppressedExecution.ibkr_exec_id))).scalars().all()
+    )
+    resurrected = 0
+    if suppressed:
+        before = len(trade_rows)
+        trade_rows = [r for r in trade_rows if r["ibkr_exec_id"] not in suppressed]
+        resurrected = before - len(trade_rows)
+
     created_ids: list[str] = []
     if trade_rows:
         trade_stmt = (
@@ -593,6 +636,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         symbols_touched=symbols,
         skipped_non_tradeable=skipped_non_tradeable,
         queries_failed=query_failures,
+        suppressed_skipped=resurrected,
     )
 
 
@@ -1403,6 +1447,154 @@ async def annotate_trade(
     )
 
 
+class ExecutionUpdate(BaseModel):
+    """Correct the facts of a fill: what, how much, at what price, when.
+
+    Separate from TradeAnnotationUpdate, which deliberately locks these fields.
+    Annotation records what you THOUGHT; this records what HAPPENED, and the
+    two have different consequences -- changing a quantity re-runs FIFO and can
+    dissolve or create round trips, which no annotation ever does.
+    """
+
+    direction: Optional[str] = None
+    quantity: Optional[float] = Field(None, gt=0)
+    price: Optional[float] = Field(None, gt=0)  # -> trades.actual_entry
+    execution_time: Optional[datetime] = None
+
+    @field_validator("direction")
+    @classmethod
+    def _valid_side(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        side = value.strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("direction must be 'BUY' or 'SELL'")
+        return side
+
+
+class ExecutionUpdateResult(BaseModel):
+    trade_id: uuid.UUID
+    ticker: str
+    direction: str
+    quantity: float
+    price: float
+    execution_time: datetime
+    edited_at: Optional[datetime]
+    # What the broker originally reported, once this fill has been edited.
+    # Null on untouched rows and on manual entries, which had no broker value.
+    broker_original: Optional[dict] = None
+    positions_removed: int
+    positions_rebuilt: int
+    reviews_discarded: int
+
+
+@app.patch(
+    "/api/trades/{trade_id}/execution",
+    response_model=ExecutionUpdateResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_execution(
+    trade_id: uuid.UUID,
+    params: ExecutionUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Correct a fill, then rebuild every round trip that depended on it.
+
+    Editing quantity, price, side or time changes what FIFO matches, so the
+    same care delete_trade takes is required here: positions built from this
+    fill assert a size and a realised P&L derived from its old values, and
+    leaving them in place would let analytics keep reporting figures no
+    execution supports.
+
+    The first edit snapshots the broker's values into `broker_original`. That
+    is what keeps the ledger reconcilable after it stops agreeing with IBKR --
+    without it, a hand-corrected fill is indistinguishable from a broker one
+    and the next reconciliation silently "finds" a discrepancy it cannot
+    explain.
+    """
+    from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        run_matching_for_ticker,
+    )
+
+    trade = await session.get(Trade, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    changes = params.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="No fields to update.")
+
+    ticker = trade.ticker
+
+    # Snapshot once, before the first mutation. Re-snapshotting on a later edit
+    # would overwrite the broker's figures with the previous edit's and destroy
+    # the only copy of what actually arrived.
+    if trade.broker_original is None and trade.source_tag == "IBKR":
+        trade.broker_original = {
+            "direction": trade.direction,
+            "quantity": str(trade.quantity),
+            "price": str(trade.actual_entry),
+            "execution_time": trade.entry_date.isoformat() if trade.entry_date else None,
+        }
+
+    if "direction" in changes:
+        trade.direction = changes["direction"]
+    if "quantity" in changes:
+        trade.quantity = Decimal(str(changes["quantity"]))
+    if "price" in changes:
+        trade.actual_entry = Decimal(str(changes["price"]))
+    if "execution_time" in changes:
+        when = changes["execution_time"]
+        if when is not None and when.tzinfo is None:
+            # datetime-local inputs arrive bare; anchor to market time, exactly
+            # as manual entry does, or the heatmap buckets them by the server's
+            # timezone instead.
+            when = when.replace(tzinfo=MARKET_TZ)
+        trade.entry_date = when
+
+    trade.edited_at = datetime.now(MARKET_TZ)
+
+    # Same reasoning as delete_trade: captured before the rebuild, because
+    # position_fills.trade_id cascades and the link is about to disappear.
+    affected_ids = list(set((
+        await session.execute(
+            select(PositionFill.position_id).where(PositionFill.trade_id == trade_id)
+        )
+    ).scalars().all()))
+
+    reviews_discarded = 0
+    if affected_ids:
+        affected = (
+            await session.execute(select(Position).where(Position.id.in_(affected_ids)))
+        ).scalars().all()
+        reviews_discarded = sum(
+            1
+            for p in affected
+            if p.review_status == ReviewStatus.reviewed.value
+            or any((p.review_went_well, p.review_went_wrong, p.review_lessons, p.notes))
+        )
+        await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
+
+    await session.commit()
+
+    result = await run_matching_for_ticker(session, ticker, persist=True)
+    await session.refresh(trade)
+
+    return ExecutionUpdateResult(
+        trade_id=trade.id,
+        ticker=trade.ticker,
+        direction=trade.direction,
+        quantity=float(trade.quantity),
+        price=float(trade.actual_entry),
+        execution_time=trade.entry_date,
+        edited_at=trade.edited_at,
+        broker_original=trade.broker_original,
+        positions_removed=len(affected_ids),
+        positions_rebuilt=len(result.positions),
+        reviews_discarded=reviews_discarded,
+    )
+
+
 class TradeDeleteResult(BaseModel):
     """What a deletion actually did, beyond removing one row.
 
@@ -1417,6 +1609,10 @@ class TradeDeleteResult(BaseModel):
     positions_removed: int
     positions_rebuilt: int
     reviews_discarded: int
+    # True when a tombstone was written, i.e. this was a broker fill and the
+    # next sync will not bring it back. False for manual entries, which no
+    # sync would re-send anyway.
+    suppressed_from_future_syncs: bool = False
 
 
 @app.delete(
@@ -1426,6 +1622,7 @@ class TradeDeleteResult(BaseModel):
 )
 async def delete_trade(
     trade_id: uuid.UUID,
+    reason: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
 ):
     """Remove an execution, then rebuild every round trip it belonged to.
@@ -1482,6 +1679,25 @@ async def delete_trade(
         # position_fills.position_id cascades, so the fills go with them.
         await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
 
+    # Tombstone broker fills so the next sync does not resurrect them. Manual
+    # entries are skipped: their MANUAL-<uuid> key is generated fresh each time
+    # and no sync will ever re-send it, so suppressing it would only grow a
+    # table nothing reads.
+    suppressed = False
+    if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith("IBKR-"):
+        await session.execute(
+            pg_insert(SuppressedExecution)
+            .values(
+                ibkr_exec_id=trade.ibkr_exec_id,
+                ticker=ticker,
+                reason=reason or "Deleted from the journal",
+            )
+            # Deleting the same broker id twice is not an error; it is the user
+            # being thorough after a sync re-sent something.
+            .on_conflict_do_nothing(index_elements=["ibkr_exec_id"])
+        )
+        suppressed = True
+
     await session.delete(trade)
     await session.commit()
 
@@ -1495,7 +1711,129 @@ async def delete_trade(
         positions_removed=len(affected_ids),
         positions_rebuilt=len(result.positions),
         reviews_discarded=reviews_discarded,
+        suppressed_from_future_syncs=suppressed,
     )
+
+
+class PositionDeleteResult(BaseModel):
+    """What removing a round trip actually removed.
+
+    Deleting a position means deleting the executions underneath it, so the
+    count of fills is reported: this is a bigger action than dismissing, and
+    the response should say so rather than let it look like a queue operation.
+    """
+
+    position_id: uuid.UUID
+    ticker: str
+    executions_deleted: int
+    positions_rebuilt: int
+    suppressed_from_future_syncs: int
+
+
+@app.delete(
+    "/api/positions/{position_id}",
+    response_model=PositionDeleteResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_position(
+    position_id: uuid.UUID,
+    reason: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a round trip AND the executions it was built from.
+
+    The distinction from dismissing matters. A position is derived data -- it
+    exists because two fills paired off -- so deleting the position alone would
+    leave those fills behind for the next rebuild to pair up again, and the row
+    would silently return. Removing the executions is the only deletion that
+    holds.
+
+    That is what this is for: a round trip that never happened, such as the
+    phantom CAT and UNH trades a duplicate sync invented. For a real trade you
+    simply do not want to review, dismiss it instead and keep the P&L.
+
+    Broker fills are tombstoned on the way out so the sync cannot re-add them.
+    """
+    from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        run_matching_for_ticker,
+    )
+
+    position = await session.get(Position, position_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    ticker = position.symbol
+    trade_ids = list(set((
+        await session.execute(
+            select(PositionFill.trade_id).where(PositionFill.position_id == position_id)
+        )
+    ).scalars().all()))
+
+    suppressed = 0
+    if trade_ids:
+        trades = (
+            await session.execute(select(Trade).where(Trade.id.in_(trade_ids)))
+        ).scalars().all()
+        for trade in trades:
+            if trade.ibkr_exec_id and trade.ibkr_exec_id.startswith("IBKR-"):
+                await session.execute(
+                    pg_insert(SuppressedExecution)
+                    .values(
+                        ibkr_exec_id=trade.ibkr_exec_id,
+                        ticker=ticker,
+                        reason=reason or "Round trip deleted from the inbox",
+                    )
+                    .on_conflict_do_nothing(index_elements=["ibkr_exec_id"])
+                )
+                suppressed += 1
+
+    # The position goes first; position_fills cascades from both sides, and
+    # deleting the trades while fills still referenced the position would leave
+    # it asserting a size its executions no longer support.
+    await session.delete(position)
+    if trade_ids:
+        await session.execute(delete(Trade).where(Trade.id.in_(trade_ids)))
+    await session.commit()
+
+    # Other round trips on this ticker are untouched by the rebuild; matching
+    # is idempotent on the open/close pair.
+    result = await run_matching_for_ticker(session, ticker, persist=True)
+
+    return PositionDeleteResult(
+        position_id=position_id,
+        ticker=ticker,
+        executions_deleted=len(trade_ids),
+        positions_rebuilt=len(result.positions),
+        suppressed_from_future_syncs=suppressed,
+    )
+
+
+@app.post(
+    "/api/positions/{position_id}/dismiss",
+    response_model=PositionOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def dismiss_position(
+    position_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Take a round trip out of the review queue without reviewing it.
+
+    Deliberately distinct from deleting. The trade happened, its P&L is real
+    and stays in every analytic; the user simply has nothing to write about it.
+    Marking it reviewed is what empties the queue, and leaving the review
+    fields empty is what keeps it out of discipline and grade breakdowns --
+    absence of an answer is not the same as a bad answer, which is the same
+    distinction position_disciplines was built on.
+    """
+    position = await session.get(Position, position_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    position.review_status = ReviewStatus.reviewed.value
+    await session.commit()
+    await session.refresh(position)
+    return await _position_out(session, position)
 
 
 @app.get(

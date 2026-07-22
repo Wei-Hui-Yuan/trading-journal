@@ -7,6 +7,7 @@ import {
   ArrowUpRight,
   CheckCircle2,
   ChevronRight,
+  EyeOff,
   Inbox,
   Loader2,
   Plus,
@@ -17,7 +18,9 @@ import {
 import {
   useCreateDiscipline,
   useDeleteDiscipline,
+  useDeletePosition,
   useDisciplines,
+  useDismissPosition,
   usePendingPositions,
   useReviewPosition,
   useStrategies,
@@ -79,6 +82,12 @@ export function TradeInboxQueue() {
   const createDisciplineMutation = useCreateDiscipline();
   const deleteDisciplineMutation = useDeleteDiscipline();
   const reviewMutation = useReviewPosition();
+  const deletePositionMutation = useDeletePosition();
+  const dismissMutation = useDismissPosition();
+  // Outcome of a dismiss or delete. Both reach beyond the card that was
+  // clicked -- delete rebuilds the ticker's round trips -- so what happened is
+  // reported rather than left to be inferred from a changed total.
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // Drafts are keyed by position id so each card edits independently.
   const [drafts, setDrafts] = useState<Record<string, ReviewDraft>>({});
@@ -168,6 +177,20 @@ export function TradeInboxQueue() {
           TRADE INBOX
         </h2>
       </div>
+      {actionNotice && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-obsidian-border bg-obsidian-bg/60 px-3 py-2 text-[11px] text-slate-300">
+          <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0 text-obsidian-muted" />
+          <span className="flex-1">{actionNotice}</span>
+          <button
+            type="button"
+            onClick={() => setActionNotice(null)}
+            aria-label="Dismiss message"
+            className="text-obsidian-muted hover:text-slate-200"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
       {children}
     </div>
   );
@@ -525,7 +548,74 @@ export function TradeInboxQueue() {
               </div>
             )}
 
-            <div className="mt-4 flex justify-end">
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              {/* Two ways out that are not a review, and they are not the
+                  same. Dismiss is for a real trade you have nothing to write
+                  about -- the P&L stays in every analytic. Delete is for a
+                  round trip that never happened, such as one a duplicate sync
+                  invented, and removes the executions underneath it. */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Delete this ${position.symbol} round trip?\n\n` +
+                        `This removes the underlying executions and rebuilds ${position.symbol}'s ` +
+                        `round trips, and its P&L of ${
+                          position.realized_pnl === null
+                            ? 'n/a'
+                            : `$${position.realized_pnl.toFixed(2)}`
+                        } leaves your analytics.\n\n` +
+                        `Broker fills are also suppressed so the next sync cannot re-add them. ` +
+                        `Use this only if the trade never happened — to keep the P&L and just ` +
+                        `clear the queue, choose Dismiss instead.`
+                    )
+                  ) {
+                    deletePositionMutation.mutate(
+                      { id: position.id, reason: 'Deleted from the Trade Inbox' },
+                      {
+                        onSuccess: (result) =>
+                          setActionNotice(
+                            `${result.ticker}: removed, ${result.executions_deleted} execution(s) deleted` +
+                              (result.suppressed_from_future_syncs > 0
+                                ? `, ${result.suppressed_from_future_syncs} suppressed from future syncs.`
+                                : '.')
+                          ),
+                        onError: (err) => setActionNotice(err.message),
+                      }
+                    );
+                  }
+                }}
+                disabled={isSubmitting || deletePositionMutation.isPending || dismissMutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-loss/30 bg-loss/10 px-3 py-2 text-xs font-medium text-loss transition-colors hover:bg-loss/20 disabled:opacity-60"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete Trade
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  dismissMutation.mutate(position.id, {
+                    onSuccess: () =>
+                      setActionNotice(
+                        `${position.symbol} dismissed — it keeps its P&L and leaves the queue.`
+                      ),
+                    onError: (err) => setActionNotice(err.message),
+                  })
+                }
+                disabled={isSubmitting || dismissMutation.isPending || deletePositionMutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs font-medium text-obsidian-muted transition-colors hover:text-slate-200 hover:border-slate-600 disabled:opacity-60"
+                title="Leave the queue without writing a review. The trade and its P&L are kept."
+              >
+                {dismissMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <EyeOff className="h-3.5 w-3.5" />
+                )}
+                Dismiss
+              </button>
+
               <button
                 type="button"
                 onClick={() => handleSubmit(position)}
