@@ -1227,10 +1227,23 @@ class PlanUpdate(BaseModel):
     @field_validator("status")
     @classmethod
     def _valid_status(cls, value: Optional[str]) -> Optional[str]:
+        """Only the two statuses a client may actually choose.
+
+        ATTACHED is deliberately absent: it is reached by attaching to a real
+        fill, never by assertion, or a plan could claim a trade that does not
+        point back at it. Refused here rather than at the endpoint so the
+        message names the reason instead of failing a CHECK constraint.
+        """
         if value is None:
             return None
         status = value.strip().upper()
-        if status not in {PLAN_OPEN, PLAN_ATTACHED, PLAN_CANCELLED}:
+        settable = {PLAN_OPEN, PLAN_CANCELLED}
+        if status not in settable:
+            if status == PLAN_ATTACHED:
+                raise ValueError(
+                    "attach a plan to a trade instead of setting its status to "
+                    f"{PLAN_ATTACHED}"
+                )
             raise ValueError(f"status must be one of {PLAN_OPEN}, {PLAN_CANCELLED}")
         return status
 

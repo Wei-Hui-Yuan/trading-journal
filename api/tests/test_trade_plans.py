@@ -350,9 +350,14 @@ def test_plans_attached_defaults_to_zero():
 def test_a_plan_cannot_be_talked_into_attached_status():
     """ATTACHED is reached by attaching to a real fill, never by assertion --
     otherwise a plan could claim a trade that does not point back at it."""
-    assert main.PlanUpdate(status="attached").status == main.PLAN_ATTACHED
-    # The validator normalises it; the endpoint is what refuses it. Both exist
-    # so the refusal is a 422 naming the reason rather than a silent write.
+    with pytest.raises(ValidationError, match="attach a plan to a trade"):
+        main.PlanUpdate(status="attached")
+
+
+def test_the_two_settable_statuses_are_accepted():
+    """Cancelling and re-opening are the client's to choose."""
+    assert main.PlanUpdate(status="cancelled").status == main.PLAN_CANCELLED
+    assert main.PlanUpdate(status="open").status == main.PLAN_OPEN
 
 
 def test_an_unknown_status_is_refused_at_the_edge():
