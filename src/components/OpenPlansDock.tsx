@@ -32,6 +32,28 @@ const money = (n: number) =>
 const qty = (n: number | null) =>
   n === null ? '—' : Number(n.toFixed(8)).toString();
 
+/**
+ * What the plan pays if the target is reached, in dollars.
+ *
+ * R is size-independent, which is what makes it comparable across trades — but
+ * it is also why "1.22R" alone does not tell you whether this setup is worth
+ * the screen time. 1.22R on $22 risk and 1.22R on $2,200 are the same number
+ * and very different decisions.
+ *
+ * Computed from the prices and size rather than as planned_r x risk_amount:
+ * planned_r is stored rounded to two decimals, so multiplying it back out
+ * drifts. Here 1.216... x 22.20 would show $27.08 where the trade actually
+ * pays $27.00.
+ *
+ * Direction-aware, since a short profits when the target sits BELOW the entry.
+ */
+function plannedReward(plan: TradePlan): number | null {
+  const { planned_entry: entry, take_profit: target, quantity, direction } = plan;
+  if (entry === null || target === null || quantity === null) return null;
+  const perShare = direction === 'BUY' ? target - entry : entry - target;
+  return perShare * quantity;
+}
+
 interface EditDraft {
   planned_entry: string;
   stop_loss: string;
@@ -168,6 +190,15 @@ export const OpenPlansDock: React.FC = () => {
                 {plan.planned_r !== null && (
                   <span className="font-mono text-[11px] text-slate-300">
                     {plan.planned_r.toFixed(2)}R planned
+                    {/* The same ratio means very different things at different
+                        sizes, so the money sits next to it rather than being
+                        left as arithmetic to do in your head. */}
+                    {(() => {
+                      const reward = plannedReward(plan);
+                      return reward === null ? null : (
+                        <span className="ml-1.5 text-win">+{money(reward)}</span>
+                      );
+                    })()}
                   </span>
                 )}
 
