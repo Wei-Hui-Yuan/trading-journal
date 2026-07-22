@@ -121,6 +121,68 @@ export function computeSizing({
   };
 }
 
+export interface TakeProfitScore {
+  /** Gain per share at that price. Negative when the target is backwards. */
+  perShare: number;
+  /** What that gain is worth in R. Same sign as `perShare`. */
+  rMultiple: number;
+  /** Dollar profit across `shares`, or null when the position is unsized. */
+  profit: number | null;
+  /** The share count `profit` was computed on, so the figure can say so. */
+  shares: number | null;
+  /**
+   * True when the target sits on the losing side of the entry — a long taking
+   * profit below where it bought. Surfaced rather than shown as a negative R,
+   * because it is a typo rather than a strategy.
+   */
+  isBackwards: boolean;
+}
+
+/**
+ * Score a take profit the user typed in, rather than one off the R ladder.
+ *
+ * The ladder answers "where is 2R?"; this answers the question people actually
+ * arrive with, which is "I want out at 25 — what is that worth?". Without it
+ * the only way to find out is to notice that 25 sits between the 1R and 2R
+ * chips and interpolate, which is exactly the arithmetic the calculator exists
+ * to remove.
+ *
+ * Direction-aware: on a short, profit is entry MINUS target, so the same
+ * subtraction would report a winning target as a loss.
+ */
+export function scoreTakeProfit({
+  side,
+  entry,
+  takeProfit,
+  riskPerShare,
+  shares,
+}: {
+  side: Side;
+  entry: number;
+  takeProfit: number;
+  riskPerShare: number;
+  shares: number | null;
+}): TakeProfitScore | null {
+  if (!Number.isFinite(entry) || !Number.isFinite(takeProfit)) return null;
+  if (takeProfit <= 0) return null;
+  // Guarded rather than assumed: this is the divisor, and computeSizing has
+  // already refused to produce a result when it is not positive.
+  if (!Number.isFinite(riskPerShare) || riskPerShare <= 0) return null;
+
+  const perShare = side === 'BUY' ? takeProfit - entry : entry - takeProfit;
+
+  return {
+    perShare,
+    rMultiple: perShare / riskPerShare,
+    // Multiplied out per share rather than as rMultiple x riskAmount: the R is
+    // displayed rounded to two decimals, and reusing the rounded figure drifts
+    // the dollar amount away from what the position actually pays.
+    profit: shares === null ? null : perShare * shares,
+    shares,
+    isBackwards: perShare <= 0,
+  };
+}
+
 /**
  * Why sizing is unavailable, phrased for the user.
  *

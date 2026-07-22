@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucide-react';
 
 import { useCreatePlan, useSettings, useStrategies } from '@/hooks/useTradeInbox';
-import { computeSizing, sizingHint } from '@/lib/positionSizing';
+import { computeSizing, scoreTakeProfit, sizingHint } from '@/lib/positionSizing';
 import type { TradeSide } from '@/types/api';
 
 interface CreatePlanModalProps {
@@ -177,6 +177,23 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
       : null;
   const plannedRiskPercent =
     plannedRisk !== null && accountSize ? (plannedRisk / accountSize) * 100 : null;
+
+  // What the take profit actually typed into the form is worth, as opposed to
+  // the 1R/2R/3R chips. Sized on the quantity being planned where one has been
+  // entered, falling back to the calculator's suggestion — the same share count
+  // the ladder prices its own targets on, so the two are comparable.
+  const takeProfitScore = useMemo(() => {
+    const entry = toNullableNumber(form.plannedEntry);
+    const target = toNullableNumber(form.takeProfitPrice);
+    if (sizing === null || entry === null || target === null) return null;
+    return scoreTakeProfit({
+      side: form.side,
+      entry,
+      takeProfit: target,
+      riskPerShare: sizing.riskPerShare,
+      shares: enteredQty ?? sizing.wholeShares,
+    });
+  }, [form.plannedEntry, form.takeProfitPrice, form.side, sizing, enteredQty]);
 
   if (!open || !mounted) return null;
 
@@ -609,6 +626,59 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
                     })}
                   </div>
                 </div>
+
+                {/* What the take profit in the form above is worth.
+                    The ladder answers "where is 2R?"; this answers the
+                    question you actually arrive with — "I want out at 25,
+                    what does that pay?" — which otherwise means eyeballing
+                    where 25 falls between two chips and interpolating. */}
+                {takeProfitScore !== null && (
+                  <div
+                    className={`rounded-lg border px-2.5 py-2 ${
+                      takeProfitScore.isBackwards
+                        ? 'border-loss/40 bg-loss/5'
+                        : 'border-obsidian-border bg-obsidian-bg/60'
+                    }`}
+                  >
+                    {takeProfitScore.isBackwards ? (
+                      // Named as the typo it is rather than rendered as a
+                      // negative R, which would read like a deliberate choice.
+                      <p className="text-[10px] leading-relaxed text-loss">
+                        Take profit {price(toNullableNumber(form.takeProfitPrice) as number)}{' '}
+                        is on the losing side of your entry
+                        {form.side === 'BUY'
+                          ? ' — for a long it has to sit above it.'
+                          : ' — for a short it has to sit below it.'}
+                      </p>
+                    ) : (
+                      <>
+                        <div className="flex items-baseline justify-between">
+                          <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                            Your take profit
+                          </span>
+                          <span className="font-mono text-[11px] text-slate-200">
+                            {takeProfitScore.rMultiple.toFixed(2)}R
+                            {takeProfitScore.profit !== null && (
+                              <span className="ml-1.5 text-win">
+                                +{money(takeProfitScore.profit)}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-[10px] text-obsidian-muted">
+                          {money(takeProfitScore.perShare)} per share
+                          {takeProfitScore.shares !== null &&
+                            ` on ${takeProfitScore.shares} share${
+                              takeProfitScore.shares === 1 ? '' : 's'
+                            }`}
+                          {enteredQty === null &&
+                            takeProfitScore.shares !== null &&
+                            ' (suggested size)'}
+                        </p>
+                      </>
+                    )}
+                  </div>
+                )}
 
                 {sizing.wholeShares !== null && sizing.wholeShares > 0 && (
                   <button
