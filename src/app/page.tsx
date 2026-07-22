@@ -13,6 +13,15 @@ import {
   useDashboardStats,
 } from '@/hooks/useTradeInbox';
 
+/**
+ * The API host this build actually talks to.
+ *
+ * Mirrors the fallback in lib/api.ts. Inlined at build time by Next, so it
+ * reflects the environment the bundle was built for — which is the point:
+ * a missing NEXT_PUBLIC_API_URL is otherwise invisible until requests fail.
+ */
+const API_HOST = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
 const EMPTY_STATS: KPIStats = {
   netPnl: 0,
   winRate: 0,
@@ -89,9 +98,14 @@ export default function Home() {
 
       </main>
 
-      {/* Footer */}
+      {/* Footer.
+          The backend host is read from the environment rather than hardcoded.
+          The literal "http://localhost:8000" was printed even in production,
+          where the app was talking to Northflank — it reads as a diagnostic
+          but was pure decoration, and sent at least one debugging session
+          chasing a misconfiguration that did not exist. */}
       <footer className="border-t border-obsidian-border py-4 text-center text-xs text-obsidian-muted">
-        Trading Journal Platform &bull; FastAPI Backend at http://localhost:8000 &bull; Obsidian Engine
+        Trading Journal Platform &bull; FastAPI Backend at {API_HOST} &bull; Obsidian Engine
       </footer>
     </div>
   );

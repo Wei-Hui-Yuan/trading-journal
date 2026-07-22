@@ -627,7 +627,11 @@ export default function AnalyticsPage() {
                 }
               />
               <KpiCard
-                label="Profit Factor"
+                // Suffixed because the Dashboard shows a DIFFERENT profit
+                // factor, computed on dollar P&L. The two legitimately differ
+                // -- 0.95 here against 0.89 there -- because R weights every
+                // trade by the risk it took rather than by its size.
+                label="Profit Factor (R)"
                 // null = no losing trades; rendering 0.00 would invert the meaning.
                 value={m.profit_factor_r === null ? '∞' : metric(m.profit_factor_r)}
                 hint="Gross win R / loss R"

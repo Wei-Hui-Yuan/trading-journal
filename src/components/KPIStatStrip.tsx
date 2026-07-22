@@ -1,5 +1,6 @@
 import React from 'react';
 import type { KPIStats } from '@/types/api';
+import { formatMoney, formatSignedPercent } from '@/lib/format';
 import { TrendingUp, TrendingDown, Target, BarChart2, DollarSign, Clock, ShieldAlert } from 'lucide-react';
 
 interface KPIStatStripProps {
@@ -8,6 +9,7 @@ interface KPIStatStripProps {
 
 export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
   const isNetWin = stats.netPnl >= 0;
+  const isRoiPositive = stats.avgRoi > 0;
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
@@ -26,11 +28,13 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         </div>
         <div className="mt-2 flex items-baseline justify-between">
           <span className={`text-2xl font-bold font-mono ${isNetWin ? 'text-win' : 'text-loss'}`}>
-            {isNetWin ? '+' : ''}${stats.netPnl.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            {formatMoney(stats.netPnl)}
           </span>
         </div>
         <div className="mt-2 flex items-center text-[11px] text-obsidian-muted">
-          <span>Trailing 30 Days</span>
+          {/* Every closed round trip, not a rolling window. The old label said
+              "Trailing 30 Days" over a figure covering the whole history. */}
+          <span>All-Time P&amp;L</span>
         </div>
       </div>
 
@@ -72,7 +76,10 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
       {/* Profit Factor */}
       <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Profit Factor</span>
+          {/* Suffixed because Analytics shows a DIFFERENT profit factor, computed
+              on R-multiples. Same name, different denominator: this one is
+              gross win $ / gross loss $. */}
+          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Profit Factor ($)</span>
           <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400">
             <DollarSign className="h-4 w-4" />
           </div>
@@ -92,11 +99,19 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         <div className="flex items-center justify-between">
           <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Avg Trade ROI</span>
           <div className="p-1.5 rounded-lg bg-purple-500/10 text-purple-400">
-            <TrendingUp className="h-4 w-4" />
+            {isRoiPositive ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
           </div>
         </div>
         <div className="mt-2 flex items-baseline justify-between">
-          <span className="text-2xl font-bold font-mono text-win">+{stats.avgRoi}%</span>
+          {/* Coloured by its own sign, not hardcoded green. A losing average
+              rendered in win-green alongside a "+" it had not earned. */}
+          <span
+            className={`text-2xl font-bold font-mono ${
+              isRoiPositive ? 'text-win' : stats.avgRoi < 0 ? 'text-loss' : 'text-white'
+            }`}
+          >
+            {formatSignedPercent(stats.avgRoi)}
+          </span>
         </div>
         <div className="mt-2 text-[11px] text-obsidian-muted">
           <span>Per Execution</span>
