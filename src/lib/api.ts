@@ -416,7 +416,25 @@ export async function createManualTrade(
  * overlapping date range is a no-op rather than a duplicate.
  */
 export async function ingestIBKR(): Promise<IngestResult> {
-  const { data } = await apiClient.post<IngestResult>('/ingest/ibkr');
+  const { data } = await apiClient.post<IngestResult>('/ingest/ibkr', null, {
+    // The 30s default cannot work here, and not marginally: IBKR compiles a
+    // Flex report on demand, so the backend SENDS a request and then POLLS for
+    // the payload. Its own budget for a single query is up to 3 send attempts
+    // (2 x 5s backoff) plus 5 polls (4 x 4s backoff), each with a 30s HTTP
+    // timeout -- roughly 266s before it gives up, all of it legitimate.
+    //
+    // Widening the Flex window to 365 days made this reachable rather than
+    // theoretical: the first such sync timed out client-side at 30s and
+    // reported "no response from the server" for a request that had not
+    // failed. Nothing was written, so the ledger stayed correct, but the run
+    // was wasted and IBKR had already been asked to build the report.
+    //
+    // This covers one query's worst case. A many-query sync can still exceed
+    // it, and the real fix is for ingest to return 202 with a job id and be
+    // polled -- a request whose duration is bounded by a third party's
+    // compile time does not belong in a synchronous round trip.
+    timeout: 300_000,
+  });
   return data;
 }
 
