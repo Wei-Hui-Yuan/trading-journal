@@ -142,6 +142,34 @@ class PositionDiscipline(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class AppSetting(Base):
+    """The one row of trader-level defaults (migration 015).
+
+    Holds what the position-size calculator needs and the ledger cannot infer:
+    current account size and the share of it a trade may risk. Single-row by
+    construction -- `CHECK (id = 1)` in the schema -- so reads and writes never
+    have to choose between rows.
+
+    Deliberately current-state only. What each trade actually risked is on
+    `trades.risk_amount`, captured at entry; keeping a second history here
+    would give the same question two answers.
+    """
+
+    __tablename__ = "app_settings"
+
+    SINGLETON_ID = 1
+
+    id = Column(Integer, primary_key=True, default=SINGLETON_ID)
+    # Nullable: unset means unknown, not zero. The calculator withholds a share
+    # count rather than confidently suggesting none.
+    account_size = Column(Numeric(14, 2), nullable=True)
+    # Percent, matching trades.risk_percent's unit so the two compare directly.
+    risk_percent = Column(Numeric(5, 2), nullable=False, default=Decimal("1.00"))
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Trade(Base):
     __tablename__ = "trades"
 
@@ -163,7 +191,9 @@ class Trade(Base):
     # stop_loss so widening a stop shows up instead of overwriting the intent.
     actual_stop_loss = Column(Numeric(10, 4), nullable=True)
     target = Column(Numeric(10, 4), nullable=True)
-    risk_percent = Column(Numeric(4, 2), default=1.00)
+    # Widened from (4,2) in migration 015: derived from actual quantity, a
+    # margined position can exceed 100% of the account.
+    risk_percent = Column(Numeric(6, 2), default=1.00)
     # The absolute figure, which is what turns an R-multiple back into money.
     risk_amount = Column(Numeric(12, 2), nullable=True)
     strategy_id = Column(
@@ -595,6 +625,20 @@ class ManualTradeCreate(BaseModel):
     # Left blank while a trade is still running.
     exit_price: Optional[float] = Field(None, gt=0)
 
+    # What the position-size calculator sized this trade against. Recorded per
+    # trade rather than read back from app_settings at query time, because
+    # account size drifts: a trade sized against $2,500 must keep reading as 1%
+    # of $2,500 forever, not 1% of whatever the account holds today.
+    #
+    # risk_amount is what converts an R-multiple back into money, so a trade
+    # missing it can be scored in R but never in dollars.
+    #
+    # Bound matches trades.risk_percent's NUMERIC(6,2) exactly, so an oversized
+    # figure fails Pydantic validation with a 422 that names the field rather
+    # than reaching the database and surfacing as an opaque 500.
+    risk_percent: Optional[float] = Field(None, ge=0, le=9999.99)
+    risk_amount: Optional[float] = Field(None, ge=0)
+
     # Which playbook entry this trade follows, and why it was taken.
     strategy_id: Optional[uuid.UUID] = None
     thesis: Optional[str] = None
@@ -673,6 +717,16 @@ async def create_manual_trade(
         stop_loss=params.planned_stop_loss,
         target=params.take_profit_price,
         exit_price=params.exit_price,
+        # Omitting risk_percent does NOT leave it NULL -- the column carries
+        # default=1.00, which SQLAlchemy applies whenever the value is None.
+        # So it cannot distinguish "risked 1%" from "never sized"; 185 of the
+        # imported rows read 1.00 for exactly that reason.
+        #
+        # risk_amount has no such default, which makes it the honest test for
+        # "was this trade sized at all" -- and the one analytics should filter
+        # on before converting R-multiples into money.
+        risk_percent=params.risk_percent,
+        risk_amount=params.risk_amount,
         strategy_id=params.strategy_id,
         thesis=params.thesis,
         source_tag="Manual",
@@ -700,6 +754,82 @@ async def create_manual_trade(
         positions_created=len(result.positions),
         open_quantity=result.open_quantity,
     )
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class SettingsOut(BaseModel):
+    account_size: Optional[float]
+    risk_percent: float
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SettingsUpdate(BaseModel):
+    """Partial update. Only keys present in the body are applied.
+
+    account_size is Optional and settable to null, which is a real state --
+    "I no longer want a remembered account size" -- rather than a no-op. That
+    makes `model_fields_set` the authority on what to write, not truthiness.
+    """
+
+    account_size: Optional[float] = Field(None, ge=0)
+    # app_settings.risk_percent is NUMERIC(5,2); this is a default to start from
+    # rather than a recorded outcome, so a tighter bound than the ledger's is
+    # correct -- nobody sets a default risk of 900%.
+    risk_percent: Optional[float] = Field(None, ge=0, le=999.99)
+
+
+async def _get_or_create_settings(session: AsyncSession) -> AppSetting:
+    """The single settings row, created on first read if the seed never ran.
+
+    Migration 015 seeds it, but a database restored from a schema-only dump
+    would have the table and no row. Creating it here keeps the endpoint total
+    rather than 404-ing on a condition the user cannot act on.
+    """
+    row = await session.get(AppSetting, AppSetting.SINGLETON_ID)
+    if row is None:
+        row = AppSetting(id=AppSetting.SINGLETON_ID, risk_percent=Decimal("1.00"))
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
+@app.get(
+    "/api/settings",
+    response_model=SettingsOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def get_settings(session: AsyncSession = Depends(get_session)):
+    return SettingsOut.model_validate(await _get_or_create_settings(session))
+
+
+@app.put(
+    "/api/settings",
+    response_model=SettingsOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_settings(
+    params: SettingsUpdate, session: AsyncSession = Depends(get_session)
+):
+    row = await _get_or_create_settings(session)
+    for key in params.model_fields_set:
+        value = getattr(params, key)
+        # account_size is nullable and may be cleared; risk_percent is NOT NULL,
+        # so an explicit null there is rejected rather than allowed through to
+        # become an integrity error the client cannot interpret.
+        if value is None and key != "account_size":
+            raise HTTPException(status_code=422, detail=f"{key} cannot be null.")
+        setattr(row, key, Decimal(str(value)) if value is not None else None)
+    await session.commit()
+    await session.refresh(row)
+    return SettingsOut.model_validate(row)
 
 
 # ---------------------------------------------------------------------------
