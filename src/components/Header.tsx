@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { Activity, BarChart3, BookOpen, BookText, RefreshCw, SlidersHorizontal, User, Plus } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { ManualTradeModal } from './ManualTradeModal';
+import { SyncResultToast } from './SyncResultToast';
 import { useLastSync } from '@/hooks/useTradeInbox';
 
 interface HeaderProps {
@@ -160,6 +161,10 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
         open={isManualLogOpen}
         onClose={() => setIsManualLogOpen(false)}
       />
+
+      {/* Mounted here so the summary survives navigating between pages while a
+          sync is still in flight — the request outlives any one route. */}
+      <SyncResultToast />
     </header>
   );
 };

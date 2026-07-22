@@ -8,6 +8,8 @@ import type {
   ExecutionUpdatePayload,
   ExecutionUpdateResult,
   PositionDeleteResult,
+  SuppressedExecution,
+  UnsuppressResult,
   Discipline,
   DisciplineCreatePayload,
   IngestResult,
@@ -265,6 +267,28 @@ export async function deletePosition(
 /** POST /api/positions/{id}/dismiss - leave the queue, keep the P&L. */
 export async function dismissPosition(id: string): Promise<Position> {
   const { data } = await apiClient.post<Position>(`/positions/${id}/dismiss`);
+  return data;
+}
+
+/** GET /api/trades/suppressed - broker fills ingest is deliberately skipping. */
+export async function getSuppressedExecutions(): Promise<SuppressedExecution[]> {
+  const { data } = await apiClient.get<SuppressedExecution[]>('/trades/suppressed');
+  return data;
+}
+
+/**
+ * DELETE /api/trades/suppressed/{id} - lift a tombstone.
+ *
+ * Keyed by the BROKER id, not a trade id: suppression exists because the trade
+ * row was deleted, so there is no trade to address. This restores nothing on
+ * its own — the fill returns only when a sync next covers its date.
+ */
+export async function unsuppressExecution(
+  execId: string
+): Promise<UnsuppressResult> {
+  const { data } = await apiClient.delete<UnsuppressResult>(
+    `/trades/suppressed/${encodeURIComponent(execId)}`
+  );
   return data;
 }
 

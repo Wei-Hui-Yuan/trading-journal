@@ -6,12 +6,18 @@ import {
   AlertCircle,
   ArrowLeft,
   Check,
+  GhostIcon,
   Loader2,
   SlidersHorizontal,
   Wallet,
 } from 'lucide-react';
 
-import { useSettings, useUpdateSettings } from '@/hooks/useTradeInbox';
+import {
+  useSettings,
+  useSuppressedExecutions,
+  useUpdateSettings,
+} from '@/hooks/useTradeInbox';
+import { SuppressedFillsModal } from '@/components/SuppressedFillsModal';
 
 /**
  * Held as strings for the same reason the trade form does: a controlled number
@@ -44,6 +50,12 @@ export default function SettingsPage() {
   // server; after, it is theirs — otherwise a background refetch would
   // overwrite half-typed input.
   const [touched, setTouched] = useState(false);
+  const [suppressedOpen, setSuppressedOpen] = useState(false);
+
+  // Fetched eagerly so the count is on the button before it is pressed: a
+  // non-zero badge is the only hint that anything is being skipped at all.
+  const suppressedQuery = useSuppressedExecutions();
+  const suppressedCount = suppressedQuery.data?.length ?? 0;
 
   const settings = settingsQuery.data;
 
@@ -259,7 +271,41 @@ export default function SettingsPage() {
             </form>
           )}
         </section>
+
+        {/* Sits in Settings rather than the ledger because a suppressed fill
+            is not in the ledger — that is what suppression means. Nothing on
+            any other page can show it. */}
+        <section className="mt-6 rounded-xl border border-obsidian-border bg-obsidian-card p-5">
+          <div className="mb-1 flex items-center gap-2">
+            <GhostIcon className="h-4 w-4 text-amber-400" />
+            <h2 className="text-sm font-semibold tracking-wide text-slate-200">
+              BROKER SYNC
+            </h2>
+          </div>
+          <p className="mb-4 text-xs text-obsidian-muted">
+            Fills you deleted are suppressed so a later sync cannot add them
+            back. Review that list here if a trade you expected never arrived.
+          </p>
+          <button
+            type="button"
+            onClick={() => setSuppressedOpen(true)}
+            className="inline-flex items-center gap-2 rounded-lg border border-obsidian-border bg-obsidian-bg px-3.5 py-2 text-xs font-medium text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200"
+          >
+            <GhostIcon className="h-3.5 w-3.5" />
+            Manage Suppressed Fills
+            {suppressedCount > 0 && (
+              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-300">
+                {suppressedCount}
+              </span>
+            )}
+          </button>
+        </section>
       </main>
+
+      <SuppressedFillsModal
+        open={suppressedOpen}
+        onClose={() => setSuppressedOpen(false)}
+      />
     </div>
   );
 }

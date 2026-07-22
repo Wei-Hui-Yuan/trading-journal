@@ -19,11 +19,13 @@ import {
   getRoundTrips,
   getSettings,
   getStrategies,
+  getSuppressedExecutions,
   getTrades,
   httpStatusOf,
   ingestIBKR,
   updateExecution,
   updatePositionReview,
+  unsuppressExecution,
   updateSettings,
   updateStrategy,
 } from '@/lib/api';
@@ -46,11 +48,13 @@ import type {
   PositionReviewPayload,
   RoundTrip,
   Strategy,
+  SuppressedExecution,
   StrategyCreatePayload,
   StrategyUpdatePayload,
   Trade,
   TradeDeleteResult,
   TradeAnnotationPayload,
+  UnsuppressResult,
 } from '@/types/api';
 
 /**
@@ -69,6 +73,7 @@ export const queryKeys = {
   // Written by the sync mutation, read by the header badge. Not a fetched
   // resource — the cache is being used as the one place both can see.
   lastSync: ['lastSync'] as const,
+  suppressed: ['suppressedExecutions'] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -215,6 +220,8 @@ export function useSyncBroker() {
             : result.staged_duplicates > 0
               ? 'up to date'
               : 'no fills',
+        result,
+        acknowledged: false,
       });
     },
     onError: (error) => {
@@ -223,6 +230,8 @@ export function useSyncBroker() {
         outcome: 'error',
         status: httpStatusOf(error),
         summary: error.message,
+        result: null,
+        acknowledged: false,
       });
     },
   });
@@ -398,6 +407,43 @@ export function useDismissPosition() {
       // The round trip itself is unchanged, but its review_status drives the
       // badge the ledger renders.
       queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+    },
+  });
+}
+
+/** Dismiss the sync summary without erasing the fact that a sync happened. */
+export function useAcknowledgeSync() {
+  const queryClient = useQueryClient();
+  return () =>
+    queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, (prev) =>
+      prev ? { ...prev, acknowledged: true } : prev
+    );
+}
+
+/** Broker fills ingest is deliberately skipping. */
+export function useSuppressedExecutions() {
+  return useQuery<SuppressedExecution[]>({
+    queryKey: queryKeys.suppressed,
+    queryFn: getSuppressedExecutions,
+  });
+}
+
+/**
+ * Lift a tombstone so a future sync may re-import the fill.
+ *
+ * Invalidates the ledger queries even though nothing changes yet: the fill
+ * does not return until a sync covers its date. That is deliberate — if a
+ * sync runs in the same session the numbers must not be served from a cache
+ * populated while the fill was still suppressed.
+ */
+export function useUnsuppressTrade() {
+  const queryClient = useQueryClient();
+  return useMutation<UnsuppressResult, Error, string>({
+    mutationFn: unsuppressExecution,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.suppressed });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
     },
   });
 }

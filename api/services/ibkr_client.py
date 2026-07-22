@@ -38,6 +38,21 @@ NOT_READY_CODES = {"1001", "1018", "1019"}
 # is trying to escape. Those are reported to the caller to retry later instead.
 RETRY_IN_REQUEST_CODES = {"1019"}
 
+def is_transient_failure(message: str) -> bool:
+    """Whether a failure message names a condition that clears on its own.
+
+    Lives here so the codes stay in one place. The caller needs this to tell
+    the user whether retrying is worth anything: a throttled query is a "try
+    again in a few minutes", while a bad token or unknown query id will fail
+    identically forever and retrying only wastes the request budget.
+
+    Matches on the `(code NNNN)` fragment that request_statement and
+    download_statement embed, not on a bare number, so a quantity or a price
+    that happens to read 1001 cannot be mistaken for a rate limit.
+    """
+    return any(f"code {code}" in message for code in NOT_READY_CODES)
+
+
 MAX_POLL_ATTEMPTS = 5
 POLL_DELAY_SECONDS = 4.0
 REQUEST_TIMEOUT = 30.0

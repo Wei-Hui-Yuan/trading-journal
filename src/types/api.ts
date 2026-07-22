@@ -212,6 +212,47 @@ export interface IngestResult {
    * rather than letting a partial sync look complete.
    */
   queries_failed: string[];
+  /**
+   * Broker fills re-sent that you had deliberately deleted, and ingest
+   * skipped. A number that keeps climbing means the Flex query is still
+   * returning something the journal does not want.
+   */
+  suppressed_skipped?: number;
+  /**
+   * True when at least one failed query was throttled rather than rejected.
+   * Only throttling is worth retrying — a bad token fails identically forever.
+   */
+  rate_limited?: boolean;
+}
+
+/**
+ * One tombstoned broker fill (GET /api/trades/suppressed).
+ *
+ * Everything but the id is nullable: tombstones written before the detail
+ * columns existed have nothing to backfill from, because the fill they name
+ * was deleted. Null means "not recorded", which is true.
+ */
+export interface SuppressedExecution {
+  ibkr_exec_id: string;
+  ticker: string | null;
+  reason: string | null;
+  direction: string | null;
+  quantity: number | null;
+  price: number | null;
+  executed_at: string | null; // ISO 8601
+  created_at: string | null;
+}
+
+/** Result of lifting a tombstone. */
+export interface UnsuppressResult {
+  ibkr_exec_id: string;
+  ticker: string | null;
+  /**
+   * Always false, and named to be awkward to ignore. Lifting the tombstone
+   * restores nothing by itself — the fill returns only when a sync next covers
+   * its date.
+   */
+  restored_immediately: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +323,18 @@ export interface LastSyncState {
   status: number | null;
   /** Short human summary: "12 new", "up to date", or the error message. */
   summary: string;
+  /**
+   * The full ingest payload, so the summary toast can report every figure
+   * without a second source of truth. Null when the request failed before the
+   * server answered.
+   */
+  result: IngestResult | null;
+  /**
+   * Cleared when the user dismisses the toast. The badge keeps rendering from
+   * the same entry — dismissing the detail must not erase the fact that a sync
+   * happened.
+   */
+  acknowledged: boolean;
 }
 
 // ---------------------------------------------------------------------------

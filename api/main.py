@@ -188,6 +188,13 @@ class SuppressedExecution(Base):
     ticker = Column(Text, nullable=True)
     reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # The fill's own facts (migration 017), copied at tombstone time. The row
+    # they came from is deleted, so they cannot be joined back from `trades` --
+    # without them the management list can name an id but not a trade.
+    direction = Column(Text, nullable=True)
+    quantity = Column(Numeric(18, 8), nullable=True)
+    price = Column(Numeric(10, 4), nullable=True)
+    executed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Trade(Base):
@@ -495,6 +502,10 @@ class IngestResult(BaseModel):
     # rather than silently dropped: a number that keeps climbing means the Flex
     # query is still returning something the journal does not want.
     suppressed_skipped: int = 0
+    # True when at least one failed query was throttled rather than rejected.
+    # The distinction is the whole point of showing it: a throttle clears on
+    # its own and is worth retrying in a few minutes, a bad token never is.
+    rate_limited: bool = False
 
 
 @app.post(
@@ -550,6 +561,9 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             symbols_touched=[],
             skipped_non_tradeable=skipped_non_tradeable,
             queries_failed=query_failures,
+            rate_limited=any(
+                ibkr_client.is_transient_failure(f) for f in query_failures
+            ),
         )
 
     # --- 3: stage, skipping anything already seen -------------------------
@@ -636,6 +650,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         symbols_touched=symbols,
         skipped_non_tradeable=skipped_non_tradeable,
         queries_failed=query_failures,
+        rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
         suppressed_skipped=resurrected,
     )
 
@@ -1595,6 +1610,94 @@ async def update_execution(
     )
 
 
+class SuppressedExecutionOut(BaseModel):
+    """One tombstoned broker fill, as the management list shows it.
+
+    Every field except the id is nullable. Tombstones written before migration
+    017 recorded only the id, ticker and reason, and there is nothing to
+    backfill them from -- the fill they name is deleted. A null reads as "not
+    recorded", which is true; a zero quantity would be an invention.
+    """
+
+    ibkr_exec_id: str
+    ticker: Optional[str]
+    reason: Optional[str]
+    direction: Optional[str]
+    quantity: Optional[float]
+    price: Optional[float]
+    executed_at: Optional[datetime]
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+@app.get(
+    "/api/trades/suppressed",
+    response_model=list[SuppressedExecutionOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_suppressed_executions(session: AsyncSession = Depends(get_session)):
+    """Broker fills the user deleted, which ingest is skipping.
+
+    Ordered by when the fill happened rather than when it was suppressed: the
+    user arrives here looking for a trade they remember taking, not for the
+    order in which they pressed delete. Rows with no recorded time sort last
+    rather than being hidden.
+    """
+    rows = (
+        await session.execute(
+            select(SuppressedExecution).order_by(
+                SuppressedExecution.executed_at.desc().nullslast(),
+                SuppressedExecution.created_at.desc(),
+            )
+        )
+    ).scalars().all()
+    return [SuppressedExecutionOut.model_validate(r) for r in rows]
+
+
+class UnsuppressResult(BaseModel):
+    ibkr_exec_id: str
+    ticker: Optional[str]
+    # Deliberately explicit: removing the tombstone does NOT put the fill back.
+    # The row was deleted; only the broker still has it. Nothing changes until
+    # the next sync covers this fill's date, which the UI has to say plainly or
+    # "Restore" promises something it cannot deliver.
+    restored_immediately: bool = False
+
+
+@app.delete(
+    "/api/trades/suppressed/{exec_id}",
+    response_model=UnsuppressResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def unsuppress_execution(
+    exec_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Lift the tombstone so a future sync may re-import this fill.
+
+    NOTE ON THE ROUTE. The obvious shape would be
+    `POST /api/trades/{trade_id}/unsuppress`, but there is no trade to address:
+    suppression exists precisely because the row was deleted, and
+    `suppressed_executions` is keyed by the broker's own id for that reason. So
+    the broker id is the path parameter, and the verb is DELETE, because the
+    thing being removed is the tombstone.
+
+    This does not restore anything by itself, and says so in its response. The
+    fill returns only when a sync next covers its date -- which for an old fill
+    means the Flex query window has to reach back that far.
+    """
+    row = await session.get(SuppressedExecution, exec_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No suppression found for that id.")
+
+    ticker = row.ticker
+    await session.delete(row)
+    await session.commit()
+    return UnsuppressResult(ibkr_exec_id=exec_id, ticker=ticker)
+
+
 class TradeDeleteResult(BaseModel):
     """What a deletion actually did, beyond removing one row.
 
@@ -1691,6 +1794,11 @@ async def delete_trade(
                 ibkr_exec_id=trade.ibkr_exec_id,
                 ticker=ticker,
                 reason=reason or "Deleted from the journal",
+                # Copied now or lost: the row is about to be deleted.
+                direction=trade.direction,
+                quantity=trade.quantity,
+                price=trade.actual_entry,
+                executed_at=trade.entry_date,
             )
             # Deleting the same broker id twice is not an error; it is the user
             # being thorough after a sync re-sent something.
@@ -1782,6 +1890,10 @@ async def delete_position(
                         ibkr_exec_id=trade.ibkr_exec_id,
                         ticker=ticker,
                         reason=reason or "Round trip deleted from the inbox",
+                        direction=trade.direction,
+                        quantity=trade.quantity,
+                        price=trade.actual_entry,
+                        executed_at=trade.entry_date,
                     )
                     .on_conflict_do_nothing(index_elements=["ibkr_exec_id"])
                 )
