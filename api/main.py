@@ -1700,9 +1700,13 @@ async def list_round_trips(
     from executions that FIFO matching never paired off. Both carry their plan
     and their fills, so one row is a whole trade rather than a fragment.
     """
-    # Reused rather than hardcoded as "OPEN": the role vocabulary belongs to
-    # the matching engine, and two copies would drift.
-    from services.matching_engine import ROLE_OPEN  # noqa: PLC0415 - import cycle
+    # Reused rather than hardcoded: the role vocabulary and the cost-basis
+    # replay both belong to the matching engine, and two copies would drift.
+    from services.matching_engine import (  # noqa: PLC0415 - import cycle
+        ROLE_CLOSE,
+        ROLE_OPEN,
+        replay_open_exposure,
+    )
 
     positions = (
         await session.execute(select(Position).order_by(Position.exit_time.desc()))
@@ -1805,12 +1809,15 @@ async def list_round_trips(
             continue
 
         net_direction = "BUY" if signed > 0 else "SELL"
-        side = [t for t in group if (t.direction or "BUY").upper() == net_direction]
-        qty = sum((t.quantity or Decimal("0")) for t in side) or Decimal("1")
-        # Quantity-weighted, so scaling in reports the real average cost.
-        avg_entry = sum(
-            (t.actual_entry or Decimal("0")) * (t.quantity or Decimal("0")) for t in side
-        ) / qty
+        # Replayed rather than averaged. Taking the mean of every same-direction
+        # fill treats shares that have already been sold as though they were
+        # still held: MSFT reported 415.45, the average of all 17 shares ever
+        # bought, when only 2 remained at 409.40.
+        exposure = replay_open_exposure(
+            (t.direction, t.quantity or Decimal("0"), t.actual_entry or Decimal("0"))
+            for t in group
+        )
+        avg_entry = exposure.average_cost
 
         opening = group[0]
         plan = _plan_fields(opening)
@@ -1834,7 +1841,15 @@ async def list_round_trips(
                     PositionFillOut(
                         id=t.id,
                         trade_id=t.id,
-                        role=ROLE_OPEN,
+                        # A fill's role is what it DID, not which group it
+                        # landed in. Hardcoding OPEN here labelled every
+                        # partial sell as an opening buy -- MSFT showed seven
+                        # OPEN fills when three of them were sells.
+                        role=(
+                            ROLE_OPEN
+                            if (t.direction or "BUY").upper() == net_direction
+                            else ROLE_CLOSE
+                        ),
                         quantity=float(t.quantity or 0),
                         price=float(t.actual_entry or 0),
                         executed_at=t.entry_date,

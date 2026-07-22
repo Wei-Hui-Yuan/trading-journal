@@ -156,6 +156,81 @@ def _weighted_average(pairs: list[tuple[Decimal, Decimal]]) -> Decimal:
     return (total / Decimal(total_qty)).quantize(PRICE_PRECISION, rounding=ROUND_HALF_UP)
 
 
+@dataclass(frozen=True)
+class OpenExposure:
+    """What is still held on a ticker, and what it cost.
+
+    Open exposure has no `positions` row -- by definition nothing has closed --
+    so it is reconstructed from the fills FIFO never paired off.
+    """
+
+    # Signed: positive is long, negative is short.
+    net_quantity: Decimal
+    # Average cost of what REMAINS, not of everything ever bought.
+    average_cost: Decimal
+
+
+def replay_open_exposure(
+    fills: Iterable[tuple[str, Decimal, Decimal]],
+) -> OpenExposure:
+    """Net position and average cost, replayed fill by fill in time order.
+
+    Uses the AVERAGE-COST method, deliberately, because that is what the broker
+    reports and what the trader will compare against. The naive alternative --
+    averaging every same-direction fill -- ignores that some of those shares
+    have already been sold, and reports the cost of a position that no longer
+    exists: MSFT read 415.45, the mean of all 17 shares ever bought, when only
+    2 remained at 409.40.
+
+    Note this differs from the FIFO basis the matching engine uses to realise
+    P&L. They answer different questions. FIFO decides which lot a sale closes;
+    this reports what the untouched remainder cost on average. A trader
+    reconciling against IBKR wants the latter.
+
+    Reducing fills leave the average untouched -- selling half a position does
+    not change what the other half cost -- so only opening fills move it. A
+    fill that overshoots flat flips the position and starts a fresh basis at
+    its own price.
+    """
+    position = Decimal("0")
+    cost = Decimal("0")
+
+    for direction, quantity, price in fills:
+        if quantity is None or price is None:
+            continue
+        signed = quantity if (direction or BUY).upper() == BUY else -quantity
+        if signed == 0:
+            continue
+
+        opening = position == 0 or (position > 0) == (signed > 0)
+        if opening:
+            cost += abs(signed) * price
+            position += signed
+            continue
+
+        # Reducing. Take the closed portion out at the current average so the
+        # remainder keeps the cost it always had.
+        closed = min(abs(signed), abs(position))
+        average = cost / abs(position)
+        cost -= closed * average
+        position += signed
+
+        overshoot = abs(signed) - closed
+        if overshoot > 0:
+            # Crossed through flat: the excess opens the other way, and the old
+            # basis is not carried into a position of the opposite sign.
+            cost = overshoot * price
+
+    if position == 0:
+        return OpenExposure(Decimal("0"), Decimal("0"))
+    return OpenExposure(
+        net_quantity=position,
+        average_cost=(cost / abs(position)).quantize(
+            PRICE_PRECISION, rounding=ROUND_HALF_UP
+        ),
+    )
+
+
 def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
     """Fold the legs of one flat-to-flat span into a single position."""
     # Attribution per execution. A fill closing several lots appears once with
