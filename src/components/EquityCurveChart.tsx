@@ -329,7 +329,10 @@ export const EquityCurveChart: React.FC<EquityCurveChartProps> = ({
                   tick={{ fontSize: 9, fill: '#64748b' }}
                   tickLine={false}
                   width={52}
-                  ticks={[s.max_drawdown, 0]}
+                  // Two ticks: the worst it got, and level. Deduped because a
+                  // curve that has never been below its peak would otherwise
+                  // render 0 twice, stacked on itself.
+                  ticks={s.max_drawdown < 0 ? [s.max_drawdown, 0] : [0]}
                 />
                 <Tooltip content={<CurveTooltip />} />
                 <ReferenceLine y={0} stroke="#64748b" strokeDasharray="4 4" />
