@@ -27,8 +27,15 @@ import {
   useStrategies,
   useUpdateExecution,
 } from '@/hooks/useTradeInbox';
-import type { PositionFill, RoundTrip, TradeSide } from '@/types/api';
+import type {
+  PositionFill,
+  RoundTrip,
+  TradeDeleteResult,
+  TradeSide,
+} from '@/types/api';
 import { RepairFillModal } from './RepairFillModal';
+import { ConfirmDialog } from './ConfirmDialog';
+import { usePendingActions } from './PendingActionProvider';
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
   year: 'numeric',
@@ -366,6 +373,13 @@ export const TradeLedger: React.FC = () => {
   // What a deletion actually did. Surfaced because the side effects reach
   // beyond the row that was clicked.
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
+  // The fill awaiting confirmation, with the round trip it belongs to — the
+  // dialog needs both to say what dissolving that round trip would cost.
+  const [confirmingFill, setConfirmingFill] = useState<{
+    fill: PositionFill;
+    roundTrip: RoundTrip;
+  } | null>(null);
+  const { schedule, isPending } = usePendingActions();
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const detachMutation = useDetachPlan();
@@ -829,7 +843,12 @@ export const TradeLedger: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="font-mono text-slate-300">
-                            {rt.fills.map((f) =>
+                            {rt.fills
+                              // Hidden while its undo window runs, so the row
+                              // does not sit there looking undeleted and
+                              // invite a second click.
+                              .filter((f) => !isPending(`trade:${f.trade_id}`))
+                              .map((f) =>
                               editingFillId === f.id ? (
                                 <tr
                                   key={f.id}
@@ -978,35 +997,9 @@ export const TradeLedger: React.FC = () => {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => {
-                                      // A fill is rarely deletable in
-                                      // isolation. Removing one from a closed
-                                      // round trip dissolves it, and FIFO
-                                      // re-matching rebuilds whatever the
-                                      // remaining fills now form -- discarding
-                                      // the review written against the old
-                                      // shape. Said up front rather than
-                                      // discovered afterwards.
-                                      const warning =
-                                        rt.kind === 'closed'
-                                          ? `\n\nThis fill belongs to a closed round trip. Deleting it rebuilds ${rt.symbol}'s round trips from the remaining executions, and the review attached to this one will be discarded.`
-                                          : '';
-                                      if (
-                                        window.confirm(
-                                          `Delete this ${f.role.toLowerCase()} fill of ${formatQuantity(f.quantity)} ${rt.symbol} @ ${f.price}?${warning}`
-                                        )
-                                      ) {
-                                        deleteTradeMutation.mutate(f.trade_id, {
-                                          onSuccess: (result) => {
-                                            if (result.reviews_discarded > 0) {
-                                              setDeleteNotice(
-                                                `${rt.symbol}: ${result.positions_removed} round trip(s) removed, ${result.positions_rebuilt} rebuilt, ${result.reviews_discarded} review(s) discarded.`
-                                              );
-                                            }
-                                          },
-                                        });
-                                      }
-                                    }}
+                                    onClick={() =>
+                                      setConfirmingFill({ fill: f, roundTrip: rt })
+                                    }
                                     disabled={deleteTradeMutation.isPending}
                                     className="inline-flex items-center gap-1 rounded bg-loss/10 px-2 py-0.5 text-[10px] text-loss border border-loss/20 hover:bg-loss/20 transition-colors disabled:opacity-50 font-sans"
                                     title="Delete execution fill"
@@ -1202,6 +1195,61 @@ export const TradeLedger: React.FC = () => {
         presetSymbol={addingFor ?? undefined}
         onClose={() => setAddingFor(null)}
       />
+
+      {/* A fill is rarely deletable in isolation: removing one from a closed
+          round trip dissolves it, and FIFO re-matching rebuilds whatever the
+          remaining fills now form — discarding the review written against the
+          old shape. Said up front rather than discovered afterwards. */}
+      <ConfirmDialog
+        open={confirmingFill !== null}
+        title="Delete this execution?"
+        confirmLabel="Delete fill"
+        cancelLabel="Keep it"
+        onCancel={() => setConfirmingFill(null)}
+        onConfirm={() => {
+          const target = confirmingFill;
+          setConfirmingFill(null);
+          if (!target) return;
+          const { fill, roundTrip } = target;
+          setDeleteNotice(null);
+          schedule({
+            id: `trade:${fill.trade_id}`,
+            label: `${roundTrip.symbol} fill deleted`,
+            detail: `${fill.role.toLowerCase()} ${formatQuantity(fill.quantity)} @ ${fill.price}`,
+            commit: () => deleteTradeMutation.mutateAsync(fill.trade_id),
+            onCommitted: (result) => {
+              const r = result as TradeDeleteResult;
+              if (r.reviews_discarded > 0) {
+                setDeleteNotice(
+                  `${roundTrip.symbol}: ${r.positions_removed} round trip(s) removed, ${r.positions_rebuilt} rebuilt, ${r.reviews_discarded} review(s) discarded.`
+                );
+              }
+            },
+            onError: (err) => setDeleteNotice(err.message),
+          });
+        }}
+      >
+        <p>
+          <span className="text-slate-100">
+            {confirmingFill?.fill.role.toLowerCase()}{' '}
+            {confirmingFill ? formatQuantity(confirmingFill.fill.quantity) : ''}{' '}
+            {confirmingFill?.roundTrip.symbol}
+          </span>{' '}
+          @ {confirmingFill?.fill.price}
+        </p>
+        {confirmingFill?.roundTrip.kind === 'closed' && (
+          <p>
+            This fill belongs to a closed round trip. Deleting it rebuilds{' '}
+            {confirmingFill.roundTrip.symbol}&apos;s round trips from the
+            remaining executions, and{' '}
+            <span className="text-loss">the review attached to it is discarded</span>.
+          </p>
+        )}
+        <p className="text-obsidian-muted">
+          If this fill came from IBKR it is also suppressed, so a later sync
+          cannot add it back.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 };

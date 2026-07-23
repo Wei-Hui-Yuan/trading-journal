@@ -26,7 +26,13 @@ import {
   useStrategies,
 } from '@/hooks/useTradeInbox';
 import { PositionFills } from '@/components/PositionFills';
-import type { Position, PositionReviewPayload } from '@/types/api';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { usePendingActions } from '@/components/PendingActionProvider';
+import type {
+  Position,
+  PositionDeleteResult,
+  PositionReviewPayload,
+} from '@/types/api';
 
 const GRADES = ['A', 'B', 'C', 'D', 'F'] as const;
 
@@ -88,6 +94,10 @@ export function TradeInboxQueue() {
   // clicked -- delete rebuilds the ticker's round trips -- so what happened is
   // reported rather than left to be inferred from a changed total.
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  // Which round trip is being confirmed for deletion, if any. Holds the whole
+  // position rather than an id so the dialog can name the P&L at stake.
+  const [confirmingDelete, setConfirmingDelete] = useState<Position | null>(null);
+  const { schedule, isPending } = usePendingActions();
 
   // Drafts are keyed by position id so each card edits independently.
   const [drafts, setDrafts] = useState<Record<string, ReviewDraft>>({});
@@ -192,6 +202,76 @@ export function TradeInboxQueue() {
         </div>
       )}
       {children}
+
+      {/* Mounted in the shell so it survives the queue emptying: hiding the
+          last card during its undo window switches this component to the empty
+          state, and a dialog rendered beside the list would vanish with it. */}
+      <ConfirmDialog
+        open={confirmingDelete !== null}
+        title={`Delete this ${confirmingDelete?.symbol ?? ''} round trip?`}
+        confirmLabel="Delete round trip"
+        cancelLabel="Keep it"
+        onCancel={() => setConfirmingDelete(null)}
+        onConfirm={() => {
+          const position = confirmingDelete;
+          setConfirmingDelete(null);
+          if (!position) return;
+          setActionNotice(null);
+          schedule({
+            id: `position:${position.id}`,
+            label: `${position.symbol} round trip deleted`,
+            detail:
+              position.realized_pnl === null
+                ? undefined
+                : `P&L of ${
+                    position.realized_pnl >= 0 ? '+' : ''
+                  }$${position.realized_pnl.toFixed(2)} leaves your analytics`,
+            commit: () =>
+              deletePositionMutation.mutateAsync({
+                id: position.id,
+                reason: 'Deleted from the Trade Inbox',
+              }),
+            onCommitted: (result) => {
+              const r = result as PositionDeleteResult;
+              setActionNotice(
+                `${r.ticker}: removed, ${r.executions_deleted} execution(s) deleted` +
+                  (r.suppressed_from_future_syncs > 0
+                    ? `, ${r.suppressed_from_future_syncs} suppressed from future syncs.`
+                    : '.')
+              );
+            },
+            onError: (err) => setActionNotice(err.message),
+          });
+        }}
+      >
+        <p>
+          This removes the underlying executions and rebuilds{' '}
+          <span className="text-slate-100">{confirmingDelete?.symbol}</span>&apos;s
+          round trips.
+        </p>
+        {confirmingDelete?.realized_pnl != null && (
+          <p>
+            Its P&amp;L of{' '}
+            <span
+              className={
+                confirmingDelete.realized_pnl >= 0 ? 'text-win' : 'text-loss'
+              }
+            >
+              {confirmingDelete.realized_pnl >= 0 ? '+' : ''}$
+              {confirmingDelete.realized_pnl.toFixed(2)}
+            </span>{' '}
+            leaves your analytics.
+          </p>
+        )}
+        <p>
+          Broker fills are also suppressed, so the next sync cannot re-add them.
+        </p>
+        <p className="text-obsidian-muted">
+          Use this only if the trade never happened. To keep the P&amp;L and just
+          clear the queue, choose <span className="text-slate-300">Dismiss</span>{' '}
+          instead.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 
@@ -219,7 +299,12 @@ export function TradeInboxQueue() {
     );
   }
 
-  const positions = positionsQuery.data ?? [];
+  // Rows inside their undo window are hidden here rather than after the
+  // request lands. Without that the card would sit there looking undeleted for
+  // ten seconds, and the obvious response is to press Delete again.
+  const positions = (positionsQuery.data ?? []).filter(
+    (p) => !isPending(`position:${p.id}`)
+  );
 
   // --- Empty ---------------------------------------------------------------
   if (positions.length === 0) {
@@ -556,36 +641,7 @@ export function TradeInboxQueue() {
                   invented, and removes the executions underneath it. */}
               <button
                 type="button"
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      `Delete this ${position.symbol} round trip?\n\n` +
-                        `This removes the underlying executions and rebuilds ${position.symbol}'s ` +
-                        `round trips, and its P&L of ${
-                          position.realized_pnl === null
-                            ? 'n/a'
-                            : `$${position.realized_pnl.toFixed(2)}`
-                        } leaves your analytics.\n\n` +
-                        `Broker fills are also suppressed so the next sync cannot re-add them. ` +
-                        `Use this only if the trade never happened — to keep the P&L and just ` +
-                        `clear the queue, choose Dismiss instead.`
-                    )
-                  ) {
-                    deletePositionMutation.mutate(
-                      { id: position.id, reason: 'Deleted from the Trade Inbox' },
-                      {
-                        onSuccess: (result) =>
-                          setActionNotice(
-                            `${result.ticker}: removed, ${result.executions_deleted} execution(s) deleted` +
-                              (result.suppressed_from_future_syncs > 0
-                                ? `, ${result.suppressed_from_future_syncs} suppressed from future syncs.`
-                                : '.')
-                          ),
-                        onError: (err) => setActionNotice(err.message),
-                      }
-                    );
-                  }
-                }}
+                onClick={() => setConfirmingDelete(position)}
                 disabled={isSubmitting || deletePositionMutation.isPending || dismissMutation.isPending}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-loss/30 bg-loss/10 px-3 py-2 text-xs font-medium text-loss transition-colors hover:bg-loss/20 disabled:opacity-60"
               >

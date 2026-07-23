@@ -4,6 +4,8 @@ import React, { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 
+import { PendingActionProvider } from './PendingActionProvider';
+
 /**
  * React Query context for the App Router.
  *
@@ -29,7 +31,9 @@ export function QueryProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <QueryClientProvider client={queryClient}>
-      {children}
+      {/* Inside the query client, because a deferred delete commits through a
+          mutation and must be able to invalidate the cache when it lands. */}
+      <PendingActionProvider>{children}</PendingActionProvider>
       {process.env.NODE_ENV === 'development' && (
         <ReactQueryDevtools initialIsOpen={false} />
       )}

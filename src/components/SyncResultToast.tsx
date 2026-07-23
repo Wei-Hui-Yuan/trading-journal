@@ -54,15 +54,30 @@ export const SyncResultToast: React.FC = () => {
         ? 'Sync incomplete'
         : 'Sync failed';
 
-  // Only the figures that carry information. `staged_new` and
-  // `executions_parsed` describe the staging table rather than the ledger, and
-  // put numbers on screen that no decision depends on.
+  // Only the figures that carry information -- which turned out to include
+  // `executions_parsed`, dropped here originally as "describing the staging
+  // table rather than the ledger". On a re-sync where nothing is new, every
+  // ledger-side counter is legitimately zero and the staging figures are the
+  // only evidence the Flex query returned anything at all.
+  //
+  // "Already in the ledger" sums both duplicate counters on purpose. A fill
+  // stopped at staging and one stopped at the trades insert are the same fact
+  // to the reader: the broker re-sent it, and the journal already had it.
+  // Reporting only the second reads as 0 whenever the first caught everything.
   const rows: { label: string; value: number; hint?: string }[] = result
     ? [
+        {
+          // Without this the panel reads 0 across the board on any re-sync,
+          // which is indistinguishable from IBKR returning nothing at all --
+          // and telling those two apart is the whole reason to look.
+          label: 'Executions IBKR returned',
+          value: result.executions_parsed,
+          hint: 'Rows in the Flex report. Zero means the query came back empty.',
+        },
         { label: 'New fills imported', value: result.trades_created },
         {
           label: 'Already in the ledger',
-          value: result.trades_duplicates,
+          value: result.staged_duplicates + result.trades_duplicates,
           hint: 'Recognised by broker id and skipped — this is idempotency working.',
         },
         {
