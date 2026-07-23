@@ -10,7 +10,7 @@ the response boundary, so rounding never accumulates through the aggregation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -93,6 +93,15 @@ class ClosedPosition:
     entry_price: Decimal
     quantity: Decimal
     entry_time: datetime
+    # When the P&L was actually realised. Distinct from entry_time and not
+    # interchangeable with it: the heatmap asks "which session do I trade
+    # well?" and belongs on entry, while an equity curve plots money hitting
+    # the account and belongs on exit. A trade opened in March and closed in
+    # July moved the balance in July.
+    #
+    # Optional because a position row could in principle lack it; such rows are
+    # dropped from the curve rather than dated by a guess.
+    exit_time: Optional[datetime] = None
 
 
 @dataclass
@@ -264,18 +273,127 @@ async def load_closed_positions(session: AsyncSession) -> list[ClosedPosition]:
             entry_price=Decimal(str(row.entry_price)),
             quantity=Decimal(str(row.quantity)),
             entry_time=row.entry_time,
+            exit_time=row.exit_time,
         )
         for row in rows
         if row.realized_pnl is not None and row.entry_time is not None
     ]
 
 
+def build_equity_curve(positions: Iterable[ClosedPosition]) -> dict[str, Any]:
+    """Cumulative realised P&L over time, with the drawdown it went through.
+
+    NOT account equity, and deliberately not called that in the response. True
+    equity needs a starting balance plus every deposit and withdrawal, none of
+    which the broker feed carries -- inventing one by working backwards from
+    today's account size would silently assume the account was never funded
+    twice. This is the sum of closed P&L, which the data does support.
+
+    Dated by EXIT time. A trade opened in March and closed in July moved the
+    balance in July, and dating it by entry would draw a curve that recovered
+    before the trade that recovered it.
+
+    Every calendar day between the first and last close gets a point, including
+    weekends. The gaps are the point: a chart that plots only trading days
+    compresses a three-month pause into one step, and "how fast did it recover"
+    is unanswerable if the x-axis is not proportional to time.
+    """
+    dated = [
+        (p.exit_time.astimezone(MARKET_TZ).date(), p.realized_pnl)
+        for p in positions
+        if p.exit_time is not None
+    ]
+
+    if not dated:
+        return {
+            "points": [],
+            "summary": {
+                "start_date": None,
+                "end_date": None,
+                "net_pnl": 0.0,
+                "peak_pnl": 0.0,
+                "max_drawdown": 0.0,
+                "current_drawdown": 0.0,
+                "trading_days": 0,
+                "calendar_days": 0,
+                "closed_trades": 0,
+            },
+        }
+
+    daily_pnl: dict[Any, Decimal] = {}
+    daily_count: dict[Any, int] = {}
+    for day, pnl in dated:
+        daily_pnl[day] = daily_pnl.get(day, Decimal("0")) + pnl
+        daily_count[day] = daily_count.get(day, 0) + 1
+
+    first_day, last_day = min(daily_pnl), max(daily_pnl)
+
+    points: list[dict[str, Any]] = []
+    cumulative = Decimal("0")
+    peak = Decimal("0")
+    max_drawdown = Decimal("0")
+
+    # Anchored at zero the day before the first close, so the first day reads
+    # as a move rather than as a starting level.
+    points.append(
+        {
+            "date": (first_day - timedelta(days=1)).isoformat(),
+            "realized_pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "peak_pnl": 0.0,
+            "drawdown": 0.0,
+            "trades": 0,
+        }
+    )
+
+    day = first_day
+    while day <= last_day:
+        realized = daily_pnl.get(day, Decimal("0"))
+        cumulative += realized
+        # Peak floors at zero: before the curve has ever been profitable there
+        # is no high-water mark to be below, and measuring drawdown from a
+        # negative peak would report a losing account as having recovered.
+        peak = max(peak, cumulative)
+        drawdown = cumulative - peak  # <= 0
+        max_drawdown = min(max_drawdown, drawdown)
+
+        points.append(
+            {
+                "date": day.isoformat(),
+                "realized_pnl": float(realized),
+                "cumulative_pnl": float(cumulative),
+                "peak_pnl": float(peak),
+                # Signed negative, so "deeper" is unambiguously "lower" on both
+                # the chart and the number.
+                "drawdown": float(drawdown),
+                "trades": daily_count.get(day, 0),
+            }
+        )
+        day += timedelta(days=1)
+
+    return {
+        "points": points,
+        "summary": {
+            "start_date": first_day.isoformat(),
+            "end_date": last_day.isoformat(),
+            "net_pnl": float(cumulative),
+            "peak_pnl": float(peak),
+            "max_drawdown": float(max_drawdown),
+            "current_drawdown": float(cumulative - peak),
+            "trading_days": len(daily_pnl),
+            "calendar_days": (last_day - first_day).days + 1,
+            "closed_trades": len(dated),
+        },
+    }
+
+
 async def build_dashboard(session: AsyncSession) -> dict[str, Any]:
-    """Full dashboard payload: headline stats plus the heatmap grid."""
+    """Full dashboard payload: headline stats, the heatmap, the equity curve."""
     positions = await load_closed_positions(session)
     return {
         "core_stats": compute_core_stats(positions),
         "heatmap": build_heatmap(positions),
+        "equity_curve": build_equity_curve(positions),
     }
 
 

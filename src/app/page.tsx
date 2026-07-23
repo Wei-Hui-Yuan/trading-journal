@@ -1,13 +1,37 @@
 'use client';
 
 import React from 'react';
-import { AlertCircle } from 'lucide-react';
+import dynamic from 'next/dynamic';
+import { AlertCircle, Loader2 } from 'lucide-react';
 
 import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
 import { OpenPlansDock } from '@/components/OpenPlansDock';
+
+/**
+ * Loaded on demand: Recharts pulls in d3 and costs ~100 kB, which is a third
+ * of the dashboard's bundle for one chart that sits below the fold. Splitting
+ * it out keeps the KPI strip — the part you actually open this page for —
+ * painting on the original payload.
+ *
+ * `ssr: false` because Recharts measures the DOM to size itself; there is no
+ * width to measure on the server, and prerendering it only produces markup
+ * that is thrown away on hydration.
+ */
+const EquityCurveChart = dynamic(
+  () => import('@/components/EquityCurveChart').then((m) => m.EquityCurveChart),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-[26rem] items-center justify-center rounded-xl border border-obsidian-border bg-obsidian-card text-obsidian-muted">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        <span className="text-xs">Loading equity curve…</span>
+      </div>
+    ),
+  }
+);
 import type { KPIStats } from '@/types/api';
 import {
   usePendingPositions,
@@ -87,6 +111,16 @@ export default function Home() {
         <section>
           <DayOfWeekHeatmap
             data={dashboardQuery.data?.heatmap}
+            isLoading={dashboardQuery.isPending}
+            error={dashboardQuery.error as Error | null}
+          />
+        </section>
+
+        {/* Below the heatmap because the two answer different questions: the
+            heatmap is "when do I trade well", this is "how has it gone". */}
+        <section>
+          <EquityCurveChart
+            data={dashboardQuery.data?.equity_curve}
             isLoading={dashboardQuery.isPending}
             error={dashboardQuery.error as Error | null}
           />

@@ -230,6 +230,47 @@ export interface IngestResult {
   plans_attached?: number;
 }
 
+/** One day on the equity curve. Every calendar day gets one, trades or not. */
+export interface EquityCurvePoint {
+  date: string; // YYYY-MM-DD, in market time
+  /** P&L closed on this day alone. Zero on a quiet day. */
+  realized_pnl: number;
+  /** Running total of closed P&L. This is what the line plots. */
+  cumulative_pnl: number;
+  /** High-water mark so far, floored at zero. */
+  peak_pnl: number;
+  /** Distance below the high-water mark. Always <= 0, so deeper is lower. */
+  drawdown: number;
+  /** Round trips closed on this day. */
+  trades: number;
+}
+
+export interface EquityCurveSummary {
+  start_date: string | null;
+  end_date: string | null;
+  net_pnl: number;
+  peak_pnl: number;
+  max_drawdown: number;
+  current_drawdown: number;
+  /** Days something actually closed. */
+  trading_days: number;
+  /** Days elapsed, including the quiet ones. */
+  calendar_days: number;
+  closed_trades: number;
+}
+
+/**
+ * Cumulative realised P&L over time — deliberately not called account equity.
+ *
+ * True equity needs a starting balance and every deposit and withdrawal, none
+ * of which the broker feed carries. This is the sum of closed P&L, which the
+ * data does support, and open positions are not in it.
+ */
+export interface EquityCurve {
+  points: EquityCurvePoint[];
+  summary: EquityCurveSummary;
+}
+
 /** Where a plan is in its life. Mirrors a CHECK constraint in the database. */
 export type PlanStatus = 'OPEN' | 'ATTACHED' | 'CANCELLED';
 
@@ -739,6 +780,11 @@ export interface Heatmap {
 export interface DashboardStats {
   core_stats: CoreStats;
   heatmap: Heatmap;
+  /**
+   * Optional so a frontend deploy that lands before the API one renders the
+   * rest of the dashboard instead of crashing on a missing key.
+   */
+  equity_curve?: EquityCurve;
 }
 
 // ---------------------------------------------------------------------------
