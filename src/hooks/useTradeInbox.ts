@@ -12,6 +12,7 @@ import {
   createStrategy,
   deleteDiscipline,
   deletePosition,
+  deleteStrategy,
   deleteTrade,
   detachPlan,
   dismissPosition,
@@ -62,6 +63,7 @@ import type {
   Strategy,
   SuppressedExecution,
   StrategyCreatePayload,
+  StrategyDeleteResult,
   StrategyUpdatePayload,
   Trade,
   TradeDeleteResult,
@@ -421,6 +423,32 @@ export function useUpdateStrategy() {
     mutationFn: ({ id, payload }) => updateStrategy(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.strategies });
+    },
+  });
+}
+
+/**
+ * Delete a playbook entry, having first moved its history elsewhere.
+ *
+ * Invalidates far more than the strategy list: reassignment rewrites
+ * `strategy_id` on trades, positions and plans, so every surface that groups
+ * by strategy — the analytics breakdown above all — is now stale.
+ */
+export function useDeleteStrategy() {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    StrategyDeleteResult,
+    Error,
+    { id: string; reassignTo?: string | null }
+  >({
+    mutationFn: ({ id, reassignTo }) => deleteStrategy(id, reassignTo),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.strategies });
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
     },
   });
 }

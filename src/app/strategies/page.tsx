@@ -10,15 +10,30 @@ import {
   Loader2,
   Plus,
   Target,
+  Trash2,
   TrendingUp,
 } from 'lucide-react';
 
 import {
   useCreateStrategy,
+  useDeleteStrategy,
   useStrategies,
   useUpdateStrategy,
 } from '@/hooks/useTradeInbox';
-import type { Strategy } from '@/types/api';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { usePendingActions } from '@/components/PendingActionProvider';
+import type { Strategy, StrategyDeleteResult, StrategyUsage } from '@/types/api';
+
+/**
+ * How many rows point at a strategy.
+ *
+ * Trades and round trips are different grains of the same history, so they are
+ * summed here only to answer "is anything attached at all" — the dialog
+ * reports them separately, because "76 trades" and "1 round trip" are not
+ * interchangeable facts.
+ */
+const usageTotal = (u?: StrategyUsage): number =>
+  u ? u.trades + u.positions + u.plans : 0;
 
 /** Editable shape of one strategy; mirrors the API fields the form owns. */
 interface StrategyDraft {
@@ -58,9 +73,19 @@ export default function StrategiesPage() {
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
 
+  const deleteMutation = useDeleteStrategy();
+  const { schedule, isPending } = usePendingActions();
+  const [confirmingDelete, setConfirmingDelete] = useState<Strategy | null>(null);
+  // '' until a reassignment target is chosen. The dialog will not confirm
+  // without one whenever the strategy has history attached.
+  const [reassignTo, setReassignTo] = useState('');
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
+
   const strategies = useMemo(
-    () => strategiesQuery.data ?? [],
-    [strategiesQuery.data]
+    // Hidden while its undo window runs, so the row does not sit in the list
+    // looking undeleted — and cannot be picked as its own reassignment target.
+    () => (strategiesQuery.data ?? []).filter((s) => !isPending(`strategy:${s.id}`)),
+    [strategiesQuery.data, isPending]
   );
 
   // Select the first strategy once the list arrives, so the editor is never
@@ -250,6 +275,18 @@ export default function StrategiesPage() {
                       <p className="text-[10px] text-obsidian-muted mt-0.5 truncate">
                         {s.method || 'No method set'}
                       </p>
+                      {/* Visible before the delete button is ever pressed. A
+                          playbook entry with no trades behind it is a
+                          different thing from one carrying most of your
+                          history, and the list is where that comparison
+                          actually happens. */}
+                      {s.usage && (
+                        <p className="mt-1 text-[10px] font-mono text-obsidian-muted">
+                          {s.usage.trades === 0
+                            ? 'unused'
+                            : `${s.usage.trades} trade${s.usage.trades === 1 ? '' : 's'}`}
+                        </p>
+                      )}
                     </button>
                   </li>
                 );
@@ -275,13 +312,47 @@ export default function StrategiesPage() {
                   <h2 className="text-base font-semibold text-white">
                     {isCreating ? 'New Strategy' : selected?.name ?? 'Strategy'}
                   </h2>
-                  {savedAt && (
-                    <span className="inline-flex items-center gap-1.5 text-xs text-win">
-                      <Check className="h-3.5 w-3.5" />
-                      Saved
-                    </span>
-                  )}
+                  <div className="flex items-center gap-3">
+                    {savedAt && (
+                      <span className="inline-flex items-center gap-1.5 text-xs text-win">
+                        <Check className="h-3.5 w-3.5" />
+                        Saved
+                      </span>
+                    )}
+                    {/* Only for a saved strategy: there is nothing to delete
+                        on an unsaved draft, and offering it would imply
+                        otherwise. */}
+                    {!isCreating && selected && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmingDelete(selected);
+                          setReassignTo('');
+                          setDeleteNotice(null);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-loss/30 bg-loss/10 px-3 py-1.5 text-xs font-medium text-loss transition-colors hover:bg-loss/20"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Delete
+                      </button>
+                    )}
+                  </div>
                 </div>
+
+                {deleteNotice && (
+                  <div className="mb-4 flex items-start gap-2 rounded-lg border border-obsidian-border bg-obsidian-bg/60 px-3 py-2 text-[11px] text-slate-300">
+                    <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0 text-obsidian-muted" />
+                    <span className="flex-1">{deleteNotice}</span>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteNotice(null)}
+                      aria-label="Dismiss message"
+                      className="text-obsidian-muted hover:text-slate-200"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
 
                 <div className="space-y-5">
                   <label className="block">
@@ -399,6 +470,137 @@ export default function StrategiesPage() {
           </section>
         </div>
       </main>
+
+      {/* Deleting a playbook entry cannot lose a trade — the three foreign
+          keys are ON DELETE SET NULL. What it can lose is the attribution:
+          every trade tagged with it would fall into "Unassigned" in the
+          analytics breakdown, with nothing left to say which setup it was.
+          So a used strategy demands somewhere for its history to go. */}
+      <ConfirmDialog
+        open={confirmingDelete !== null}
+        title={`Delete "${confirmingDelete?.name ?? ''}"?`}
+        confirmLabel={
+          usageTotal(confirmingDelete?.usage) > 0
+            ? 'Reassign and delete'
+            : 'Delete strategy'
+        }
+        cancelLabel="Keep it"
+        confirmDisabled={
+          usageTotal(confirmingDelete?.usage) > 0 && reassignTo === ''
+        }
+        onCancel={() => {
+          setConfirmingDelete(null);
+          setReassignTo('');
+        }}
+        onConfirm={() => {
+          const doomed = confirmingDelete;
+          const target = reassignTo || null;
+          setConfirmingDelete(null);
+          setReassignTo('');
+          if (!doomed) return;
+
+          const targetName =
+            strategies.find((s) => s.id === target)?.name ?? null;
+
+          // Land on wherever the history went, so the reassignment is
+          // immediately inspectable rather than taken on trust.
+          if (selectedId === doomed.id) {
+            setSelectedId(target);
+            const next = strategies.find((s) => s.id === target);
+            if (next) setDraft(toDraft(next));
+          }
+
+          schedule({
+            id: `strategy:${doomed.id}`,
+            label: `"${doomed.name}" deleted`,
+            detail: targetName
+              ? `history moved to "${targetName}"`
+              : 'no trades were attached',
+            commit: () =>
+              deleteMutation.mutateAsync({ id: doomed.id, reassignTo: target }),
+            onCommitted: (result) => {
+              const r = result as StrategyDeleteResult;
+              setDeleteNotice(
+                r.reassigned_to_name
+                  ? `"${r.deleted_name}" deleted. ${r.trades_reassigned} trade(s), ` +
+                    `${r.positions_reassigned} round trip(s) and ${r.plans_reassigned} plan(s) ` +
+                    `now belong to "${r.reassigned_to_name}".`
+                  : `"${r.deleted_name}" deleted. Nothing referenced it.`
+              );
+            },
+            onError: (err) => setDeleteNotice(err.message),
+          });
+        }}
+      >
+        {usageTotal(confirmingDelete?.usage) === 0 ? (
+          <p>
+            Nothing references this strategy, so deleting it changes no trade
+            and no statistic.
+          </p>
+        ) : (
+          <>
+            <p>
+              <span className="text-slate-100">
+                {confirmingDelete?.usage?.trades ?? 0} trade
+                {(confirmingDelete?.usage?.trades ?? 0) === 1 ? '' : 's'}
+              </span>
+              {(confirmingDelete?.usage?.positions ?? 0) > 0 && (
+                <>
+                  ,{' '}
+                  <span className="text-slate-100">
+                    {confirmingDelete?.usage?.positions} round trip
+                    {confirmingDelete?.usage?.positions === 1 ? '' : 's'}
+                  </span>
+                </>
+              )}
+              {(confirmingDelete?.usage?.plans ?? 0) > 0 && (
+                <>
+                  {' '}and{' '}
+                  <span className="text-slate-100">
+                    {confirmingDelete?.usage?.plans} open plan
+                    {confirmingDelete?.usage?.plans === 1 ? '' : 's'}
+                  </span>
+                </>
+              )}{' '}
+              currently use this strategy. They will be reassigned, not deleted.
+            </p>
+
+            <label className="block pt-1">
+              <span className="text-[10px] uppercase tracking-wider text-obsidian-muted">
+                Reassign them to
+              </span>
+              <select
+                value={reassignTo}
+                onChange={(e) => setReassignTo(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs text-slate-200 focus:border-slate-600 focus:outline-none"
+              >
+                <option value="">— Choose a strategy —</option>
+                {strategies
+                  .filter((s) => s.id !== confirmingDelete?.id)
+                  .map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            {strategies.filter((s) => s.id !== confirmingDelete?.id).length ===
+              0 && (
+              <p className="text-loss">
+                This is your only strategy, so there is nowhere to move its
+                history. Create another one first.
+              </p>
+            )}
+
+            <p className="text-obsidian-muted">
+              Every figure in the analytics breakdown for this strategy will be
+              counted under the one you choose. That cannot be undone once the
+              delete goes through.
+            </p>
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }

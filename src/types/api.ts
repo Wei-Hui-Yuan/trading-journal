@@ -21,6 +21,44 @@ export interface Strategy {
   /** Exit rules, risk parameters, targets. */
   exit_criteria: string;
   created_at: string | null; // ISO 8601
+  /**
+   * How much history references this entry. Present on the list endpoint only
+   * — a strategy just created has nothing pointing at it yet, and a zero there
+   * would read as a count that was taken rather than one that was skipped.
+   */
+  usage?: StrategyUsage;
+}
+
+/**
+ * Reference counts for one playbook entry.
+ *
+ * `trades` and `positions` are different grains of the same history — a round
+ * trip is built from trades — so they are reported separately rather than
+ * summed, which would count one trade twice.
+ */
+export interface StrategyUsage {
+  trades: number;
+  positions: number;
+  plans: number;
+}
+
+/**
+ * What deleting a strategy moved before it removed anything.
+ *
+ * Deletion requires a reassignment target whenever anything references the
+ * strategy. The FKs are ON DELETE SET NULL, so a bare delete would lose no
+ * trade — but every trade tagged with it would fall into "Unassigned" in the
+ * analytics breakdown with nothing left to say which setup it belonged to.
+ */
+export interface StrategyDeleteResult {
+  deleted_id: string;
+  deleted_name: string;
+  /** Null when the strategy was unused and nothing needed moving. */
+  reassigned_to_id: string | null;
+  reassigned_to_name: string | null;
+  trades_reassigned: number;
+  positions_reassigned: number;
+  plans_reassigned: number;
 }
 
 export interface StrategyCreatePayload {

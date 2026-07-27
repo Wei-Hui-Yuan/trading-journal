@@ -27,6 +27,7 @@ import type {
   TradePlanUpdatePayload,
   Strategy,
   StrategyCreatePayload,
+  StrategyDeleteResult,
   StrategyUpdatePayload,
   Trade,
   TradeDeleteResult,
@@ -389,6 +390,24 @@ export async function updateStrategy(
   payload: StrategyUpdatePayload
 ): Promise<Strategy> {
   const { data } = await apiClient.patch<Strategy>(`/strategies/${id}`, payload);
+  return data;
+}
+
+/**
+ * DELETE /api/strategies/{id} — remove a playbook entry.
+ *
+ * `reassignTo` is required by the server whenever anything references the
+ * strategy; omitting it returns a 409 naming the counts. An unused strategy
+ * deletes without one.
+ */
+export async function deleteStrategy(
+  id: string,
+  reassignTo?: string | null
+): Promise<StrategyDeleteResult> {
+  const { data } = await apiClient.delete<StrategyDeleteResult>(
+    `/strategies/${id}`,
+    { params: reassignTo ? { reassign_to: reassignTo } : undefined }
+  );
   return data;
 }
 

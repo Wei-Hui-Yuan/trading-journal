@@ -13,6 +13,13 @@ export interface ConfirmDialogProps {
   cancelLabel?: string;
   /** Danger reds the confirm button. Anything reversible should not use it. */
   tone?: 'danger' | 'neutral';
+  /**
+   * Blocks confirmation while the dialog's own content is incomplete — e.g. a
+   * required choice inside `children` that has not been made yet. The button
+   * stays visible rather than hidden, so the action remains discoverable and
+   * what is missing stays obvious.
+   */
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -37,6 +44,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   confirmLabel,
   cancelLabel = 'Cancel',
   tone = 'danger',
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }) => {
@@ -112,7 +120,8 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
           <button
             type="button"
             onClick={onConfirm}
-            className={`rounded-lg border px-4 py-2 text-xs font-medium transition-colors ${confirmClass}`}
+            disabled={confirmDisabled}
+            className={`rounded-lg border px-4 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${confirmClass}`}
           >
             {confirmLabel}
           </button>

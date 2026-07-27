@@ -1701,6 +1701,25 @@ class StrategyUpdate(BaseModel):
     exit_criteria: Optional[str] = None
 
 
+class StrategyUsage(BaseModel):
+    """How much history is riding on one playbook entry.
+
+    Sent with every strategy so the delete affordance can state the stakes
+    before it is pressed, rather than after. `positions` is counted separately
+    from `trades` because they are different grains -- a round trip versus the
+    individual fills behind it -- and summing them would report one trade
+    twice.
+    """
+
+    trades: int = 0
+    positions: int = 0
+    plans: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.trades + self.positions + self.plans
+
+
 class StrategyOut(BaseModel):
     id: uuid.UUID
     name: str
@@ -1711,6 +1730,9 @@ class StrategyOut(BaseModel):
     entry_criteria: str = ""
     exit_criteria: str = ""
     created_at: Optional[datetime]
+    # Absent on create/update responses, where nothing has had a chance to
+    # reference the row yet. Only the list endpoint fills it in.
+    usage: Optional[StrategyUsage] = None
 
     @field_validator("method", "entry_criteria", "exit_criteria", mode="before")
     @classmethod
@@ -1721,6 +1743,33 @@ class StrategyOut(BaseModel):
         from_attributes = True
 
 
+async def _strategy_usage(session: AsyncSession) -> dict[uuid.UUID, StrategyUsage]:
+    """Reference counts per strategy, in three grouped queries rather than 3N.
+
+    Counting per strategy in a loop would issue a query per playbook entry on
+    every page load, for a number the UI shows on every row.
+    """
+    usage: dict[uuid.UUID, StrategyUsage] = {}
+
+    for model, field in (
+        (Trade, "trades"),
+        (Position, "positions"),
+        (PlannedTrade, "plans"),
+    ):
+        rows = (
+            await session.execute(
+                select(model.strategy_id, func.count())
+                .where(model.strategy_id.is_not(None))
+                .group_by(model.strategy_id)
+            )
+        ).all()
+        for strategy_id, count in rows:
+            entry = usage.setdefault(strategy_id, StrategyUsage())
+            setattr(entry, field, count)
+
+    return usage
+
+
 @app.get(
     "/api/strategies",
     response_model=list[StrategyOut],
@@ -1728,7 +1777,13 @@ class StrategyOut(BaseModel):
 )
 async def list_strategies(session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(Strategy).order_by(Strategy.name))
-    return [StrategyOut.model_validate(s) for s in result.scalars().all()]
+    usage = await _strategy_usage(session)
+    out: list[StrategyOut] = []
+    for strategy in result.scalars().all():
+        item = StrategyOut.model_validate(strategy)
+        item.usage = usage.get(strategy.id, StrategyUsage())
+        out.append(item)
+    return out
 
 
 @app.post(
@@ -1787,6 +1842,109 @@ async def update_strategy(
         )
     await session.refresh(strategy)
     return StrategyOut.model_validate(strategy)
+
+
+class StrategyDeleteResult(BaseModel):
+    """What a deletion moved before it removed anything."""
+
+    deleted_id: uuid.UUID
+    deleted_name: str
+    reassigned_to_id: Optional[uuid.UUID] = None
+    reassigned_to_name: Optional[str] = None
+    trades_reassigned: int = 0
+    positions_reassigned: int = 0
+    plans_reassigned: int = 0
+
+
+@app.delete(
+    "/api/strategies/{strategy_id}",
+    response_model=StrategyDeleteResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_strategy(
+    strategy_id: uuid.UUID,
+    reassign_to: Optional[uuid.UUID] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Remove a playbook entry, moving its history to another entry first.
+
+    The three FKs pointing here are all ON DELETE SET NULL, so the database
+    would happily accept a bare delete -- no trade would be lost. What would be
+    lost is the *attribution*: every trade tagged with this strategy would fall
+    into the "Unassigned" bucket in the analytics breakdown, and there is no
+    record afterwards of which setup they belonged to. On this account one
+    playbook entry carries 76 of 123 closed trades, so that is a real
+    analysis destroyed by a single click.
+
+    Hence `reassign_to` is mandatory whenever anything references the strategy.
+    An unused entry deletes outright -- there is nothing to preserve.
+
+    The moves and the delete share one transaction: a reassignment that
+    committed without the delete would leave two strategies looking identical,
+    and a delete that committed without the reassignment is the silent-NULL
+    outcome this endpoint exists to prevent.
+    """
+    strategy = await session.get(Strategy, strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    usage = (await _strategy_usage(session)).get(strategy_id, StrategyUsage())
+
+    if usage.total == 0:
+        name = strategy.name
+        await session.delete(strategy)
+        await session.commit()
+        return StrategyDeleteResult(deleted_id=strategy_id, deleted_name=name)
+
+    if reassign_to is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{strategy.name}' is used by {usage.trades} trade(s), "
+                f"{usage.positions} round trip(s) and {usage.plans} plan(s). "
+                "Choose a strategy to reassign them to before deleting."
+            ),
+        )
+
+    if reassign_to == strategy_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot reassign a strategy to itself.",
+        )
+
+    target = await session.get(Strategy, reassign_to)
+    if target is None:
+        raise HTTPException(
+            status_code=404, detail="The strategy to reassign to was not found."
+        )
+
+    moved: dict[str, int] = {}
+    for model, key in (
+        (Trade, "trades"),
+        (Position, "positions"),
+        (PlannedTrade, "plans"),
+    ):
+        result = await session.execute(
+            update(model)
+            .where(model.strategy_id == strategy_id)
+            .values(strategy_id=reassign_to)
+        )
+        moved[key] = result.rowcount or 0
+
+    name = strategy.name
+    target_name = target.name
+    await session.delete(strategy)
+    await session.commit()
+
+    return StrategyDeleteResult(
+        deleted_id=strategy_id,
+        deleted_name=name,
+        reassigned_to_id=reassign_to,
+        reassigned_to_name=target_name,
+        trades_reassigned=moved["trades"],
+        positions_reassigned=moved["positions"],
+        plans_reassigned=moved["plans"],
+    )
 
 
 # ---------------------------------------------------------------------------
