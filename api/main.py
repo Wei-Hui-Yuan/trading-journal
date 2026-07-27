@@ -29,8 +29,10 @@ from sqlalchemy import (
     Text,
     delete,
     func,
+    literal,
     or_,
     select,
+    union_all,
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -1783,28 +1785,37 @@ class StrategyOut(BaseModel):
 
 
 async def _strategy_usage(session: AsyncSession) -> dict[uuid.UUID, StrategyUsage]:
-    """Reference counts per strategy, in three grouped queries rather than 3N.
+    """Reference counts per strategy, in a single round trip.
 
-    Counting per strategy in a loop would issue a query per playbook entry on
-    every page load, for a number the UI shows on every row.
+    One UNION ALL rather than three separate GROUP BYs, and certainly not a
+    query per playbook entry. The shape matters more than it looks: this API
+    container sits far from its database -- a bare `SELECT 1` measures ~1.2s
+    from inside it against ~15ms from a host near Supabase -- so latency here
+    is paid per ROUND TRIP, not per row. Three queries over nine strategies
+    and a few hundred rows cost three times as much as one, entirely in
+    waiting.
     """
-    usage: dict[uuid.UUID, StrategyUsage] = {}
+    parts = [
+        select(
+            model.strategy_id.label("strategy_id"),
+            literal(label).label("kind"),
+            func.count().label("n"),
+        )
+        .where(model.strategy_id.is_not(None))
+        .group_by(model.strategy_id)
+        for model, label in (
+            (Trade, "trades"),
+            (Position, "positions"),
+            (PlannedTrade, "plans"),
+        )
+    ]
 
-    for model, field in (
-        (Trade, "trades"),
-        (Position, "positions"),
-        (PlannedTrade, "plans"),
-    ):
-        rows = (
-            await session.execute(
-                select(model.strategy_id, func.count())
-                .where(model.strategy_id.is_not(None))
-                .group_by(model.strategy_id)
-            )
-        ).all()
-        for strategy_id, count in rows:
-            entry = usage.setdefault(strategy_id, StrategyUsage())
-            setattr(entry, field, count)
+    rows = (await session.execute(union_all(*parts))).all()
+
+    usage: dict[uuid.UUID, StrategyUsage] = {}
+    for strategy_id, kind, count in rows:
+        entry = usage.setdefault(strategy_id, StrategyUsage())
+        setattr(entry, kind, count)
 
     return usage
 
