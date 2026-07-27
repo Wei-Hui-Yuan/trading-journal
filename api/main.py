@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import uuid
@@ -466,6 +467,35 @@ async def get_session():
         yield session
 
 
+async def _warm_connection_pool() -> None:
+    """Open every pooled connection up front, so no request has to.
+
+    Opened concurrently and released immediately: each task holds a distinct
+    connection at the same moment, which is what forces the pool to fill
+    rather than one connection being handed round the loop.
+
+    Never fatal. A database that is unreachable at boot must not stop the
+    process from starting -- /health exists precisely to report that state,
+    and it cannot report anything if the app died trying to warm a pool.
+    """
+    size = engine.pool.size() if hasattr(engine.pool, "size") else 0
+    if not size:
+        return
+
+    async def touch() -> None:
+        async with engine.connect() as connection:
+            await connection.execute(select(1))
+
+    try:
+        await asyncio.gather(*(touch() for _ in range(size)))
+        logger.info("Connection pool warmed: %d connections ready", size)
+    except Exception as exc:  # noqa: BLE001 - startup must survive a cold database
+        logger.warning(
+            "Could not warm the connection pool (%s); serving anyway",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown.
@@ -483,7 +513,16 @@ async def lifespan(app: FastAPI):
     defaults, leaving the database quietly diverged from what the migration
     files describe. Schema changes belong in api/migrations/, applied
     deliberately.
+
+    It DOES fill the connection pool, because the first page load of a session
+    otherwise pays for it. The dashboard issues six requests at once and the
+    pool starts empty, so each one opens its own connection to Supabase --
+    measured at ~89ms per handshake, turning a 107ms burst into a 341ms one.
+    Doing it here moves that cost into container startup, where nobody is
+    waiting. Northflank restarts the container often enough on the free tier
+    that this is not a one-time saving.
     """
+    await _warm_connection_pool()
     yield
     await engine.dispose()
 
