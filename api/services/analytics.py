@@ -102,6 +102,8 @@ class ClosedPosition:
     # Optional because a position row could in principle lack it; such rows are
     # dropped from the curve rather than dated by a guess.
     exit_time: Optional[datetime] = None
+    gross_pnl: Optional[Decimal] = None
+    commission: Optional[Decimal] = None
 
 
 @dataclass
@@ -158,6 +160,8 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
     if not total_trades:
         return {
             "net_pnl": 0.0,
+            "gross_pnl": 0.0,
+            "total_commission": 0.0,
             "win_rate_pct": 0.0,
             "total_trades": 0,
             "profit_factor": 0.0,
@@ -165,6 +169,8 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
         }
 
     net_pnl = Decimal("0")
+    total_gross_pnl = Decimal("0")
+    total_commission = Decimal("0")
     gross_profit = Decimal("0")  # sum of winning P&L
     gross_loss = Decimal("0")  # sum of |losing P&L|
     wins = 0
@@ -174,6 +180,8 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
     for position in positions:
         pnl = position.realized_pnl
         net_pnl += pnl
+        total_gross_pnl += position.gross_pnl if position.gross_pnl is not None else pnl
+        total_commission += position.commission if position.commission is not None else Decimal("0")
 
         if pnl > 0:
             gross_profit += pnl
@@ -201,6 +209,8 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
 
     return {
         "net_pnl": float(net_pnl),
+        "gross_pnl": float(total_gross_pnl),
+        "total_commission": float(total_commission),
         "win_rate_pct": round(wins / total_trades * 100, 2),
         "total_trades": total_trades,
         "profit_factor": profit_factor,
@@ -270,6 +280,8 @@ async def load_closed_positions(session: AsyncSession) -> list[ClosedPosition]:
     return [
         ClosedPosition(
             realized_pnl=Decimal(str(row.realized_pnl)),
+            gross_pnl=Decimal(str(row.gross_pnl)) if row.gross_pnl is not None else Decimal(str(row.realized_pnl)),
+            commission=Decimal(str(row.commission)) if row.commission is not None else Decimal("0"),
             entry_price=Decimal(str(row.entry_price)),
             quantity=Decimal(str(row.quantity)),
             entry_time=row.entry_time,

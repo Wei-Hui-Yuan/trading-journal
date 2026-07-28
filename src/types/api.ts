@@ -835,6 +835,8 @@ export type DayName =
 
 export interface CoreStats {
   net_pnl: number;
+  gross_pnl?: number;
+  total_commission?: number;
   win_rate_pct: number;
   total_trades: number;
   /**
@@ -998,6 +1000,8 @@ export interface DisciplineBreakdown {
  */
 export interface KPIStats {
   netPnl: number;
+  grossPnl: number;
+  totalCommission: number;
   winRate: number;
   totalTrades: number;
   /** null when there are no losing trades - the ratio is unbounded. */

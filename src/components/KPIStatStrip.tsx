@@ -21,7 +21,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
           : 'border-loss/30 shadow-loss-glow hover:border-loss/50'
       }`}>
         <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Net P&L</span>
+          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Net P&amp;L</span>
           <div className={`p-1.5 rounded-lg ${isNetWin ? 'bg-win/10 text-win' : 'bg-loss/10 text-loss'}`}>
             {isNetWin ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
           </div>
@@ -31,10 +31,21 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
             {formatMoney(stats.netPnl)}
           </span>
         </div>
-        <div className="mt-2 flex items-center text-[11px] text-obsidian-muted">
-          {/* Every closed round trip, not a rolling window. The old label said
-              "Trailing 30 Days" over a figure covering the whole history. */}
-          <span>All-Time P&amp;L</span>
+        
+        {/* Sub-breakdown: Market Trading P&L vs Broker Fees */}
+        <div className="mt-3 pt-2.5 border-t border-obsidian-border/60 flex flex-col space-y-1 font-mono">
+          <div className="flex justify-between items-center text-xs">
+            <span className="text-obsidian-muted text-[11px]">Market Trading P&amp;L:</span>
+            <span className={stats.grossPnl >= 0 ? 'text-win font-semibold' : 'text-loss font-semibold'}>
+              {formatMoney(stats.grossPnl)}
+            </span>
+          </div>
+          <div className="flex justify-between items-center text-xs">
+            <span className="text-obsidian-muted text-[11px]">Broker Fees &amp; Commissions:</span>
+            <span className="text-amber-400 font-semibold">
+              -{formatMoney(stats.totalCommission)}
+            </span>
+          </div>
         </div>
       </div>
 

@@ -268,6 +268,9 @@ const RoundTripHeader = React.memo<RoundTripHeaderProps>(function RoundTripHeade
   const isBuy = rt.direction === 'BUY';
   const isOpen = rt.kind === 'open';
 
+  const absGross = Math.abs(rt.gross_pnl ?? rt.realized_pnl ?? 0);
+  const feeDragPct = absGross > 0 && rt.commission !== null ? (rt.commission / absGross) * 100 : 0;
+
   return (
     <button
       type="button"
@@ -325,6 +328,15 @@ const RoundTripHeader = React.memo<RoundTripHeaderProps>(function RoundTripHeade
         >
           {rt.realized_pnl >= 0 ? '+' : ''}
           {rt.realized_pnl.toFixed(2)}
+        </span>
+      )}
+
+      {rt.commission !== null && rt.commission > 0 && (
+        <span
+          className="hidden shrink-0 rounded bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] text-amber-400 sm:inline"
+          title={`Broker Commission: $${rt.commission.toFixed(2)} (${feeDragPct.toFixed(0)}% of gross trade value)`}
+        >
+          Fee: ${rt.commission.toFixed(2)} ({feeDragPct.toFixed(0)}%)
         </span>
       )}
 
