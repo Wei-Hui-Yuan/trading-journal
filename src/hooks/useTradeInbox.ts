@@ -22,6 +22,7 @@ import {
   getDashboardAnalytics,
   getDisciplines,
   getPendingPositions,
+  getPositionDeleteImpact,
   getPositionFills,
   getRoundTrips,
   getSettings,
@@ -47,6 +48,7 @@ import type {
   ExecutionUpdateResult,
   IngestResult,
   LastSyncState,
+  PositionDeleteImpact,
   PositionDeleteResult,
   ManualTradePayload,
   ManualTradeResult,
@@ -535,9 +537,33 @@ export function useUpdateExecution() {
 /** Remove a round trip and the executions under it — for a trade that never happened. */
 export function useDeletePosition() {
   const queryClient = useQueryClient();
-  return useMutation<PositionDeleteResult, Error, { id: string; reason?: string }>({
-    mutationFn: ({ id, reason }) => deletePosition(id, reason),
+  return useMutation<
+    PositionDeleteResult,
+    Error,
+    { id: string; reason?: string; includeShared?: boolean }
+  >({
+    mutationFn: ({ id, reason, includeShared }) =>
+      deletePosition(id, reason, includeShared),
     onSuccess: () => invalidateLedger(queryClient),
+  });
+}
+
+/**
+ * What deleting this round trip would take with it, fetched when the
+ * confirmation opens.
+ *
+ * Disabled until an id is passed, so nothing is requested while the dialog is
+ * closed. Not cached beyond the interaction: the answer depends on which
+ * executions currently exist, and the next sync can change it.
+ */
+export function usePositionDeleteImpact(positionId: string | null) {
+  return useQuery<PositionDeleteImpact>({
+    queryKey: ['position-delete-impact', positionId],
+    queryFn: () => getPositionDeleteImpact(positionId as string),
+    enabled: positionId !== null,
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
   });
 }
 

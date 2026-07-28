@@ -556,6 +556,34 @@ export interface ExecutionUpdateResult {
   reviews_discarded: number;
 }
 
+/**
+ * A round trip that shares an execution with the one being deleted.
+ *
+ * One fill can belong to two positions: an oversell that flips long to short
+ * closes the long and opens the short with the same execution. Deleting either
+ * round trip's fills therefore destroys the other one, so it gets named before
+ * the user confirms rather than reported afterwards.
+ */
+export interface SharedRoundTrip {
+  position_id: string;
+  symbol: string;
+  quantity: number;
+  realized_pnl: number;
+  entry_time: string;
+  exit_time: string;
+  /** Carries a grade, notes or a post-mortem — the part re-matching cannot rebuild. */
+  has_review: boolean;
+}
+
+/** GET /api/positions/{id}/delete-impact — what the delete would take with it. */
+export interface PositionDeleteImpact {
+  position_id: string;
+  ticker: string;
+  executions_deleted: number;
+  shared_round_trips: SharedRoundTrip[];
+  reviews_at_risk: number;
+}
+
 /** Result of DELETE /api/positions/{id} — removes the executions underneath. */
 export interface PositionDeleteResult {
   position_id: string;
@@ -563,6 +591,9 @@ export interface PositionDeleteResult {
   executions_deleted: number;
   positions_rebuilt: number;
   suppressed_from_future_syncs: number;
+  /** Round trips removed BESIDES the one asked for. Zero on an ordinary delete. */
+  positions_removed: number;
+  reviews_discarded: number;
 }
 
 // ---------------------------------------------------------------------------

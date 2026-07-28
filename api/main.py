@@ -366,11 +366,18 @@ class Position(Base):
 
     # Which pair of executions produced this position. A unique index on the
     # pair makes re-running the matching engine a no-op instead of a duplicate.
+    #
+    # NOT NULL since migration 019, which is what makes that index trustworthy:
+    # Postgres treats NULLs as distinct, so a row keyed (NULL, ...) collides
+    # with nothing and the next rebuild inserts the same round trip again.
+    # SET NULL is kept deliberately -- combined with NOT NULL it means deleting
+    # an execution out from under a surviving position fails loudly instead of
+    # leaving one behind with no fills.
     open_trade_id = Column(
-        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=False
     )
     close_trade_id = Column(
-        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="SET NULL"), nullable=False
     )
 
     # Review workflow (migration 002). The matching engine writes review_status
@@ -2599,12 +2606,7 @@ async def update_execution(
         affected = (
             await session.execute(select(Position).where(Position.id.in_(affected_ids)))
         ).scalars().all()
-        reviews_discarded = sum(
-            1
-            for p in affected
-            if p.review_status == ReviewStatus.reviewed.value
-            or any((p.review_went_well, p.review_went_wrong, p.review_lessons, p.notes))
-        )
+        reviews_discarded = sum(1 for p in affected if _position_has_review(p))
         await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
 
     await session.commit()
@@ -2790,12 +2792,7 @@ async def delete_trade(
         affected = (
             await session.execute(select(Position).where(Position.id.in_(affected_ids)))
         ).scalars().all()
-        reviews_discarded = sum(
-            1
-            for p in affected
-            if p.review_status == ReviewStatus.reviewed.value
-            or any((p.review_went_well, p.review_went_wrong, p.review_lessons, p.notes))
-        )
+        reviews_discarded = sum(1 for p in affected if _position_has_review(p))
         # position_fills.position_id cascades, so the fills go with them.
         await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
 
@@ -2840,6 +2837,98 @@ async def delete_trade(
     )
 
 
+def _position_has_review(position: Position) -> bool:
+    """Whether losing this round trip would lose work the user cannot redo.
+
+    Re-matching rebuilds quantity, prices and P&L from the fills. It cannot
+    rebuild a grade, a note or a post-mortem, so those are what "discarded"
+    counts -- and every surface that reports a number counts it this way, so
+    one figure means one thing across the app.
+    """
+    return position.review_status == ReviewStatus.reviewed.value or any(
+        (
+            position.review_went_well,
+            position.review_went_wrong,
+            position.review_lessons,
+            position.notes,
+        )
+    )
+
+
+async def _executions_behind(
+    session: AsyncSession, position_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Every execution this round trip was built from."""
+    return list(set((
+        await session.execute(
+            select(PositionFill.trade_id).where(PositionFill.position_id == position_id)
+        )
+    ).scalars().all()))
+
+
+async def _round_trips_sharing_executions(
+    session: AsyncSession, position_id: uuid.UUID, trade_ids: list[uuid.UUID]
+) -> list[Position]:
+    """Other round trips built on any of the same executions.
+
+    One fill can belong to two positions. An oversell that flips long to short
+    closes the long and opens the short with the SAME execution -- BUY 10,
+    SELL 15 leaves that sell 5 shares open -- so it appears in position_fills
+    twice, CLOSE of one round trip and OPEN of the next.
+
+    That makes deleting a position by way of its executions reach further than
+    the position. `position_fills.trade_id` is ON DELETE CASCADE, so the
+    neighbour loses its fills, and `positions.open_trade_id` is only SET NULL,
+    so the neighbour's row survives asserting a P&L with nothing underneath it.
+    Callers need to know before they act, not after.
+    """
+    if not trade_ids:
+        return []
+
+    ids = (
+        await session.execute(
+            select(PositionFill.position_id)
+            .where(
+                PositionFill.trade_id.in_(trade_ids),
+                PositionFill.position_id != position_id,
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    if not ids:
+        return []
+
+    return list((
+        await session.execute(
+            select(Position).where(Position.id.in_(ids)).order_by(Position.entry_time)
+        )
+    ).scalars().all())
+
+
+class SharedRoundTrip(BaseModel):
+    """A neighbouring round trip that would be destroyed as collateral."""
+
+    position_id: uuid.UUID
+    symbol: str
+    quantity: Decimal
+    realized_pnl: Decimal
+    entry_time: datetime
+    exit_time: datetime
+    # Whether it carries a grade, notes or a post-mortem. Re-matching can
+    # rebuild everything else about it; not this.
+    has_review: bool
+
+
+class PositionDeleteImpact(BaseModel):
+    """What DELETE /api/positions/{id} would remove, without removing it."""
+
+    position_id: uuid.UUID
+    ticker: str
+    executions_deleted: int
+    shared_round_trips: list[SharedRoundTrip]
+    reviews_at_risk: int
+
+
 class PositionDeleteResult(BaseModel):
     """What removing a round trip actually removed.
 
@@ -2853,6 +2942,54 @@ class PositionDeleteResult(BaseModel):
     executions_deleted: int
     positions_rebuilt: int
     suppressed_from_future_syncs: int
+    # Round trips OTHER than the one asked for that no longer exist afterwards:
+    # neighbours sharing an execution, plus anything the rebuild found stale.
+    # Zero on the ordinary delete; non-zero is the case worth reading about.
+    positions_removed: int = 0
+    reviews_discarded: int = 0
+
+
+@app.get(
+    "/api/positions/{position_id}/delete-impact",
+    response_model=PositionDeleteImpact,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def position_delete_impact(
+    position_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """What deleting this round trip would take with it.
+
+    Read-only, and the whole point is that it runs BEFORE the confirmation
+    prompt. A delete here removes executions, and an execution can be shared
+    with the round trip on either side of it, so the honest version of "are you
+    sure?" has to name what else goes. Asking afterwards is not asking.
+    """
+    position = await session.get(Position, position_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    trade_ids = await _executions_behind(session, position_id)
+    shared = await _round_trips_sharing_executions(session, position_id, trade_ids)
+
+    return PositionDeleteImpact(
+        position_id=position_id,
+        ticker=position.symbol,
+        executions_deleted=len(trade_ids),
+        shared_round_trips=[
+            SharedRoundTrip(
+                position_id=p.id,
+                symbol=p.symbol,
+                quantity=p.quantity,
+                realized_pnl=p.realized_pnl,
+                entry_time=p.entry_time,
+                exit_time=p.exit_time,
+                has_review=_position_has_review(p),
+            )
+            for p in shared
+        ],
+        reviews_at_risk=sum(1 for p in shared if _position_has_review(p)),
+    )
 
 
 @app.delete(
@@ -2863,6 +3000,7 @@ class PositionDeleteResult(BaseModel):
 async def delete_position(
     position_id: uuid.UUID,
     reason: Optional[str] = None,
+    include_shared: bool = False,
     session: AsyncSession = Depends(get_session),
 ):
     """Delete a round trip AND the executions it was built from.
@@ -2878,6 +3016,11 @@ async def delete_position(
     simply do not want to review, dismiss it instead and keep the P&L.
 
     Broker fills are tombstoned on the way out so the sync cannot re-add them.
+
+    One execution can belong to two round trips, so this can reach beyond the
+    position asked for. It refuses to by default: `include_shared=true` is
+    required, and the client is expected to have called
+    GET /api/positions/{id}/delete-impact and shown the user what else goes.
     """
     from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
         run_matching_for_ticker,
@@ -2888,11 +3031,26 @@ async def delete_position(
         raise HTTPException(status_code=404, detail="Position not found")
 
     ticker = position.symbol
-    trade_ids = list(set((
-        await session.execute(
-            select(PositionFill.trade_id).where(PositionFill.position_id == position_id)
+    trade_ids = await _executions_behind(session, position_id)
+
+    # An oversell that flips long to short closes one round trip and opens the
+    # next with the same fill. Deleting that fill silently destroys the
+    # neighbour -- and the neighbour's review, which nothing can rebuild -- so
+    # it takes a deliberate second answer rather than happening by surprise.
+    shared = await _round_trips_sharing_executions(session, position_id, trade_ids)
+    if shared and not include_shared:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(shared)} other round trip"
+                f"{'' if len(shared) == 1 else 's'} on {ticker} "
+                f"{'shares' if len(shared) == 1 else 'share'} an execution with "
+                "this one and would be deleted too. Call "
+                f"/api/positions/{position_id}/delete-impact to see which, then "
+                "retry with include_shared=true — or delete the individual "
+                "fills from the journal instead."
+            ),
         )
-    ).scalars().all()))
 
     suppressed = 0
     if trade_ids:
@@ -2916,16 +3074,33 @@ async def delete_position(
                 )
                 suppressed += 1
 
-    # The position goes first; position_fills cascades from both sides, and
-    # deleting the trades while fills still referenced the position would leave
-    # it asserting a size its executions no longer support.
+    # Counted before anything is deleted, while the rows are still readable.
+    reviews_discarded = sum(1 for p in shared if _position_has_review(p))
+
+    # Positions go first, this one and every neighbour that shares a fill with
+    # it. `position_fills` cascades from both sides, so deleting the executions
+    # while a position still referenced them would leave that position
+    # asserting a size its fills no longer support -- and migration 019 now
+    # refuses the SET NULL that would otherwise make it dangle quietly.
     await session.delete(position)
+    if shared:
+        await session.execute(
+            delete(Position).where(Position.id.in_([p.id for p in shared]))
+        )
+        logger.warning(
+            "Deleting round trip %s on %s also removed %d neighbouring round "
+            "trip(s) and %d review(s): they were built on the same execution.",
+            position_id,
+            ticker,
+            len(shared),
+            reviews_discarded,
+        )
     if trade_ids:
         await session.execute(delete(Trade).where(Trade.id.in_(trade_ids)))
     await session.commit()
 
-    # Other round trips on this ticker are untouched by the rebuild; matching
-    # is idempotent on the open/close pair.
+    # Authoritative: removing executions re-partitions the ticker's FIFO queue,
+    # so round trips built from what is left can differ from what was stored.
     result = await run_matching_for_ticker(session, ticker, persist=True)
 
     return PositionDeleteResult(
@@ -2934,6 +3109,10 @@ async def delete_position(
         executions_deleted=len(trade_ids),
         positions_rebuilt=len(result.positions),
         suppressed_from_future_syncs=suppressed,
+        # The neighbours removed here, plus anything the rebuild found stale.
+        # Both are round trips the user did not ask to delete.
+        positions_removed=len(shared) + result.positions_removed,
+        reviews_discarded=reviews_discarded + result.reviews_discarded,
     )
 
 

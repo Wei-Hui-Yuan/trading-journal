@@ -22,6 +22,7 @@ import {
   useDisciplines,
   useDismissPosition,
   usePendingPositions,
+  usePositionDeleteImpact,
   useReviewPosition,
   useStrategies,
 } from '@/hooks/useTradeInbox';
@@ -97,6 +98,11 @@ export function TradeInboxQueue() {
   // Which round trip is being confirmed for deletion, if any. Holds the whole
   // position rather than an id so the dialog can name the P&L at stake.
   const [confirmingDelete, setConfirmingDelete] = useState<Position | null>(null);
+  // Asked while the dialog is opening, not after the user answers. Deleting a
+  // round trip deletes its executions, and an execution can belong to the round
+  // trip beside it too, so the prompt has to be able to name what else goes.
+  const impactQuery = usePositionDeleteImpact(confirmingDelete?.id ?? null);
+  const sharedRoundTrips = impactQuery.data?.shared_round_trips ?? [];
   const { schedule, isPending } = usePendingActions();
 
   // Drafts are keyed by position id so each card edits independently.
@@ -209,17 +215,25 @@ export function TradeInboxQueue() {
       <ConfirmDialog
         open={confirmingDelete !== null}
         title={`Delete this ${confirmingDelete?.symbol ?? ''} round trip?`}
-        confirmLabel="Delete round trip"
+        confirmLabel={sharedRoundTrips.length > 0 ? 'Delete both' : 'Delete round trip'}
         cancelLabel="Keep it"
+        // Nothing is confirmable until the preflight has answered. The whole
+        // point of asking the server first is that the question on screen might
+        // be the wrong one -- deleting this round trip can delete another.
+        confirmDisabled={impactQuery.isPending}
         onCancel={() => setConfirmingDelete(null)}
         onConfirm={() => {
           const position = confirmingDelete;
+          const alsoRemoved = sharedRoundTrips.length;
           setConfirmingDelete(null);
           if (!position) return;
           setActionNotice(null);
           schedule({
             id: `position:${position.id}`,
-            label: `${position.symbol} round trip deleted`,
+            label:
+              alsoRemoved > 0
+                ? `${position.symbol} round trip deleted, with ${alsoRemoved} more`
+                : `${position.symbol} round trip deleted`,
             detail:
               position.realized_pnl === null
                 ? undefined
@@ -230,11 +244,21 @@ export function TradeInboxQueue() {
               deletePositionMutation.mutateAsync({
                 id: position.id,
                 reason: 'Deleted from the Trade Inbox',
+                // Only ever true after the dialog above named what else goes.
+                // The API returns 409 without it, which is the guard for any
+                // client that did not ask first.
+                includeShared: alsoRemoved > 0,
               }),
             onCommitted: (result) => {
               const r = result as PositionDeleteResult;
               setActionNotice(
                 `${r.ticker}: removed, ${r.executions_deleted} execution(s) deleted` +
+                  (r.positions_removed > 0
+                    ? `, ${r.positions_removed} other round trip(s) removed with it` +
+                      (r.reviews_discarded > 0
+                        ? ` and ${r.reviews_discarded} review(s) lost`
+                        : '')
+                    : '') +
                   (r.suppressed_from_future_syncs > 0
                     ? `, ${r.suppressed_from_future_syncs} suppressed from future syncs.`
                     : '.')
@@ -249,6 +273,60 @@ export function TradeInboxQueue() {
           <span className="text-slate-100">{confirmingDelete?.symbol}</span>&apos;s
           round trips.
         </p>
+
+        {/* The reason this dialog waits on the server. One execution can belong
+            to two round trips -- an oversell closes the long and opens the
+            short with the same fill -- so deleting this one's executions can
+            destroy the round trip beside it, and its review with it. Naming
+            them here is the difference between confirming and being told
+            afterwards. */}
+        {impactQuery.isPending && (
+          <p className="text-obsidian-muted">Checking what else this would remove…</p>
+        )}
+        {sharedRoundTrips.length > 0 && (
+          <div className="rounded-lg border border-loss/30 bg-loss/5 px-2.5 py-2">
+            <p className="font-semibold text-loss">
+              {sharedRoundTrips.length} other round trip
+              {sharedRoundTrips.length === 1 ? '' : 's'} will be deleted too.
+            </p>
+            <p className="mt-1 text-obsidian-muted">
+              {sharedRoundTrips.length === 1 ? 'It shares' : 'They share'} an
+              execution with this one — a fill that closed one position and
+              opened the next — so it cannot be removed alone.
+            </p>
+            <ul className="mt-1.5 space-y-0.5">
+              {sharedRoundTrips.map((rt) => (
+                <li key={rt.position_id} className="font-mono text-[11px] text-slate-300">
+                  {rt.symbol} {Number(rt.quantity)} @{' '}
+                  {new Date(rt.entry_time).toLocaleDateString()} ·{' '}
+                  <span className={rt.realized_pnl >= 0 ? 'text-win' : 'text-loss'}>
+                    {rt.realized_pnl >= 0 ? '+' : ''}${rt.realized_pnl.toFixed(2)}
+                  </span>
+                  {rt.has_review && (
+                    <span className="text-amber-300"> · reviewed</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {impactQuery.data && impactQuery.data.reviews_at_risk > 0 && (
+              <p className="mt-1.5 text-amber-200/90">
+                {impactQuery.data.reviews_at_risk} review
+                {impactQuery.data.reviews_at_risk === 1 ? '' : 's'} cannot be
+                rebuilt. Everything else re-matches from the fills; this does not.
+              </p>
+            )}
+            <p className="mt-1.5 text-obsidian-muted">
+              To keep {sharedRoundTrips.length === 1 ? 'it' : 'them'}, cancel and
+              delete the individual fills from the Journal instead.
+            </p>
+          </div>
+        )}
+        {impactQuery.isError && (
+          <p className="text-amber-300">
+            Could not check for shared executions ({impactQuery.error.message}).
+            Deleting may remove more than this round trip.
+          </p>
+        )}
         {confirmingDelete?.realized_pnl != null && (
           <p>
             Its P&amp;L of{' '}

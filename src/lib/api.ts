@@ -7,6 +7,7 @@ import type {
   DashboardStats,
   ExecutionUpdatePayload,
   ExecutionUpdateResult,
+  PositionDeleteImpact,
   PositionDeleteResult,
   SuppressedExecution,
   UnsuppressResult,
@@ -262,11 +263,37 @@ export async function updateExecution(
  */
 export async function deletePosition(
   id: string,
-  reason?: string
+  reason?: string,
+  includeShared = false
 ): Promise<PositionDeleteResult> {
   const { data } = await apiClient.delete<PositionDeleteResult>(
     `/positions/${id}`,
-    { params: reason ? { reason } : undefined }
+    {
+      params: {
+        ...(reason ? { reason } : {}),
+        // Without this the API returns 409 whenever an execution under this
+        // round trip also belongs to another one. Only set once the user has
+        // been shown which, via getPositionDeleteImpact.
+        ...(includeShared ? { include_shared: true } : {}),
+      },
+    }
+  );
+  return data;
+}
+
+/**
+ * GET /api/positions/{id}/delete-impact — what a delete would remove.
+ *
+ * Read-only, and fetched before the confirmation prompt rather than after it.
+ * Deleting a round trip deletes its executions, and an execution can be shared
+ * with the round trip beside it, so "are you sure?" is only an honest question
+ * once it can name what else disappears.
+ */
+export async function getPositionDeleteImpact(
+  id: string
+): Promise<PositionDeleteImpact> {
+  const { data } = await apiClient.get<PositionDeleteImpact>(
+    `/positions/${id}/delete-impact`
   );
   return data;
 }
