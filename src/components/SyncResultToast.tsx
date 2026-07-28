@@ -157,6 +157,35 @@ export const SyncResultToast: React.FC = () => {
                 </p>
               )}
 
+              {/* Rare, and never something to discover later from a changed
+                  headline. A fill dated earlier than ones already stored
+                  re-partitions FIFO for that ticker, so round trips closed by
+                  an earlier run can stop existing — taking their P&L out of
+                  every statistic, and their review with them. */}
+              {(result.positions_removed ?? 0) > 0 && (
+                <p className="mt-3 rounded-lg border border-loss/30 bg-loss/5 px-2.5 py-2 text-[11px] leading-relaxed text-loss">
+                  <span className="font-semibold">
+                    {result.positions_removed} closed round trip
+                    {result.positions_removed === 1 ? '' : 's'} no longer
+                    match{result.positions_removed === 1 ? 'es' : ''} and{' '}
+                    {result.positions_removed === 1 ? 'was' : 'were'} removed.
+                  </span>{' '}
+                  A fill arrived dated earlier than ones already recorded, which
+                  re-pairs that ticker&apos;s trades. Your P&amp;L and trade
+                  count have changed accordingly.
+                  {(result.reviews_discarded ?? 0) > 0 && (
+                    <>
+                      {' '}
+                      <span className="font-semibold">
+                        {result.reviews_discarded} review
+                        {result.reviews_discarded === 1 ? '' : 's'}
+                      </span>{' '}
+                      could not be carried over.
+                    </>
+                  )}
+                </p>
+              )}
+
               {/* Called out rather than left as a number in the list: this is
                   the one outcome that changed a trade's recorded intent, and
                   it is worth checking the sync matched the plan you meant. */}

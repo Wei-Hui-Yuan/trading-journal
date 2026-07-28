@@ -16,6 +16,7 @@ reused for backtests. `run_matching_for_ticker` is the thin database adapter.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -23,9 +24,11 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 # Style buckets. All values fit the trades.style VARCHAR(15) column.
 STYLE_SCALP = "Scalp"
@@ -295,6 +298,15 @@ class MatchingResult:
     # would count a half-finished idea as a completed trade -- but the figure is
     # surfaced here so it is visibly deferred rather than silently dropped.
     open_round_trip_realized_pnl: Decimal = Decimal("0")
+    # Round trips that were in `positions` before this run and are not in it
+    # now, because a backdated fill re-partitioned the FIFO queue. Reported
+    # rather than swallowed: they carried P&L into every headline figure, and
+    # their disappearance is a real event the caller should be able to explain.
+    positions_removed: int = 0
+    # How many of those had been reviewed. Deleting a round trip takes its
+    # grade, notes, mistakes and discipline answers with it, and that is the
+    # part the user cannot reconstruct.
+    reviews_discarded: int = 0
 
     @property
     def total_realized_pnl(self) -> Decimal:
@@ -463,22 +475,117 @@ async def run_matching_for_ticker(
     persist: bool = True,
     only_unclassified: bool = False,
 ) -> MatchingResult:
-    """Match one ticker's executions and append the round trips to `positions`.
+    """Make `positions` match what FIFO says about this ticker, exactly.
 
     Rows in `trades` are never modified: they stay an immutable record of what
     the broker actually filled. Everything derived lands in `positions`.
 
-    Set `persist=False` to compute the numbers without writing (useful for
-    previews and backtests).
+    AUTHORITATIVE, NOT ADDITIVE. This used to only append, trusting
+    ON CONFLICT against uq_positions_open_close to make a re-run a no-op. That
+    holds only while re-running produces the same (open_trade_id,
+    close_trade_id) pairs -- and a fill that arrives with an EARLIER timestamp
+    than fills already stored re-partitions the whole FIFO queue, so it does
+    not.
+
+    Concretely: BUY 10@100 then SELL 10@110 stores one round trip worth +100.
+    Add a backdated BUY 10@90 and FIFO now leaves 10 shares open and closes
+    nothing, so the fresh result is empty, nothing conflicts, and that +100 row
+    stays in the table forever -- counted in net P&L, win rate, trade count,
+    expectancy and the equity curve, while the same shares are simultaneously
+    reported as open exposure. A later sell instead produces a DIFFERENT pair,
+    which also fails to conflict, and the P&L is double-counted outright.
+
+    That is not a hypothetical ordering. Adding a fill IBKR dropped is
+    backdated by definition, and the two Flex queries disagree on purpose --
+    a TCF query reports today's fills while an Activity query lags a day or so,
+    so an older fill routinely lands after a newer one has already matched.
+
+    So the fresh result is treated as the truth and anything else for this
+    ticker is deleted. Pairs that survive re-matching keep their row, and
+    therefore their id, review, grade and discipline answers; only genuinely
+    dissolved round trips are removed.
+
+    Set `persist=False` to compute without writing (previews, backtests, and
+    the reconciliation audit).
     """
+    # Checked before any work: a subset match cannot be authoritative over the
+    # whole ticker. With only_unclassified the fresh set is built from part of
+    # the fills, so every position derived from a classified fill would look
+    # stale and be deleted. No caller passes this today; the guard is here so
+    # that adding one cannot quietly turn this function into a data-loss bug.
+    if persist and only_unclassified:
+        raise ValueError(
+            "run_matching_for_ticker(persist=True) cannot be combined with "
+            "only_unclassified=True: matching a subset of a ticker's fills "
+            "cannot decide which of its positions are stale."
+        )
+
     executions = await load_executions_for_ticker(
         session, ticker, only_unclassified=only_unclassified
     )
     result = match_executions(executions)
     result.ticker = ticker
 
-    if persist and result.positions:
+    if not persist:
+        return result
+
+    # Deferred to avoid a circular import with the FastAPI app.
+    from main import Position, ReviewStatus  # noqa: PLC0415
+
+    fresh_pairs = {(p.open_trade_id, p.close_trade_id) for p in result.positions}
+    existing = (
+        await session.execute(
+            select(
+                Position.id,
+                Position.open_trade_id,
+                Position.close_trade_id,
+                Position.review_status,
+                Position.review_went_well,
+                Position.review_went_wrong,
+                Position.review_lessons,
+                Position.notes,
+            ).where(Position.symbol == ticker)
+        )
+    ).all()
+
+    stale = [
+        row for row in existing
+        if (row.open_trade_id, row.close_trade_id) not in fresh_pairs
+    ]
+
+    result.positions_removed = len(stale)
+    # Same test delete_trade and update_execution already use, so one number
+    # means one thing across every surface that reports it.
+    result.reviews_discarded = sum(
+        1
+        for row in stale
+        if row.review_status == ReviewStatus.reviewed.value
+        or any((row.review_went_well, row.review_went_wrong, row.review_lessons, row.notes))
+    )
+
+    # One transaction. A delete that committed without its replacement insert
+    # would erase real round trips; an insert without the delete is the
+    # double-count this exists to prevent. Neither is allowed to land alone.
+    if stale:
+        await session.execute(
+            delete(Position).where(Position.id.in_([row.id for row in stale]))
+        )
+        # Loud on purpose. "Where did my review for that trade go?" needs an
+        # answer, and a backdated fill re-partitioning the queue is an
+        # explanation nobody would arrive at unaided.
+        logger.warning(
+            "Authoritative matching for %s removed %d stale position(s) and "
+            "discarded %d review(s); a backdated fill re-partitioned the FIFO "
+            "queue.",
+            ticker,
+            len(stale),
+            result.reviews_discarded,
+        )
+
+    if result.positions:
         await insert_positions(session, result.positions)
+
+    if stale or result.positions:
         await session.commit()
 
     return result

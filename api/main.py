@@ -641,6 +641,15 @@ class IngestResult(BaseModel):
     # Worth its own line because it is the moment the two halves of the
     # journal meet: the plan you wrote, and what the broker actually did.
     plans_attached: int = 0
+    # Round trips that existed before this sync and no longer survive
+    # re-matching, because a fill arrived dated earlier than ones already
+    # stored and re-partitioned the FIFO queue. Nearly always zero; when it is
+    # not, P&L and trade count have just changed for reasons the fill list
+    # alone does not explain, so it is reported rather than left to be noticed.
+    positions_removed: int = 0
+    # How many of those carried a review. This is the part that cannot be
+    # reconstructed, so it gets its own number.
+    reviews_discarded: int = 0
 
 
 @app.post(
@@ -776,9 +785,16 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     # --- 5: re-run FIFO for every affected symbol -------------------------
     symbols = sorted({e.symbol for e in new_executions})
     positions_matched = 0
+    positions_removed = 0
+    reviews_discarded = 0
     for symbol in symbols:
         result = await run_matching_for_ticker(session, symbol, persist=True)
         positions_matched += len(result.positions)
+        # The two Flex queries disagree by design -- TCF reports today, the
+        # Activity query lags a day -- so an older fill routinely arrives after
+        # a newer one has already matched, re-partitioning that ticker's queue.
+        positions_removed += result.positions_removed
+        reviews_discarded += result.reviews_discarded
 
     return IngestResult(
         executions_parsed=len(executions),
@@ -793,6 +809,8 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
         suppressed_skipped=resurrected,
         plans_attached=plans_attached,
+        positions_removed=positions_removed,
+        reviews_discarded=reviews_discarded,
     )
 
 
@@ -887,6 +905,12 @@ class ManualTradeResult(BaseModel):
     # Round trips the FIFO engine closed as a result of this execution.
     positions_created: int
     open_quantity: float
+    # A repair fill is backdated by definition, and a fill inserted before
+    # existing ones re-partitions the FIFO queue. Round trips that no longer
+    # survive that re-match are removed rather than left to double-count, and
+    # said out loud here because the P&L and review they carried are gone.
+    positions_removed: int = 0
+    reviews_discarded: int = 0
 
 
 @app.post(
@@ -955,9 +979,11 @@ async def create_manual_trade(
     await session.commit()
     await session.refresh(trade)
 
-    # Re-run matching for this ticker. The engine is idempotent (unique index
-    # on the open/close execution pair), so already-matched round trips are not
-    # duplicated -- only newly closable ones are written.
+    # Re-run matching for this ticker. Authoritative rather than additive: this
+    # fill is almost certainly backdated -- that is what repairing a dropped
+    # execution means -- and a fill inserted before existing ones re-partitions
+    # the FIFO queue, so round trips stored from an earlier run may no longer
+    # exist. Those are removed here instead of lingering as double-counted P&L.
     result = await run_matching_for_ticker(session, params.symbol, persist=True)
 
     return ManualTradeResult(
@@ -973,6 +999,8 @@ async def create_manual_trade(
         exit_price=float(trade.exit_price) if trade.exit_price is not None else None,
         positions_created=len(result.positions),
         open_quantity=result.open_quantity,
+        positions_removed=result.positions_removed,
+        reviews_discarded=result.reviews_discarded,
     )
 
 

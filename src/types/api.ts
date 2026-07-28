@@ -266,6 +266,17 @@ export interface IngestResult {
    * moment the two halves of the journal meet.
    */
   plans_attached?: number;
+  /**
+   * Round trips that existed before this sync and no longer survive
+   * re-matching, because a fill arrived dated earlier than ones already stored
+   * and re-partitioned the FIFO queue.
+   *
+   * Almost always zero. When it is not, net P&L and trade count have just
+   * changed for a reason the imported-fill counts alone do not explain.
+   */
+  positions_removed?: number;
+  /** How many of those carried a review. That part cannot be reconstructed. */
+  reviews_discarded?: number;
 }
 
 /** One day on the equity curve. Every calendar day gets one, trades or not. */
@@ -746,6 +757,15 @@ export interface ManualTradeResult {
   positions_created: number;
   /** Shares left open on this ticker after matching. */
   open_quantity: number;
+  /**
+   * Round trips that no longer survive re-matching. A repair fill is
+   * backdated by definition, and inserting a fill before existing ones
+   * re-partitions the FIFO queue — so previously closed round trips can
+   * legitimately cease to exist.
+   */
+  positions_removed?: number;
+  /** How many of those carried a review, which is the unrecoverable part. */
+  reviews_discarded?: number;
 }
 
 // ---------------------------------------------------------------------------

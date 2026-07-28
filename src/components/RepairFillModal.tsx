@@ -153,16 +153,37 @@ export function RepairFillModal({
       },
       {
         onSuccess: (result) => {
-          setSavedSummary(
+          const base =
             result.positions_created > 0
               ? `Added. ${result.positions_created} position${
                   result.positions_created === 1 ? '' : 's'
                 } closed by FIFO matching.`
               : `Added. ${result.open_quantity} share${
                   result.open_quantity === 1 ? '' : 's'
-                } open on ${result.ticker}.`
-          );
-          window.setTimeout(onClose, 1400);
+                } open on ${result.ticker}.`;
+
+          // A repair fill is backdated by definition, so it can re-pair
+          // trades that were already matched and dissolve round trips closed
+          // by an earlier run. Held on screen longer when that happens: it
+          // moves P&L and can cost a review, which is not something to
+          // notice later from a changed total.
+          const removed = result.positions_removed ?? 0;
+          const reviews = result.reviews_discarded ?? 0;
+          const extra =
+            removed > 0
+              ? ` ${removed} previously closed round trip${
+                  removed === 1 ? '' : 's'
+                } no longer match${removed === 1 ? 'es' : ''} and ${
+                  removed === 1 ? 'was' : 'were'
+                } removed${
+                  reviews > 0
+                    ? `, including ${reviews} with a review that could not be carried over`
+                    : ''
+                }.`
+              : '';
+
+          setSavedSummary(base + extra);
+          window.setTimeout(onClose, removed > 0 ? 6000 : 1400);
         },
         onError: (err) => setError(err.message),
       }
