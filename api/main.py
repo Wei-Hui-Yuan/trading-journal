@@ -218,6 +218,11 @@ class Trade(Base):
     # NUMERIC not INTEGER: fractional fills are ordinary on this account, and
     # rounding them destroyed sub-half-share positions outright (migration 010).
     quantity = Column(Numeric(18, 8), nullable=False)
+    # What this fill cost to execute (migration 020). A COST, so positive is
+    # money paid and negative is a rebate -- IBKR's ibCommission uses the
+    # opposite sign and is negated on promotion, never abs()'d, because 10 of
+    # the 328 fills on this account report a genuine rebate.
+    commission = Column(Numeric(14, 6), nullable=False, default=Decimal("0"))
     planned_entry = Column(Numeric(10, 4), nullable=True)
     stop_loss = Column(Numeric(10, 4), nullable=True)
     # Where the stop ACTUALLY sat, after any mid-trade moves. Separate from
@@ -361,7 +366,16 @@ class Position(Base):
     exit_price = Column(Numeric(10, 4), nullable=False)
     entry_time = Column(DateTime(timezone=True), nullable=False)
     exit_time = Column(DateTime(timezone=True), nullable=False)
+    # NET of commission since migration 020: gross_pnl - commission. Every
+    # statistic in the app reads this column, so net is what it has to hold --
+    # a win rate computed on the price move alone counts a trade that made
+    # $0.40 and paid $0.36 in commission as a full win.
     realized_pnl = Column(Numeric(12, 4), nullable=False)
+    # The same figure before costs, and the costs themselves. Stored rather
+    # than derived so the difference is inspectable, and so the identity
+    # gross_pnl - commission = realized_pnl can be checked against the row.
+    gross_pnl = Column(Numeric(12, 4), nullable=True)
+    commission = Column(Numeric(12, 4), nullable=False, default=Decimal("0"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Which pair of executions produced this position. A unique index on the
@@ -745,6 +759,9 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             "actual_entry": e.price if e.price is not None else 0,
             # Side lives in `direction`; store magnitude only.
             "quantity": e.abs_quantity,
+            # Sign flipped exactly once, here, from IBKR's debit convention to
+            # a cost the engine can subtract. See commission_cost.
+            "commission": e.commission_cost,
             "source_tag": "IBKR",
         }
         for e in new_executions
@@ -855,6 +872,11 @@ class ManualTradeCreate(BaseModel):
     price: float = Field(..., gt=0)
     # Omitted -> now in America/New_York. A naive value is read as market time.
     execution_time: Optional[datetime] = None
+    # What the fill cost to execute. A repair fill stands in for a broker
+    # execution that really happened, and that execution was charged -- leaving
+    # this at zero makes the repaired trade look cheaper than its neighbours.
+    # Not bounded below: a rebate is a legitimate negative cost.
+    commission: Optional[float] = 0.0
 
     # --- Planning / risk setup (all optional) ---------------------------
     # These map onto columns that already exist on the trades ledger; the two
@@ -961,6 +983,8 @@ async def create_manual_trade(
         # The form's price field is explicitly the fill actually received.
         actual_entry=params.price,
         quantity=Decimal(str(params.quantity)),
+        # Already a cost in the form's terms -- the user types what they paid.
+        commission=Decimal(str(params.commission or 0)),
         # Planning fields map onto the ledger's existing columns; stop_loss and
         # target are the canonical homes for the planned stop and take-profit,
         # and are what PUT /api/trades/{id} reads and writes.
@@ -2221,7 +2245,13 @@ class PositionOut(BaseModel):
     exit_price: float
     entry_time: datetime
     exit_time: datetime
+    # NET of commission (migration 020). Reported alongside the gross figure
+    # and the cost so the difference is visible rather than implied -- a P&L
+    # that quietly means one thing on the broker statement and another here is
+    # the reason this journal did not reconcile.
     realized_pnl: float
+    gross_pnl: Optional[float] = None
+    commission: Optional[float] = None
     strategy_id: Optional[uuid.UUID]
     review_status: Optional[str]
     tag_hard_sl: Optional[bool]
@@ -3236,7 +3266,12 @@ class RoundTripOut(BaseModel):
     exit_price: Optional[float] = None
     entry_time: datetime
     exit_time: Optional[datetime] = None
+    # NET of commission (migration 020), with the gross figure and the cost
+    # beside it. A journal row that says "P&L" and means something different
+    # from the broker statement is the reason the two never reconciled.
     realized_pnl: Optional[float] = None
+    gross_pnl: Optional[float] = None
+    commission: Optional[float] = None
     execution_count: int
 
     # Scored, never stored: R recomputed from the current entry/exit/stop, so
@@ -3478,6 +3513,8 @@ async def list_round_trips(
                 entry_time=position.entry_time,
                 exit_time=position.exit_time,
                 realized_pnl=float(position.realized_pnl) if position.realized_pnl is not None else None,
+                gross_pnl=float(position.gross_pnl) if position.gross_pnl is not None else None,
+                commission=float(position.commission) if position.commission is not None else None,
                 execution_count=len(position_fills),
                 r_multiple=_score_r(direction, entry, position.exit_price, stop),
                 planned_r_multiple=planned_r,

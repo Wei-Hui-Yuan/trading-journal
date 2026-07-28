@@ -135,7 +135,18 @@ export interface Position {
   exit_price: number;
   entry_time: string; // ISO 8601, UTC
   exit_time: string; // ISO 8601, UTC
+  /**
+   * NET of commission since migration 020 — what actually reached the account.
+   *
+   * It was the price move alone until then, on every surface, which is why the
+   * journal never tied out against a broker statement. `gross_pnl` is that old
+   * figure, kept so the difference is inspectable rather than implied, and
+   * `gross_pnl - commission === realized_pnl` holds exactly.
+   */
   realized_pnl: number;
+  gross_pnl: number | null;
+  /** A cost: positive is paid, negative is a rebate IBKR passed through. */
+  commission: number | null;
 
   // Review workflow (migration 002)
   strategy_id: string | null;
@@ -452,6 +463,13 @@ export interface ManualTradePayload {
   quantity: number;
   /** The fill actually received. Maps to trades.actual_entry. */
   price: number;
+  /**
+   * What the fill cost to execute, as a COST — positive is paid, negative is a
+   * rebate. IBKR reports the opposite sign on its statement, and the sync
+   * negates it on the way in; a hand-typed repair fill is entered the way the
+   * journal stores it.
+   */
+  commission?: number | null;
   execution_time?: string | null;
 
   // Planning / risk setup. All optional — send null, never '' or NaN.
@@ -670,7 +688,10 @@ export interface RoundTrip {
   exit_price: number | null;
   entry_time: string;
   exit_time: string | null;
+  /** NET of commission (migration 020). See Position.realized_pnl. */
   realized_pnl: number | null;
+  gross_pnl: number | null;
+  commission: number | null;
   execution_count: number;
 
   /** Computed server-side from entry/exit/stop, never stored. */

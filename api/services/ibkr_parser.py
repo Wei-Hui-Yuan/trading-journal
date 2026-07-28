@@ -85,6 +85,27 @@ class ParsedExecution:
     def abs_quantity(self) -> Decimal:
         return abs(self.quantity)
 
+    @property
+    def commission_cost(self) -> Decimal:
+        """Commission as a COST: positive is paid, negative is a rebate.
+
+        IBKR reports `ibCommission` with the opposite sign -- a charge arrives
+        negative, because it is a debit to the account. The journal wants the
+        number it will SUBTRACT from P&L, so the sign is flipped exactly once,
+        here, rather than at each of the places that eventually spends it.
+
+        Negation, not abs(). 10 of 328 fills on this account report a POSITIVE
+        ibCommission, which is a rebate -- tiered pricing passes exchange
+        liquidity rebates through, and they are real money received. abs()
+        would book each of them as a charge and get the sign wrong on the one
+        figure this exists to make honest.
+
+        Missing commission reads as zero rather than None: a fill the broker
+        did not price is one this journal charges nothing for, which is the
+        same arithmetic and avoids propagating a null through the engine.
+        """
+        return -self.commission if self.commission is not None else Decimal("0")
+
 
 def _is_non_tradeable(attrs: dict[str, str], symbol: str) -> bool:
     """Reject rows that are not positions in an instrument.

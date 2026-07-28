@@ -56,6 +56,11 @@ ROLE_CLOSE = "CLOSE"
 # what is stored is what was computed rather than whatever Postgres rounds to.
 PRICE_PRECISION = Decimal("0.0001")
 
+# positions.commission is NUMERIC(12, 4). Apportioning one fill's commission
+# across the legs it covers divides, so the result must be quantized somewhere;
+# doing it once per round trip keeps gross - commission = net exact.
+MONEY_PRECISION = Decimal("0.0001")
+
 
 @dataclass(frozen=True)
 class Execution:
@@ -68,6 +73,11 @@ class Execution:
     quantity: Decimal
     price: Decimal
     executed_at: datetime
+    # What this fill COST to execute: positive is paid, negative is a rebate
+    # (see ParsedExecution.commission_cost). Defaults to zero so a caller that
+    # does not know about commissions -- a backtest, an older test -- gets the
+    # gross arithmetic it always got rather than a null.
+    commission: Decimal = Decimal("0")
 
 
 @dataclass
@@ -117,7 +127,14 @@ class _Leg:
     exit_price: Decimal
     entry_date: datetime
     exit_date: datetime
+    # NET of commission -- what this slice actually put in the account.
     realized_pnl: Decimal
+    # The same figure before costs, and the costs themselves. Kept per leg
+    # rather than derived later because commission is apportioned by the
+    # fraction of each fill a leg consumed, and that fraction is only known
+    # here.
+    gross_pnl: Decimal = Decimal("0")
+    commission: Decimal = Decimal("0")
 
 
 @dataclass
@@ -141,9 +158,17 @@ class MatchedPosition:
     exit_price: Decimal  # quantity-weighted
     entry_date: datetime  # first entry
     exit_date: datetime  # final exit
+    # NET: gross_pnl - commission. This is the figure every downstream
+    # statistic reads, so net is what it has to be -- a win rate computed on
+    # gross counts a trade that made $0.40 and paid $0.36 as a full win.
     realized_pnl: Decimal
     style: str
     fills: list[PositionFill] = field(default_factory=list)
+    # Reported beside the net figure rather than instead of it. Cost is a
+    # thing the trader controls -- through size, through how often they trade
+    # -- and it cannot be managed while it is folded invisibly into P&L.
+    gross_pnl: Decimal = Decimal("0")
+    commission: Decimal = Decimal("0")
 
     @property
     def holding_period(self) -> timedelta:
@@ -261,6 +286,26 @@ def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
     first_open = min(opens.values(), key=lambda f: (f.executed_at, str(f.trade_id)))
     last_close = max(closes.values(), key=lambda f: (f.executed_at, str(f.trade_id)))
 
+    # Summed from the legs, deliberately: deriving these from the weighted
+    # averages above would fold their rounding into reported P&L.
+    #
+    # Quantized here rather than left to Postgres. All three money figures land
+    # in NUMERIC(12,4) columns and are rendered side by side, so the identity
+    # gross - commission = net has to hold in what is STORED, not just in what
+    # was computed. Rounding each of the three independently on the way into
+    # the database does not guarantee that -- a fractional fill puts real
+    # digits below the fourth place, and a penny of disagreement between three
+    # numbers on screen reads as a bug in the journal.
+    #
+    # So gross and commission are each rounded once, and net is derived from
+    # the rounded pair. Exact by construction, at a cost of at most 0.0001.
+    gross_pnl = sum((leg.gross_pnl for leg in legs), Decimal("0")).quantize(
+        MONEY_PRECISION, rounding=ROUND_HALF_UP
+    )
+    commission = sum((leg.commission for leg in legs), Decimal("0")).quantize(
+        MONEY_PRECISION, rounding=ROUND_HALF_UP
+    )
+
     return MatchedPosition(
         ticker=ticker,
         direction=legs[0].direction,
@@ -271,9 +316,9 @@ def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
         exit_price=_weighted_average([(l.exit_price, l.quantity) for l in legs]),
         entry_date=entry_date,
         exit_date=exit_date,
-        # Summed from the legs, deliberately: deriving this from the weighted
-        # averages above would fold their rounding into reported P&L.
-        realized_pnl=sum((leg.realized_pnl for leg in legs), Decimal("0")),
+        gross_pnl=gross_pnl,
+        commission=commission,
+        realized_pnl=gross_pnl - commission,
         style=classify_style(entry_date, exit_date),
         fills=sorted(
             [*opens.values(), *closes.values()],
@@ -336,18 +381,46 @@ def classify_style(entry_date: datetime, exit_date: datetime) -> str:
     return STYLE_SWING_TRADE
 
 
-def _realized_pnl(
+def _gross_pnl(
     direction: str, entry_price: Decimal, exit_price: Decimal, quantity: Decimal
 ) -> Decimal:
-    """P&L for `quantity` shares of a closed position.
+    """P&L for `quantity` shares of a closed position, BEFORE costs.
 
     Longs profit when price rises; shorts profit when it falls.
+
+    Named for what it is. This used to be `_realized_pnl` and was stored
+    unchanged as the realised figure, which is the whole of C3: the price move
+    is not what reached the account.
     """
     if direction == LONG:
         move = exit_price - entry_price
     else:
         move = entry_price - exit_price
     return move * quantity
+
+
+def _apportion_commission(execution: Execution, matched_quantity: Decimal) -> Decimal:
+    """The share of this fill's commission that belongs to `matched_quantity`.
+
+    One execution can be consumed by several legs -- a 20-share buy closed by
+    two 10-share sells, or an oversell that closes one round trip and opens the
+    next -- so its commission is split by the fraction of the fill each leg
+    took.
+
+    Nothing is rounded here. Thirds and sevenths still leave a residue, since
+    Decimal division keeps 28 significant digits rather than infinite ones, but
+    it lands around 1e-28 and vanishes when the round trip quantizes to the
+    4-decimal money column. Rounding per leg instead would put the error at the
+    cent level, where it is visible.
+
+    Charged in full to the round trips that consume the fill, which means a
+    partially-filled position carries only the cost of the shares it has
+    actually closed. The rest stays with the open remainder and is charged when
+    it closes.
+    """
+    if execution.quantity <= 0 or not execution.commission:
+        return Decimal("0")
+    return execution.commission * matched_quantity / execution.quantity
 
 
 def match_executions(executions: Iterable[Execution]) -> MatchingResult:
@@ -383,6 +456,18 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
             # The lot direction determines whether this was a long or a short.
             position_direction = LONG if lot.execution.direction == BUY else SHORT
 
+            gross = _gross_pnl(
+                position_direction,
+                lot.execution.price,
+                execution.price,
+                matched_qty,
+            )
+            # Both sides are charged: the trade paid to get in and to get out,
+            # and only counting one halves the cost of every round trip.
+            commission = _apportion_commission(
+                lot.execution, matched_qty
+            ) + _apportion_commission(execution, matched_qty)
+
             legs.append(
                 _Leg(
                     direction=position_direction,
@@ -393,12 +478,9 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
                     exit_price=execution.price,
                     entry_date=lot.execution.executed_at,
                     exit_date=execution.executed_at,
-                    realized_pnl=_realized_pnl(
-                        position_direction,
-                        lot.execution.price,
-                        execution.price,
-                        matched_qty,
-                    ),
+                    gross_pnl=gross,
+                    commission=commission,
+                    realized_pnl=gross - commission,
                 )
             )
 
@@ -424,7 +506,9 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
 
     # Legs left here belong to a round trip that never closed. They are not
     # emitted: a position is only real once it is flat, and the residual shows
-    # up as open_lots instead.
+    # up as open_lots instead. Net, like everything else -- the commission on
+    # the shares already scaled out has been paid whether or not the idea is
+    # finished.
     result.open_round_trip_realized_pnl = sum(
         (leg.realized_pnl for leg in legs), Decimal("0")
     )
@@ -461,6 +545,9 @@ async def load_executions_for_ticker(
             # Numeric(10, 4) comes back as Decimal; keep it exact for money math.
             price=Decimal(str(row.actual_entry)),
             executed_at=row.entry_date,
+            # Already normalised to a cost on the way into `trades` (positive
+            # is paid, negative is a rebate), so the engine only subtracts.
+            commission=Decimal(str(row.commission or 0)),
         )
         for row in rows
         # Skip anything that cannot participate in matching.
@@ -594,14 +681,19 @@ async def run_matching_for_ticker(
 async def insert_positions(
     session: AsyncSession, positions: list[MatchedPosition]
 ) -> int:
-    """Batch-insert closed round trips into the `positions` table.
+    """Upsert closed round trips into the `positions` table.
 
     One statement for the whole batch rather than a write per position.
 
-    `open_trade_id` / `close_trade_id` identify the two executions behind each
-    position and must always be set: the uq_positions_open_close unique index
-    is what makes ON CONFLICT DO NOTHING turn a re-run into a no-op, and
-    Postgres treats NULLs as distinct, so null keys would never collide.
+    `open_trade_id` / `close_trade_id` identify the round trip and must always
+    be set: uq_positions_open_close is what a re-run conflicts against, and
+    Postgres treats NULLs as distinct, so null keys would never collide. They
+    have been NOT NULL since migration 019.
+
+    On conflict the DERIVED columns are refreshed and the user's own work --
+    grade, tags, strategy, notes, mistakes, the post-mortem, the ideal and
+    revised levels -- is left exactly as it was. A round trip's numbers belong
+    to its executions; its review belongs to the trader.
     """
     if not positions:
         return 0
@@ -619,7 +711,12 @@ async def insert_positions(
             "exit_price": position.exit_price,
             "entry_time": position.entry_date,
             "exit_time": position.exit_date,
+            # Net. Stored under the name every consumer already reads, so
+            # analytics, the equity curve and win rate become net without one
+            # of them having to know commissions exist.
             "realized_pnl": position.realized_pnl,
+            "gross_pnl": position.gross_pnl,
+            "commission": position.commission,
             "open_trade_id": position.open_trade_id,
             "close_trade_id": position.close_trade_id,
             # New positions enter the Trade Inbox awaiting review. DO NOTHING
@@ -630,18 +727,50 @@ async def insert_positions(
         for position in positions
     ]
 
+    # DERIVED columns are refreshed on conflict; everything the user wrote is
+    # never named here and so is never touched.
+    #
+    # This used to be DO NOTHING, which kept grades and tags safe but also made
+    # a stored position permanently authoritative over the fills underneath it.
+    # Re-matching could not correct a figure once written -- which is precisely
+    # the state migration 020 had to repair, because every realized_pnl in the
+    # table had been computed before commissions existed. A round trip is
+    # derived data; it should follow its executions.
+    refreshed = (
+        "symbol", "style", "quantity", "entry_price", "exit_price",
+        "entry_time", "exit_time", "realized_pnl", "gross_pnl", "commission",
+    )
     stmt = (
         pg_insert(Position)
         .values(rows)
-        .on_conflict_do_nothing()
-        .returning(Position.id, Position.open_trade_id, Position.close_trade_id)
+        .on_conflict_do_update(
+            index_elements=["open_trade_id", "close_trade_id"],
+            set_={column: getattr(pg_insert(Position).excluded, column)
+                  for column in refreshed},
+        )
+        .returning(
+            Position.id,
+            Position.open_trade_id,
+            Position.close_trade_id,
+            # Distinguishes a genuinely new row from a refreshed one: DO UPDATE
+            # returns both, and only a new row needs its fills written.
+            Position.created_at,
+        )
     )
-    inserted = (await session.execute(stmt)).fetchall()
+    upserted = (await session.execute(stmt)).fetchall()
 
-    # DO NOTHING returns nothing for rows that already existed, so this maps
-    # only the genuinely new positions. That is what we want: a position present
-    # from an earlier run already has its fills, and re-inserting them would be
-    # a no-op against uq_position_fills_position_trade_role anyway.
+    # Fills are written only for positions that did not already have them.
+    # Re-inserting them for a refreshed row would be a no-op against
+    # uq_position_fills_position_trade_role anyway, but skipping the round trip
+    # keeps a re-sync from writing a fill row per position on every run.
+    existing_ids = set((
+        await session.execute(
+            select(PositionFill.position_id).where(
+                PositionFill.position_id.in_([row.id for row in upserted])
+            ).distinct()
+        )
+    ).scalars().all())
+    inserted = [row for row in upserted if row.id not in existing_ids]
     new_ids = {(row.open_trade_id, row.close_trade_id): row.id for row in inserted}
 
     fill_rows = [

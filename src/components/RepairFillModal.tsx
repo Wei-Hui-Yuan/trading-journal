@@ -23,6 +23,7 @@ interface FormState {
   side: TradeSide;
   quantity: string;
   price: string;
+  commission: string;
   executionTime: string;
 }
 
@@ -63,6 +64,7 @@ const blankForm = (): FormState => ({
   side: 'BUY',
   quantity: '',
   price: '',
+  commission: '',
   executionTime: nowInMarketTz(),
 });
 
@@ -148,6 +150,7 @@ export function RepairFillModal({
         side: form.side,
         quantity,
         price,
+        commission: toNullableNumber(form.commission) ?? 0,
         // Sent without an offset; the backend anchors it to America/New_York.
         execution_time: form.executionTime ? `${form.executionTime}:00` : null,
       },
@@ -331,6 +334,30 @@ export function RepairFillModal({
               />
             </label>
           </div>
+
+          {/* A repair fill stands in for a broker execution that really
+              happened, and that execution was charged. Left at zero the
+              repaired trade reads as cheaper than every fill beside it, and
+              its P&L is the one figure in the journal still computed gross. */}
+          <label className="block">
+            <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
+              Commission
+            </span>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="0.000001"
+              value={form.commission}
+              onChange={(e) => patch({ commission: e.target.value })}
+              disabled={isSaving}
+              placeholder="0.35"
+              className={`mt-1 font-mono ${fieldClass}`}
+            />
+            <span className="mt-1 block text-[10px] text-obsidian-muted">
+              What the fill cost to execute, as a positive number. IBKR shows it
+              negative on the statement. A rebate goes in negative.
+            </span>
+          </label>
 
           <label className="block">
             <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">

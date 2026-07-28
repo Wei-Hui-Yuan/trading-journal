@@ -383,6 +383,58 @@ const planTimeFormatter = new Intl.DateTimeFormat('en-US', {
  * form afterwards. Only the first is evidence about your process, and only an
  * attached plan carries a timestamp proving which it is.
  */
+/**
+ * Where the P&L figure came from: price move, cost of trading, what is left.
+ *
+ * The headline number is net of commission (migration 020). It used to be the
+ * price move alone, which is why nothing in this journal ever tied out against
+ * a broker statement — $102.56 of commission had been charged to the account
+ * and appeared in none of these figures.
+ *
+ * Shown as three lines rather than folded into one, because cost is a thing
+ * the trader controls — through size, through how often they trade — and it
+ * cannot be managed while it is invisible. On this account a 0.1-share fill
+ * paid 1.00% of notional to execute.
+ */
+const PnlBreakdown: React.FC<{ rt: RoundTrip }> = ({ rt }) => {
+  const { gross_pnl: gross, commission, realized_pnl: net } = rt;
+  if (gross === null || commission === null || net === null) return null;
+
+  const money = (n: number) => `${n >= 0 ? '+' : '−'}$${Math.abs(n).toFixed(2)}`;
+  // A rebate is real money received, and reads as a negative cost.
+  const isRebate = commission < 0;
+
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 font-mono text-[11px]">
+      <span className="text-obsidian-muted">
+        Gross{' '}
+        <span className={gross >= 0 ? 'text-win/70' : 'text-loss/70'}>
+          {money(gross)}
+        </span>
+      </span>
+      <span className="text-obsidian-muted">
+        {isRebate ? 'Rebate' : 'Commission'}{' '}
+        <span className={isRebate ? 'text-win/70' : 'text-loss/70'}>
+          {isRebate ? '+' : '−'}${Math.abs(commission).toFixed(2)}
+        </span>
+      </span>
+      <span className="text-obsidian-muted">
+        Net{' '}
+        <span className={`font-semibold ${net >= 0 ? 'text-win' : 'text-loss'}`}>
+          {money(net)}
+        </span>
+      </span>
+      {/* The case worth catching on sight: the price move was profitable and
+          the trade was not. */}
+      {gross > 0 && net <= 0 && (
+        <span className="rounded border border-loss/30 bg-loss/5 px-1.5 py-0.5 text-[10px] text-loss">
+          a winner before costs
+        </span>
+      )}
+    </div>
+  );
+};
+
 const PlanVsExecution: React.FC<{
   rt: RoundTrip;
   onUnlink: () => void;
@@ -697,6 +749,10 @@ export const TradeLedger: React.FC = () => {
 
                 {isExpanded && plan && rev && (
                   <div className="space-y-6 border-t border-obsidian-border px-4 py-4">
+                    {/* What the headline P&L on the row above is made of. First,
+                        because it explains a number the user has already read. */}
+                    <PnlBreakdown rt={rt} />
+
                     {/* ------- PLAN vs EXECUTION (only when linked) ------- */}
                     {rt.plan_id && (
                       <PlanVsExecution
