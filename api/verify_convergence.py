@@ -109,6 +109,7 @@ async def snapshot(session, ticker: str) -> dict:
             )
         ).all()
         out[(position.open_trade_id, position.close_trade_id)] = {
+            "direction": position.direction,
             "quantity": Decimal(str(position.quantity)),
             "entry_price": Decimal(str(position.entry_price)),
             "exit_price": Decimal(str(position.exit_price)),

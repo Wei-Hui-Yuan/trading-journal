@@ -709,6 +709,10 @@ async def insert_positions(
         {
             "id": uuid.uuid4(),
             "symbol": position.ticker,
+            # Written verbatim. It was computed correctly here and discarded,
+            # leaving every reader to reconstruct it from the opening execution
+            # and guess "long" when that lookup failed (migration 022).
+            "direction": position.direction,
             "style": position.style,
             "quantity": position.quantity,
             "entry_price": position.entry_price,
@@ -741,7 +745,7 @@ async def insert_positions(
     # table had been computed before commissions existed. A round trip is
     # derived data; it should follow its executions.
     refreshed = (
-        "symbol", "style", "quantity", "entry_price", "exit_price",
+        "symbol", "direction", "style", "quantity", "entry_price", "exit_price",
         "entry_time", "exit_time", "realized_pnl", "gross_pnl", "commission",
     )
     stmt = (

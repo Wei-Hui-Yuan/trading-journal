@@ -843,8 +843,11 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
         # The opening execution carries the plan for this round trip.
         opening = trade_by_id.get(str(position.open_trade_id))
 
-        # Direction comes from the opening fill; a position does not store it.
-        direction = (opening.direction if opening else "") or "BUY"
+        # Stored on the position since migration 022, in the matcher's own
+        # LONG/SHORT vocabulary. It used to be reconstructed from `opening` and
+        # defaulted to "BUY" when that came back empty, which reports a short's
+        # entry slippage with the sign reversed.
+        direction = "SELL" if (position.direction or "").upper() == "SHORT" else "BUY"
 
         reviewed.append(
             ReviewedTrade(

@@ -360,6 +360,11 @@ class Position(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     symbol = Column(String(20), nullable=False)
+    # LONG or SHORT, as the matcher computed it (migration 022). Stored rather
+    # than re-derived from the opening execution at read time: that lookup can
+    # come back empty, and the fallback every reader used was "long", which
+    # flips the sign of entry slippage on a short.
+    direction = Column(String(5), nullable=False)
     style = Column(String(50), nullable=False)
     quantity = Column(Numeric(18, 8), nullable=False)
     entry_price = Column(Numeric(10, 4), nullable=False)
@@ -2665,6 +2670,23 @@ class TradeAnnotationUpdate(BaseModel):
     emotional_state: Optional[str] = None
 
 
+def _position_side(position: Position) -> str:
+    """A round trip's direction in the API's BUY/SELL vocabulary.
+
+    `positions.direction` stores LONG/SHORT, which is what a position actually
+    is and what the matcher computes. The journal and the analytics layer speak
+    the execution's language -- BUY opened it, SELL opened a short -- and the
+    frontend keys off that, so the two are mapped here rather than at each of
+    the places that used to reconstruct the answer from the opening fill.
+
+    Total by construction: a CHECK constraint admits only the two values, so
+    there is no third case and no reason for a fallback. That fallback is the
+    bug this replaced -- it guessed "long", which flips the sign of entry
+    slippage on a short.
+    """
+    return "SELL" if (position.direction or "").upper() == "SHORT" else "BUY"
+
+
 async def _consumed_quantity_by_trade(
     session: AsyncSession, trade_ids: Optional[list[uuid.UUID]] = None
 ) -> dict[uuid.UUID, Decimal]:
@@ -3740,7 +3762,9 @@ async def list_round_trips(
         if ticker and position.symbol != ticker.strip().upper():
             continue
         opening = trade_by_id.get(position.open_trade_id)
-        direction = (opening.direction if opening else "BUY") or "BUY"
+        # Read, not reconstructed. `opening` is still needed below for the plan
+        # it carries, but the direction no longer depends on finding it.
+        direction = _position_side(position)
         plan = _plan_fields(opening)
 
         entry = position.entry_price
