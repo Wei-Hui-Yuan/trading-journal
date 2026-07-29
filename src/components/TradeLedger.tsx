@@ -268,9 +268,26 @@ const RoundTripHeader = React.memo<RoundTripHeaderProps>(function RoundTripHeade
   const isBuy = rt.direction === 'BUY';
   const isOpen = rt.kind === 'open';
 
+  // Drag is measured against capital committed, not against P&L. Dividing by
+  // the price move made a scratch trade — three cents of movement against a
+  // $0.71 fee — report 1884%, which says nothing about how expensive the trade
+  // actually was to hold.
   const capitalCommitted = Math.abs((rt.entry_price ?? 0) * (rt.quantity ?? 0));
-  const feeDragPct = capitalCommitted > 0 && rt.commission !== null ? (rt.commission / capitalCommitted) * 100 : 0;
-  const feeDragText = feeDragPct < 0.01 && feeDragPct > 0 ? '< 0.01' : feeDragPct < 1 ? feeDragPct.toFixed(2) : feeDragPct.toFixed(1);
+  // Magnitude, so the label carries the direction: a rebate reads
+  // "Credit: $0.05 (0.02%)" rather than "Credit: $0.05 (-0.02%)".
+  const feeDragPct =
+    capitalCommitted > 0 && rt.commission !== null
+      ? (Math.abs(rt.commission) / capitalCommitted) * 100
+      : 0;
+  const feeDragText =
+    feeDragPct > 0 && feeDragPct < 0.01
+      ? '< 0.01'
+      : feeDragPct < 1
+        ? feeDragPct.toFixed(2)
+        : feeDragPct.toFixed(1);
+  // Commission is stored as a cost, so a negative one is a rebate IBKR passed
+  // through — real money received, and not something to show in fee amber.
+  const isCredit = rt.commission !== null && rt.commission < 0;
 
   return (
     <button
@@ -332,12 +349,22 @@ const RoundTripHeader = React.memo<RoundTripHeaderProps>(function RoundTripHeade
         </span>
       )}
 
-      {rt.commission !== null && rt.commission > 0 && (
+      {rt.commission !== null && rt.commission !== 0 && (
         <span
-          className="hidden shrink-0 rounded bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] text-amber-400 sm:inline"
-          title={`Broker Commission: $${rt.commission.toFixed(2)} (${feeDragPct.toFixed(2)}% of $${capitalCommitted.toFixed(2)} capital committed)`}
+          className={`hidden shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px] sm:inline ${
+            isCredit
+              ? 'border-win/20 bg-win/10 text-win'
+              : 'border-amber-500/20 bg-amber-500/10 text-amber-400'
+          }`}
+          title={
+            isCredit
+              ? `Exchange rebate: $${Math.abs(rt.commission).toFixed(2)} received ` +
+                `(${feeDragPct.toFixed(2)}% of $${capitalCommitted.toFixed(2)} capital committed)`
+              : `Broker commission: $${rt.commission.toFixed(2)} ` +
+                `(${feeDragPct.toFixed(2)}% of $${capitalCommitted.toFixed(2)} capital committed)`
+          }
         >
-          Fee: ${rt.commission.toFixed(2)} ({feeDragText}%)
+          {isCredit ? 'Credit' : 'Fee'}: ${Math.abs(rt.commission).toFixed(2)} ({feeDragText}%)
         </span>
       )}
 
