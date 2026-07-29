@@ -82,4 +82,8 @@ ALTER TABLE positions
 -- The journal groups closed round trips by their opening execution and lists
 -- open exposure by ticker; both paths hit these columns on every page load.
 CREATE INDEX IF NOT EXISTS ix_positions_open_trade_id ON positions (open_trade_id);
+-- SUPERSEDED by migration 021, which drops this. Migration 009 had already
+-- created ix_position_fills_position over the same column, and both were
+-- redundant with uq_position_fills_position_trade_role, whose leading column
+-- is position_id.
 CREATE INDEX IF NOT EXISTS ix_position_fills_position_id ON position_fills (position_id);

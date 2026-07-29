@@ -30,5 +30,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_position_fills_position_trade_role
     ON position_fills (position_id, trade_id, role);
 
 -- The drill-down reads every fill for one position.
+--
+-- SUPERSEDED by migration 021, which drops this. It was redundant from the
+-- moment it was written: the unique index above leads with position_id, and a
+-- B-tree serves any query on a leading subset of its columns. Migration 012
+-- then created a second one under a different name, having missed this.
 CREATE INDEX IF NOT EXISTS ix_position_fills_position
     ON position_fills (position_id);
