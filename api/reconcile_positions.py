@@ -63,6 +63,7 @@ async def reconcile() -> int:
                 stale_total = 0
                 missing_total = 0
                 drift_total = 0
+                fills_total = 0
                 stale_pnl = Decimal("0")
                 drift_pnl = Decimal("0")
 
@@ -108,7 +109,49 @@ async def reconcile() -> int:
                         if (row.realized_pnl or Decimal("0")) != expected.realized_pnl:
                             drifted.append((row, expected))
 
-                    if stale or missing or drifted:
+                    # And matching the money is not the same as matching the
+                    # executions it was computed from. A round trip is keyed by
+                    # its FIRST open and LAST close, so a fill landing between
+                    # them joins it without changing the pair -- which is what a
+                    # repair fill does by definition. Pairs agree, P&L agrees,
+                    # and the drill-down can still be describing a different
+                    # trade: a 15-share position whose fills sum to 10, with the
+                    # repair fill floating loose as phantom open exposure.
+                    fill_rows = (
+                        await session.execute(
+                            select(
+                                main.PositionFill.position_id,
+                                main.PositionFill.trade_id,
+                                main.PositionFill.role,
+                                main.PositionFill.quantity,
+                            ).where(
+                                main.PositionFill.position_id.in_(
+                                    [r.id for r in stored]
+                                )
+                            )
+                        )
+                    ).all() if stored else []
+                    stored_fills: dict = {}
+                    for f in fill_rows:
+                        stored_fills.setdefault(f.position_id, {})[
+                            (f.trade_id, f.role)
+                        ] = f.quantity
+
+                    mismatched = []
+                    for row in stored:
+                        expected = fresh_by_pair.get(
+                            (row.open_trade_id, row.close_trade_id)
+                        )
+                        if expected is None:
+                            continue
+                        want = {
+                            (f.trade_id, f.role): f.quantity for f in expected.fills
+                        }
+                        have = stored_fills.get(row.id, {})
+                        if want != have:
+                            mismatched.append((row, want, have))
+
+                    if stale or missing or drifted or mismatched:
                         print(f"  {ticker}")
                     for row in stale:
                         stale_total += 1
@@ -129,6 +172,18 @@ async def reconcile() -> int:
                             f"     DRIFT   stored={row.realized_pnl:+} "
                             f"fifo={expected.realized_pnl:+} id={row.id}"
                         )
+                    for row, want, have in mismatched:
+                        fills_total += 1
+                        print(f"     FILLS   id={row.id}")
+                        for key in sorted(set(want) | set(have), key=str):
+                            w, h = want.get(key), have.get(key)
+                            if w != h:
+                                trade_id, role = key
+                                print(
+                                    f"        {role:<5} {str(trade_id)[:8]} "
+                                    f"stored={'-' if h is None else h} "
+                                    f"fifo={'-' if w is None else w}"
+                                )
 
                 reported = sum(
                     (await session.execute(select(main.Position.realized_pnl)))
@@ -141,6 +196,7 @@ async def reconcile() -> int:
                 print(f"stale positions (in the table, not in FIFO) : {stale_total}")
                 print(f"missing positions (in FIFO, not the table)  : {missing_total}")
                 print(f"positions whose stored P&L != FIFO's        : {drift_total}")
+                print(f"positions whose FILLS != FIFO's             : {fills_total}")
                 print(f"P&L attributable to stale rows              : {stale_pnl:+}")
                 if drift_total:
                     print(f"P&L the drifted rows are wrong by           : {drift_pnl:+}")
@@ -148,9 +204,9 @@ async def reconcile() -> int:
                 if stale_total:
                     print(f"net P&L with stale rows excluded            : {reported - stale_pnl:+}")
                 print()
-                clean = not (stale_total or missing_total or drift_total)
+                clean = not (stale_total or missing_total or drift_total or fills_total)
                 print("CLEAN" if clean else "DISCREPANCIES FOUND")
-                return stale_total + missing_total + drift_total
+                return stale_total + missing_total + drift_total + fills_total
         finally:
             await transaction.rollback()
             await main.engine.dispose()

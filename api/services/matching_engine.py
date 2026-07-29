@@ -694,6 +694,10 @@ async def insert_positions(
     grade, tags, strategy, notes, mistakes, the post-mortem, the ideal and
     revised levels -- is left exactly as it was. A round trip's numbers belong
     to its executions; its review belongs to the trader.
+
+    `position_fills` is resynced the same way, so the drill-down cannot end up
+    describing a different trade from the position above it. Returns the number
+    of positions written.
     """
     if not positions:
         return 0
@@ -748,49 +752,123 @@ async def insert_positions(
             set_={column: getattr(pg_insert(Position).excluded, column)
                   for column in refreshed},
         )
-        .returning(
-            Position.id,
-            Position.open_trade_id,
-            Position.close_trade_id,
-            # Distinguishes a genuinely new row from a refreshed one: DO UPDATE
-            # returns both, and only a new row needs its fills written.
-            Position.created_at,
-        )
+        .returning(Position.id, Position.open_trade_id, Position.close_trade_id)
     )
     upserted = (await session.execute(stmt)).fetchall()
+    position_ids = {(r.open_trade_id, r.close_trade_id): r.id for r in upserted}
 
-    # Fills are written only for positions that did not already have them.
-    # Re-inserting them for a refreshed row would be a no-op against
-    # uq_position_fills_position_trade_role anyway, but skipping the round trip
-    # keeps a re-sync from writing a fill row per position on every run.
-    existing_ids = set((
-        await session.execute(
-            select(PositionFill.position_id).where(
-                PositionFill.position_id.in_([row.id for row in upserted])
-            ).distinct()
+    await _sync_position_fills(session, positions, position_ids)
+    return len(upserted)
+
+
+async def _sync_position_fills(
+    session: AsyncSession,
+    positions: list[MatchedPosition],
+    position_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID],
+) -> tuple[int, int]:
+    """Make `position_fills` describe what FIFO actually produced.
+
+    A round trip is identified by its FIRST open and LAST close, so a fill
+    landing between them joins it without changing the pair. BUY 10 then
+    SELL 15 stores a 10-share round trip (A,B); adding a backdated BUY 5 makes
+    it a 15-share round trip -- still (A,B), so nothing is stale, and the
+    position row is refreshed in place by the upsert above.
+
+    Its fills were not. They were written once, when the position was created,
+    and skipped ever after on the grounds that re-inserting them would conflict
+    anyway. That is true of the rows that already existed and says nothing
+    about the ones that should now exist: the repair fill got no row at all,
+    and the closing fill kept a quantity of 10 under a position asserting 15.
+
+    The damage is not in the money -- realized_pnl is correct -- but the
+    drill-down contradicts its own position, `is_matched` reads false for the
+    repair fill, and because open exposure is reconstructed from executions
+    that have no fill row, it reappears as a phantom open trade. Which makes
+    this the ordinary outcome of the repair feature's whole purpose: noticing a
+    round trip is short a fill and adding it.
+
+    Costs nothing when nothing changed. The stored rows were already being read
+    to decide which positions to skip; they are now read in full and compared,
+    and no write is issued unless the composition actually differs.
+    """
+    from main import PositionFill  # noqa: PLC0415 - avoids import cycle
+
+    if not position_ids:
+        return (0, 0)
+
+    # Keyed the way uq_position_fills_position_trade_role is, so a comparison
+    # here and a conflict in Postgres mean the same thing.
+    fresh: dict[tuple, dict] = {}
+    for position in positions:
+        position_id = position_ids.get(
+            (position.open_trade_id, position.close_trade_id)
         )
-    ).scalars().all())
-    inserted = [row for row in upserted if row.id not in existing_ids]
-    new_ids = {(row.open_trade_id, row.close_trade_id): row.id for row in inserted}
+        if position_id is None:
+            continue
+        for fill in position.fills:
+            fresh[(position_id, fill.trade_id, fill.role)] = {
+                "position_id": position_id,
+                "trade_id": fill.trade_id,
+                "role": fill.role,
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "executed_at": fill.executed_at,
+            }
 
-    fill_rows = [
-        {
-            "id": uuid.uuid4(),
-            "position_id": position_id,
-            "trade_id": fill.trade_id,
-            "role": fill.role,
-            "quantity": fill.quantity,
-            "price": fill.price,
-            "executed_at": fill.executed_at,
-        }
-        for position in positions
-        if (position_id := new_ids.get((position.open_trade_id, position.close_trade_id)))
-        for fill in position.fills
+    stored = (
+        await session.execute(
+            select(
+                PositionFill.id,
+                PositionFill.position_id,
+                PositionFill.trade_id,
+                PositionFill.role,
+                PositionFill.quantity,
+                PositionFill.price,
+            ).where(PositionFill.position_id.in_(list(position_ids.values())))
+        )
+    ).all()
+    stored_by_key = {(r.position_id, r.trade_id, r.role): r for r in stored}
+
+    # `executed_at` is deliberately not compared. It comes from the same trades
+    # row the fill was built from, so it cannot drift while the key holds --
+    # and comparing timestamps across a driver boundary is the kind of thing
+    # that reports a difference every run and turns a no-op into a write.
+    changed = [
+        values
+        for key, values in fresh.items()
+        if (row := stored_by_key.get(key)) is None
+        or row.quantity != values["quantity"]
+        or row.price != values["price"]
     ]
+    # Fills that used to belong to this round trip and no longer do. Without
+    # this the sum drifts the other way: a re-partition that moves a fill out
+    # leaves it behind, and the drill-down over-counts.
+    removed = [row.id for key, row in stored_by_key.items() if key not in fresh]
 
-    if fill_rows:
+    if removed:
         await session.execute(
-            pg_insert(PositionFill).values(fill_rows).on_conflict_do_nothing()
+            delete(PositionFill).where(PositionFill.id.in_(removed))
         )
 
-    return len(inserted)
+    if changed:
+        await session.execute(
+            pg_insert(PositionFill)
+            .values([{"id": uuid.uuid4(), **values} for values in changed])
+            .on_conflict_do_update(
+                index_elements=["position_id", "trade_id", "role"],
+                set_={
+                    "quantity": pg_insert(PositionFill).excluded.quantity,
+                    "price": pg_insert(PositionFill).excluded.price,
+                    "executed_at": pg_insert(PositionFill).excluded.executed_at,
+                },
+            )
+        )
+
+    if changed or removed:
+        logger.info(
+            "position_fills resynced: %d row(s) written, %d removed across "
+            "%d round trip(s).",
+            len(changed), len(removed), len(position_ids),
+        )
+
+    return (len(changed), len(removed))
