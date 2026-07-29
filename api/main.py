@@ -2665,6 +2665,55 @@ class TradeAnnotationUpdate(BaseModel):
     emotional_state: Optional[str] = None
 
 
+async def _consumed_quantity_by_trade(
+    session: AsyncSession, trade_ids: Optional[list[uuid.UUID]] = None
+) -> dict[uuid.UUID, Decimal]:
+    """How much of each execution FIFO has folded into closed round trips.
+
+    Quantity, not membership. An execution can be PARTLY consumed: an oversell
+    closes the long it was aimed at and opens a short with whatever is left
+    over, so a 15-share sell can appear in `position_fills` as a 10-share CLOSE
+    while five shares of it are a live position.
+
+    Summed across every fill row for the execution, which is what makes the
+    flip case come out right in both states. While the short is open the sell
+    is recorded once, as a 10-share CLOSE, and five shares remain. Once the
+    short is covered the sell is recorded twice -- CLOSE 10 and OPEN 5 -- and
+    the total reaches 15, so nothing is left open. Testing membership cannot
+    tell those two apart, and reported the second for both.
+
+    One grouped query for the whole ledger. It replaces a query that returned
+    every fill row, so it moves less data, not more.
+    """
+    stmt = select(
+        PositionFill.trade_id, func.sum(PositionFill.quantity)
+    ).group_by(PositionFill.trade_id)
+    if trade_ids is not None:
+        stmt = stmt.where(PositionFill.trade_id.in_(trade_ids))
+    return {
+        trade_id: quantity or Decimal("0")
+        for trade_id, quantity in (await session.execute(stmt)).all()
+    }
+
+
+def _unmatched_quantity(trade: Trade, consumed: dict[uuid.UUID, Decimal]) -> Decimal:
+    """Shares of this execution that no closed round trip accounts for."""
+    remaining = (trade.quantity or Decimal("0")) - consumed.get(
+        trade.id, Decimal("0")
+    )
+    return remaining if remaining > 0 else Decimal("0")
+
+
+def _is_fully_matched(trade: Trade, consumed: dict[uuid.UUID, Decimal]) -> bool:
+    """Whether the whole execution has been folded into closed round trips.
+
+    False while any part of it is still open, which is the honest answer for
+    the sell that flipped a long into a short: it closed one trade and started
+    another, and calling it "matched" hid the one that is still running.
+    """
+    return _unmatched_quantity(trade, consumed) == 0
+
+
 @app.get(
     "/api/trades",
     response_model=list[TradeOut],
@@ -2685,15 +2734,13 @@ async def list_trades(
         stmt = stmt.where(Trade.ticker == ticker.strip().upper())
     trades = (await session.execute(stmt)).scalars().all()
 
-    # One query for the whole ledger rather than a lookup per row.
-    matched = (await session.execute(select(PositionFill.trade_id))).scalars().all()
-    matched_ids = set(matched)
+    consumed = await _consumed_quantity_by_trade(session)
 
     return [
         TradeOut(
             **{c.name: getattr(trade, c.name) for c in Trade.__table__.columns
                if c.name in TradeOut.model_fields},
-            is_matched=trade.id in matched_ids,
+            is_matched=_is_fully_matched(trade, consumed),
         )
         for trade in trades
     ]
@@ -2724,13 +2771,11 @@ async def annotate_trade(
     await session.commit()
     await session.refresh(trade)
 
-    matched = await session.execute(
-        select(PositionFill.id).where(PositionFill.trade_id == trade_id).limit(1)
-    )
+    consumed = await _consumed_quantity_by_trade(session, [trade_id])
     return TradeOut(
         **{c.name: getattr(trade, c.name) for c in Trade.__table__.columns
            if c.name in TradeOut.model_fields},
-        is_matched=matched.first() is not None,
+        is_matched=_is_fully_matched(trade, consumed),
     )
 
 
@@ -3678,7 +3723,15 @@ async def list_round_trips(
     fills_by_position: dict[uuid.UUID, list[PositionFill]] = {}
     for fill in fills:
         fills_by_position.setdefault(fill.position_id, []).append(fill)
-    matched_trade_ids = {f.trade_id for f in fills}
+
+    # How much of each execution the closed round trips account for. Summed
+    # from the fills already loaded above rather than re-queried -- an
+    # execution can be partly consumed, and the remainder is live exposure.
+    consumed_by_trade: dict[uuid.UUID, Decimal] = {}
+    for fill in fills:
+        consumed_by_trade[fill.trade_id] = consumed_by_trade.get(
+            fill.trade_id, Decimal("0")
+        ) + (fill.quantity or Decimal("0"))
 
     rows: list[RoundTripOut] = []
 
@@ -3757,22 +3810,33 @@ async def list_round_trips(
         )
 
     # --- open exposure -----------------------------------------------------
-    # Executions FIFO never paired off. Grouped per ticker, because that is the
-    # unit of exposure: two unsold AAPL buys are one open position, not two.
-    open_by_ticker: dict[str, list[Trade]] = {}
+    # Executions FIFO never paired off, in whole or in PART. Grouped per
+    # ticker, because that is the unit of exposure: two unsold AAPL buys are
+    # one open position, not two.
+    #
+    # Partly matters. This used to skip any execution present in
+    # `position_fills` at all, on the reading that appearing there means
+    # consumed. An oversell breaks that reading: the sell closes the long it
+    # was aimed at AND opens a short with the remainder, so it is recorded as a
+    # 10-share CLOSE while five shares of it are a live position. Being in the
+    # table excluded it, and the short existed nowhere in the app -- not as a
+    # row, not in exposure, not in the fill list. The matcher had it the whole
+    # time in `MatchingResult.open_lots`; this endpoint just never asked.
+    open_by_ticker: dict[str, list[tuple[Trade, Decimal]]] = {}
     for trade in trades:
-        if trade.id in matched_trade_ids:
-            continue
         if ticker and trade.ticker != ticker.strip().upper():
             continue
-        open_by_ticker.setdefault(trade.ticker, []).append(trade)
+        remaining = _unmatched_quantity(trade, consumed_by_trade)
+        if remaining <= 0:
+            continue
+        open_by_ticker.setdefault(trade.ticker, []).append((trade, remaining))
 
     for symbol, group in open_by_ticker.items():
-        group.sort(key=lambda t: t.entry_date)
+        group.sort(key=lambda pair: pair[0].entry_date)
         signed = sum(
-            (t.quantity or Decimal("0"))
+            remaining
             * (Decimal("1") if (t.direction or "BUY").upper() == "BUY" else Decimal("-1"))
-            for t in group
+            for t, remaining in group
         )
         if signed == 0:
             # Nets flat without ever being matched -- a data oddity rather than
@@ -3784,13 +3848,17 @@ async def list_round_trips(
         # fill treats shares that have already been sold as though they were
         # still held: MSFT reported 415.45, the average of all 17 shares ever
         # bought, when only 2 remained at 409.40.
+        #
+        # Replayed over the UNMATCHED remainder of each execution, not its full
+        # size, or the flipping sell would contribute all 15 of its shares to a
+        # position that is only 5.
         exposure = replay_open_exposure(
-            (t.direction, t.quantity or Decimal("0"), t.actual_entry or Decimal("0"))
-            for t in group
+            (t.direction, remaining, t.actual_entry or Decimal("0"))
+            for t, remaining in group
         )
         avg_entry = exposure.average_cost
 
-        opening = group[0]
+        opening = group[0][0]
         plan = _plan_fields(opening)
         rows.append(
             RoundTripOut(
@@ -3812,7 +3880,8 @@ async def list_round_trips(
                     net_direction, plan.get("planned_entry"), avg_entry
                 ),
                 has_hand_added_fills=any(
-                    (t.ibkr_exec_id or "").startswith(EXEC_PREFIX_REPAIR) for t in group
+                    (t.ibkr_exec_id or "").startswith(EXEC_PREFIX_REPAIR)
+                    for t, _ in group
                 ),
                 planned_r_multiple=_score_r(
                     net_direction, plan.get("planned_entry") or avg_entry,
@@ -3831,11 +3900,16 @@ async def list_round_trips(
                             if (t.direction or "BUY").upper() == net_direction
                             else ROLE_CLOSE
                         ),
-                        quantity=float(t.quantity or 0),
+                        # The part of the fill that is still open, not the size
+                        # the broker filled. On the sell that flipped a long
+                        # into a short, ten of those fifteen shares belong to
+                        # the closed round trip listed separately -- showing 15
+                        # here would count them in both places.
+                        quantity=float(remaining),
                         price=float(t.actual_entry or 0),
                         executed_at=t.entry_date,
                     )
-                    for t in group
+                    for t, remaining in group
                 ],
                 **plan,
             )

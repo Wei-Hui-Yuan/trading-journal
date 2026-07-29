@@ -671,7 +671,15 @@ export interface Trade {
   planned_entry: number | null;
   stop_loss: number | null;
   target: number | null;
-  /** False means no counterpart fill yet � an open position. */
+  /**
+   * True only when the WHOLE execution has been folded into closed round
+   * trips. False while any part of it is still open.
+   *
+   * The distinction is not pedantic: an oversell closes the long it was aimed
+   * at and opens a short with what is left over, so one fill can be half
+   * matched and half a live position. This used to report true for it, and the
+   * short was invisible everywhere in the app.
+   */
   is_matched: boolean;
   created_at: string | null;
 }

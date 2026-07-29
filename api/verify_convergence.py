@@ -16,6 +16,11 @@ prices, times, P&L, gross, commission, and the same fill composition
 underneath. A no-op re-match in between must change nothing, and reviews must
 survive it.
 
+The journal's open exposure must also equal the matcher's. An oversell puts one
+execution in two places at once -- closing a long and opening a short with what
+is left over -- and deciding by membership in position_fills made that short
+invisible everywhere in the app while the matcher had it all along.
+
 Read-only with respect to the real ledger: everything runs inside a transaction
 that is always rolled back, on ZZ* tickers that do not exist in it.
 
@@ -197,6 +202,22 @@ async def verify() -> int:
                     await run_matching_for_ticker(session, ticker, persist=True)
                     rebuilt = await snapshot(session, ticker)
 
+                    # And what the journal says is still open must equal what
+                    # the matcher says is still open. An oversell puts one
+                    # execution in both places at once -- closing the long and
+                    # opening a short with the remainder -- and the journal
+                    # used to decide by membership, so the short was invisible.
+                    expected_open = (
+                        await run_matching_for_ticker(session, ticker, persist=False)
+                    ).open_quantity
+                    journal = await main.list_round_trips(ticker=ticker, session=session)
+                    reported_open = sum(
+                        Decimal(str(row.quantity))
+                        for row in journal
+                        if row.kind == "open"
+                    )
+                    exposure_agrees = reported_open == expected_open
+
                     drift = differences(incremental, rebuilt)
                     churn = differences(incremental, unchanged)
                     # A scenario can legitimately close nothing; there are then
@@ -205,13 +226,19 @@ async def verify() -> int:
                         status == "reviewed" for status in still
                     )
 
-                    ok = not drift and not churn and reviews_kept
+                    ok = not drift and not churn and reviews_kept and exposure_agrees
                     failures += 0 if ok else 1
                     print(f"  {'PASS' if ok else 'FAIL'}  {label}")
                     print(
-                        f"          {len(incremental)} round trip(s); "
+                        f"          {len(incremental)} round trip(s), "
+                        f"{expected_open:g} share(s) still open; "
                         f"reviews survive a re-match: {reviews_kept}"
                     )
+                    if not exposure_agrees:
+                        print(
+                            f"          EXPOSURE HIDDEN  journal reports "
+                            f"{reported_open:g} open, matcher says {expected_open:g}"
+                        )
                     for problem in drift:
                         print(f"          DIVERGED    {problem}")
                     for problem in churn:
