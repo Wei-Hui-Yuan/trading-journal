@@ -196,9 +196,16 @@ export interface PositionFill {
  *
  * Every field is optional: the backend applies only keys present in the
  * request (`exclude_unset`), so a partial save never clears untouched fields.
- * Submitting this always flips `review_status` to 'completed' server-side.
+ * Submitting this flips `review_status` to 'reviewed' server-side, unless
+ * `mark_reviewed: false` is sent alongside it.
  */
 export interface PositionReviewPayload {
+  /**
+   * Completing the checklist is what empties the Trade Inbox queue, so this
+   * defaults true. The Analytics drawer only ever sends `notes`/`mistakes`
+   * and sets this false, so a note on an old trade doesn't silently clear it.
+   */
+  mark_reviewed?: boolean;
   strategy_id?: string | null;
   tag_hard_sl?: boolean;
   tag_retest?: boolean;

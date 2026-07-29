@@ -424,7 +424,7 @@ function ReviewDrawer({
   const handleSave = () => {
     setError(null);
     mutation.mutate(
-      { id: position.id, payload: { notes, mistakes: tags } },
+      { id: position.id, payload: { notes, mistakes: tags, mark_reviewed: false } },
       { onSuccess: onClose, onError: (e) => setError(e.message) }
     );
   };

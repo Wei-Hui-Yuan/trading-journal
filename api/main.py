@@ -84,9 +84,12 @@ class Base(DeclarativeBase):
 class ReviewStatus(str, Enum):
     """Lifecycle of a position's qualitative review.
 
-    One vocabulary for every surface: the Trade Inbox checklist and the
-    Analytics notes/mistakes drawer both terminate at 'reviewed', so a single
-    `review_status = 'pending'` filter drives both queues.
+    One vocabulary for every surface: the Trade Inbox checklist and the Trade
+    Ledger's post-mortem both terminate at 'reviewed' -- a single
+    `review_status = 'pending'` filter drives the Trade Inbox queue. The
+    Analytics drawer edits the same notes/mistakes fields but opts out via
+    `mark_reviewed=False`, so jotting a note on an old trade does not pull it
+    out of that queue.
     """
 
     pending = "pending"
@@ -2416,6 +2419,13 @@ class PositionReviewUpdate(BaseModel):
     in the request are applied, so one surface never clears the other's work.
     """
 
+    # Completing the checklist is what empties the Trade Inbox queue, so it
+    # defaults on for that surface and the Trade Ledger's post-mortem without
+    # either having to ask for it. The Analytics drawer sends only `notes`
+    # and `mistakes` -- jotting a note there must not silently complete the
+    # review of a trade nobody has looked at yet, so it sends `false`.
+    mark_reviewed: bool = True
+
     strategy_id: Optional[uuid.UUID] = None
     tag_hard_sl: Optional[bool] = None
     tag_retest: Optional[bool] = None
@@ -3962,12 +3972,17 @@ async def review_position(
     params: PositionReviewUpdate,
     session: AsyncSession = Depends(get_session),
 ):
-    """Record the review checklist and mark the position completed."""
+    """Record the review checklist, and mark the position reviewed unless the
+    caller opts out with `mark_reviewed=False`."""
     position = await session.get(Position, position_id)
     if position is None:
         raise HTTPException(status_code=404, detail="Position not found")
 
     updates = params.model_dump(exclude_unset=True)
+
+    # Not a column -- it only decides whether the setattr loop's assignment
+    # of review_status happens at all, applied further down.
+    updates.pop("mark_reviewed", None)
 
     # Pulled out before the setattr loop below: `disciplines` lives in its own
     # table, and assigning it to the ORM object would silently become a stray
@@ -4032,7 +4047,8 @@ async def review_position(
             )
             await session.execute(stmt)
 
-    position.review_status = ReviewStatus.reviewed.value
+    if params.mark_reviewed:
+        position.review_status = ReviewStatus.reviewed.value
 
     await session.commit()
     await session.refresh(position)
