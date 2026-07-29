@@ -33,6 +33,9 @@ import type {
   Trade,
   TradeDeleteResult,
   TradeAnnotationPayload,
+  TimeframePreset,
+  TimeframePresetPayload,
+  TimeframeSelection,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -490,9 +493,72 @@ export async function getAdvancedMetrics(): Promise<AdvancedMetrics> {
   return data;
 }
 
-/** GET /api/analytics/dashboard â€” core stats plus the heatmap grid. */
-export async function getDashboardAnalytics(): Promise<DashboardStats> {
-  const { data } = await apiClient.get<DashboardStats>('/analytics/dashboard');
+/**
+ * GET /api/analytics/dashboard — core stats, heatmap and equity curve.
+ *
+ * The window governs the whole payload, not just the curve. Pass a built-in
+ * preset name and let the server expand it: "YTD" and "1Y" are definitions,
+ * and a second copy of them here would be free to drift from the one the
+ * figures are actually computed with. Pass explicit dates for a saved preset.
+ *
+ * Omitting everything defaults to 1Y server-side, so a bare call is bounded
+ * rather than plotting the entire ledger.
+ */
+export async function getDashboardAnalytics(
+  selection?: TimeframeSelection
+): Promise<DashboardStats> {
+  const params =
+    selection?.kind === 'custom'
+      ? { start_date: selection.start_date, end_date: selection.end_date }
+      : selection
+        ? { preset: selection.preset }
+        : undefined;
+
+  const { data } = await apiClient.get<DashboardStats>('/analytics/dashboard', {
+    params,
+  });
+  return data;
+}
+
+/** GET /api/settings/timeframes — saved custom windows, oldest first. */
+export async function getTimeframes(): Promise<TimeframePreset[]> {
+  const { data } = await apiClient.get<TimeframePreset[]>('/settings/timeframes');
+  return data;
+}
+
+/** POST /api/settings/timeframes — rejects a duplicate name with a 409. */
+export async function createTimeframe(
+  payload: TimeframePresetPayload
+): Promise<TimeframePreset> {
+  const { data } = await apiClient.post<TimeframePreset>(
+    '/settings/timeframes',
+    payload
+  );
+  return data;
+}
+
+/**
+ * PUT /api/settings/timeframes/{id} — a full replacement, not a patch.
+ *
+ * All three fields are one statement about a window; editing an end date
+ * without its start in view is how a range ends up backwards.
+ */
+export async function updateTimeframe(
+  id: string,
+  payload: TimeframePresetPayload
+): Promise<TimeframePreset> {
+  const { data } = await apiClient.put<TimeframePreset>(
+    `/settings/timeframes/${id}`,
+    payload
+  );
+  return data;
+}
+
+/** DELETE /api/settings/timeframes/{id} — returns the row it removed. */
+export async function deleteTimeframe(id: string): Promise<TimeframePreset> {
+  const { data } = await apiClient.delete<TimeframePreset>(
+    `/settings/timeframes/${id}`
+  );
   return data;
 }
 

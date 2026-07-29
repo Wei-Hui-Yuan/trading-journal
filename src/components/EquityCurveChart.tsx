@@ -190,9 +190,12 @@ export const EquityCurveChart: React.FC<EquityCurveChartProps> = ({
   if (!data || points.length === 0) {
     return shell(
       <div className="py-12 text-center">
-        <p className="text-sm text-slate-300">No closed trades yet.</p>
+        <p className="text-sm text-slate-300">
+          No round trips closed in this window.
+        </p>
         <p className="mt-1 text-[11px] text-obsidian-muted">
-          The curve plots realised P&amp;L, so it starts once a round trip closes.
+          The curve plots realised P&amp;L, so it starts once a round trip
+          closes. Try a wider timeframe.
         </p>
       </div>
     );
@@ -360,6 +363,21 @@ export const EquityCurveChart: React.FC<EquityCurveChartProps> = ({
         >
           Show underwater chart
         </button>
+      )}
+
+      {/* Not a styling flourish. A curve that starts later than the data does
+          is indistinguishable from an account that began trading then, so the
+          one case where that happens has to announce itself. */}
+      {s.truncated && (
+        <div className="mt-3 flex items-start gap-1.5 rounded-lg border border-loss/30 bg-loss-glow px-3 py-2 text-[11px] text-loss">
+          <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0" />
+          <span>
+            Curve trimmed to the last {s.max_days ?? 3650} days. Closes older
+            than that were left out — a span this wide almost always means an
+            execution carrying a corrupt timestamp, so it is worth checking the
+            oldest exit date in the ledger.
+          </span>
+        </div>
       )}
 
       <p className="mt-3 text-[10px] leading-relaxed text-obsidian-muted">

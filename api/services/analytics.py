@@ -9,14 +9,17 @@ the response boundary, so rounding never accumulates through the aggregation.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 # US equities trade on Eastern time; broker timestamps are stored in UTC, so
 # every bucketing decision has to happen after converting into this zone.
@@ -45,6 +48,144 @@ _MARKET_OPEN = time(9, 30)
 _MIDDAY_START = time(12, 0)
 _AFTERNOON_START = time(14, 0)
 _CLOSE = time(16, 0)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard timeframe windows
+# ---------------------------------------------------------------------------
+#
+# Every figure the dashboard reports -- headline stats, heatmap and equity
+# curve -- is computed over the same window, so the three cannot describe
+# different spans while sitting on one screen.
+
+# Built-in presets. Resolved here rather than in the browser on purpose: "YTD"
+# and "1Y" are definitions, and a second copy of them in TypeScript would be
+# free to drift. The client names the preset; the server decides what it means.
+PRESET_YTD = "YTD"
+PRESET_1Y = "1Y"
+PRESET_ALL = "ALL"
+PRESETS: tuple[str, ...] = (PRESET_YTD, PRESET_1Y, PRESET_ALL)
+
+# What a dashboard with no parameters shows. A year of history is the window
+# that answers "how am I trading", where ALL increasingly answers "how did I
+# trade in 2024" as the ledger grows.
+DEFAULT_PRESET = PRESET_1Y
+
+# 1Y is 365 calendar days back, not "same date last year". Both are defensible;
+# this one keeps the window a fixed length so two consecutive days are
+# comparable, and does not have to decide what 1Y means on a 29 February.
+ONE_YEAR_DAYS = 365
+
+# The longest span the equity curve will ever plot, in calendar days.
+#
+# The curve emits one point per calendar day between the first and last close,
+# which is deliberate -- gaps carry information, and a chart plotting only
+# trading days compresses a three-month pause into one step. But the loop is
+# driven by whatever dates are in the data, and it has no natural ceiling: a
+# single execution carrying a corrupt timestamp (a 1970 epoch default, a
+# mis-parsed statement) stretches it across five decades. Measured, one such
+# row alongside ordinary 2026 data produced 20,637 points in a single JSON
+# response -- megabytes over the wire, and enough series for Recharts to lock
+# the tab on every dashboard load.
+#
+# Ten years is far past any window this journal is used to answer questions
+# about, so clamping cannot hide real history; it can only cut off dates that
+# should not exist. When it fires it says so, rather than quietly showing a
+# shorter curve than was asked for.
+MAX_CURVE_DAYS = 3650
+
+
+@dataclass(frozen=True)
+class Window:
+    """The span of closes a dashboard payload covers.
+
+    `start`/`end` are inclusive market-time calendar dates. Either may be None,
+    which means unbounded on that side -- that is what ALL is, and it is
+    distinct from a bound that happens to sit before the first trade.
+    """
+
+    start: Optional[date] = None
+    end: Optional[date] = None
+    # The built-in that produced these dates, when one did. None for a custom
+    # range, so the UI can tell a saved preset from a built-in pill.
+    preset: Optional[str] = None
+
+    def contains(self, day: date) -> bool:
+        if self.start is not None and day < self.start:
+            return False
+        if self.end is not None and day > self.end:
+            return False
+        return True
+
+    @property
+    def is_unbounded(self) -> bool:
+        return self.start is None and self.end is None
+
+
+def market_today() -> date:
+    """Today's calendar date in market time.
+
+    Not the server's date. A container in UTC rolls over at 19:00 or 20:00 ET,
+    so between then and midnight a YTD window computed from the server clock
+    would already include tomorrow -- and on 31 December it would jump a whole
+    year ahead of the trader.
+    """
+    return datetime.now(MARKET_TZ).date()
+
+
+def resolve_window(
+    preset: Optional[str] = None,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    *,
+    today: Optional[date] = None,
+) -> Window:
+    """Turn what the client asked for into a concrete pair of dates.
+
+    Precedence, and why:
+
+      1. Explicit `start`/`end` win outright. A saved custom preset sends
+         dates, and it must mean exactly what it says.
+      2. Otherwise a named built-in is expanded here.
+      3. Otherwise the default (1Y), so a bare request is bounded rather than
+         plotting the entire ledger.
+
+    A partial explicit range is honoured as half-open -- `start` with no `end`
+    means "since then", which is a reasonable thing to ask for and cheaper to
+    support than to reject.
+
+    Raises ValueError on an unknown preset or a backwards range; the endpoint
+    turns both into a 422 naming the problem.
+    """
+    today = today or market_today()
+
+    if start is not None or end is not None:
+        if start is not None and end is not None and start > end:
+            raise ValueError(
+                f"start_date ({start.isoformat()}) is after end_date "
+                f"({end.isoformat()})."
+            )
+        return Window(start=start, end=end, preset=None)
+
+    name = (preset or DEFAULT_PRESET).strip().upper()
+    if name not in PRESETS:
+        raise ValueError(
+            f"preset must be one of {', '.join(PRESETS)} (got {preset!r}), "
+            "or pass explicit start_date/end_date."
+        )
+
+    if name == PRESET_ALL:
+        # Genuinely unbounded. Not "a very early start date" -- the clamp below
+        # is what protects the payload, and expressing ALL as a sentinel year
+        # would make an ordinary window indistinguishable from a corrupt one.
+        return Window(preset=PRESET_ALL)
+
+    if name == PRESET_YTD:
+        return Window(start=date(today.year, 1, 1), end=today, preset=PRESET_YTD)
+
+    return Window(
+        start=today - timedelta(days=ONE_YEAR_DAYS), end=today, preset=PRESET_1Y
+    )
 
 
 def classify_session(entry_time: datetime) -> tuple[Optional[str], Optional[str]]:
@@ -292,7 +433,111 @@ async def load_closed_positions(session: AsyncSession) -> list[ClosedPosition]:
     ]
 
 
-def build_equity_curve(positions: Iterable[ClosedPosition]) -> dict[str, Any]:
+def _exit_day(position: ClosedPosition) -> Optional[date]:
+    """The market-time calendar day a round trip closed on.
+
+    One helper, used by the window filter, the clamp and the curve's own
+    bucketing, so all three agree on which side of midnight a close falls --
+    the whole point of expressing the window in market dates.
+    """
+    if position.exit_time is None:
+        return None
+    return position.exit_time.astimezone(MARKET_TZ).date()
+
+
+def filter_by_exit_window(
+    positions: Iterable[ClosedPosition], window: Window
+) -> tuple[list[ClosedPosition], int]:
+    """Keep round trips that CLOSED inside the window.
+
+    Dated by exit for the same reason the curve is: a trade opened in March and
+    closed in July moved the account in July, and a July window that excluded
+    it would show a balance stepping up with nothing to account for it.
+
+    Note what this means for the heatmap, which buckets by ENTRY. A 2025 window
+    contains a trade entered on 2024-12-30 and closed on 2025-01-02, and that
+    trade lands on the heatmap's Monday under its December entry. That is
+    correct rather than a leak: the window selects which trades are in scope,
+    and the heatmap answers when those trades were entered.
+
+    Returns the kept positions and how many were dropped for having no exit
+    time at all. `positions.exit_time` is NOT NULL, so that count is expected
+    to be zero -- it is returned rather than assumed so a schema change cannot
+    silently start shrinking every windowed figure.
+
+    Filtered in Python rather than SQL deliberately: the boundary has to be the
+    market-time date, and comparing a TIMESTAMPTZ against one in SQL needs
+    `(exit_time AT TIME ZONE 'America/New_York')::date`, which no existing index
+    covers. The dashboard already loads every position for the heatmap, so this
+    costs a pass over a list that is in memory regardless. When the ledger
+    outgrows that, the move is that expression plus a matching index -- not a
+    UTC comparison, which would misfile every close in the last five hours of a
+    trading day.
+    """
+    if window.is_unbounded:
+        return list(positions), 0
+
+    kept: list[ClosedPosition] = []
+    undated = 0
+    for position in positions:
+        day = _exit_day(position)
+        if day is None:
+            # Cannot be placed in time, so it cannot be shown to be in the
+            # window. Counted, never silently absorbed.
+            undated += 1
+            continue
+        if window.contains(day):
+            kept.append(position)
+    return kept, undated
+
+
+def clamp_to_max_span(
+    positions: Iterable[ClosedPosition],
+) -> tuple[list[ClosedPosition], bool]:
+    """Drop closes more than MAX_CURVE_DAYS before the most recent one.
+
+    The backstop for a corrupt date. See MAX_CURVE_DAYS for why an unbounded
+    span is a real hazard rather than a theoretical one.
+
+    Measured from the LAST close rather than from today, so a ledger that has
+    been idle for a while keeps its full recent history instead of having the
+    window walk off the end of it.
+
+    Idempotent: clamping an already-clamped list reports False, which is what
+    lets build_dashboard clamp once and build_equity_curve re-check without the
+    two disagreeing about whether truncation happened.
+    """
+    materialised = list(positions)
+    days = [day for day in map(_exit_day, materialised) if day is not None]
+    if not days:
+        return materialised, False
+
+    last_day = max(days)
+    floor = last_day - timedelta(days=MAX_CURVE_DAYS)
+    if min(days) >= floor:
+        return materialised, False
+
+    kept = [
+        position
+        for position in materialised
+        if (day := _exit_day(position)) is not None and day >= floor
+    ]
+    logger.warning(
+        "Equity curve span clamped to %d days: %d of %d closed round trips are "
+        "dated before %s and were excluded. A span this wide almost always "
+        "means a corrupt execution timestamp -- check the oldest exit_time in "
+        "`positions`.",
+        MAX_CURVE_DAYS,
+        len(materialised) - len(kept),
+        len(materialised),
+        floor.isoformat(),
+    )
+    return kept, True
+
+
+def build_equity_curve(
+    positions: Iterable[ClosedPosition], *, truncated: bool = False
+) -> dict[str, Any]:
     """Cumulative realised P&L over time, with the drawdown it went through.
 
     NOT account equity, and deliberately not called that in the response. True
@@ -309,11 +554,22 @@ def build_equity_curve(positions: Iterable[ClosedPosition]) -> dict[str, Any]:
     weekends. The gaps are the point: a chart that plots only trading days
     compresses a three-month pause into one step, and "how fast did it recover"
     is unanswerable if the x-axis is not proportional to time.
+
+    That per-day loop is bounded by MAX_CURVE_DAYS. `truncated` is reported in
+    the summary whenever the span was cut -- by this function or by a caller
+    that clamped first -- because a curve silently starting later than the data
+    does is indistinguishable from an account that simply began trading then.
     """
+    # Enforced here as well as in build_dashboard, so a direct caller (a
+    # backtest, a script, a future endpoint) cannot bypass the ceiling. A
+    # second clamp over already-clamped input is a no-op.
+    positions, clamped_here = clamp_to_max_span(positions)
+    truncated = truncated or clamped_here
+
     dated = [
-        (p.exit_time.astimezone(MARKET_TZ).date(), p.realized_pnl)
+        (day, p.realized_pnl)
         for p in positions
-        if p.exit_time is not None
+        if (day := _exit_day(p)) is not None
     ]
 
     if not dated:
@@ -329,6 +585,8 @@ def build_equity_curve(positions: Iterable[ClosedPosition]) -> dict[str, Any]:
                 "trading_days": 0,
                 "calendar_days": 0,
                 "closed_trades": 0,
+                "truncated": truncated,
+                "max_days": MAX_CURVE_DAYS,
             },
         }
 
@@ -395,17 +653,53 @@ def build_equity_curve(positions: Iterable[ClosedPosition]) -> dict[str, Any]:
             "trading_days": len(daily_pnl),
             "calendar_days": (last_day - first_day).days + 1,
             "closed_trades": len(dated),
+            # True when closes older than the ceiling were dropped. The UI says
+            # so on the chart rather than letting a cut curve read as history.
+            "truncated": truncated,
+            "max_days": MAX_CURVE_DAYS,
         },
     }
 
 
-async def build_dashboard(session: AsyncSession) -> dict[str, Any]:
-    """Full dashboard payload: headline stats, the heatmap, the equity curve."""
-    positions = await load_closed_positions(session)
+async def build_dashboard(
+    session: AsyncSession, window: Optional[Window] = None
+) -> dict[str, Any]:
+    """Full dashboard payload for one window: stats, heatmap, equity curve.
+
+    All three are computed from ONE filtered list. Windowing only the curve
+    would put a 1Y chart beside an all-time win rate on the same screen, and
+    nothing on it would say they covered different spans.
+
+    The window is applied first, then the corrupt-date clamp -- in that order,
+    because clamping first would measure the ceiling from a close the user just
+    filtered out.
+    """
+    window = window or resolve_window()
+
+    everything = await load_closed_positions(session)
+    windowed, undated = filter_by_exit_window(everything, window)
+    clamped, truncated = clamp_to_max_span(windowed)
+
     return {
-        "core_stats": compute_core_stats(positions),
-        "heatmap": build_heatmap(positions),
-        "equity_curve": build_equity_curve(positions),
+        # Echoed back so the UI can label what it is showing, and so a
+        # truncated or empty result carries its own explanation instead of
+        # looking like an account with no history.
+        "window": {
+            "preset": window.preset,
+            "start_date": window.start.isoformat() if window.start else None,
+            "end_date": window.end.isoformat() if window.end else None,
+            "truncated": truncated,
+            "max_days": MAX_CURVE_DAYS,
+            "closed_trades_in_window": len(clamped),
+            "closed_trades_total": len(everything),
+            # Expected to be zero -- positions.exit_time is NOT NULL. Surfaced
+            # so that if it ever is not, the shortfall is visible rather than
+            # showing up as figures that quietly do not add up.
+            "excluded_undated": undated,
+        },
+        "core_stats": compute_core_stats(clamped),
+        "heatmap": build_heatmap(clamped),
+        "equity_curve": build_equity_curve(clamped, truncated=truncated),
     }
 
 

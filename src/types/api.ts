@@ -334,6 +334,78 @@ export interface EquityCurveSummary {
   /** Days elapsed, including the quiet ones. */
   calendar_days: number;
   closed_trades: number;
+  /**
+   * True when closes older than `max_days` before the last one were dropped.
+   *
+   * The curve emits a point per calendar day, so a single corrupt execution
+   * timestamp would otherwise stretch it across decades — one 1970 row beside
+   * 2026 data measured 20,637 points in a single response. Surfaced rather
+   * than applied silently: a curve that starts later than the data does is
+   * indistinguishable from an account that began trading then.
+   *
+   * Optional so a frontend deploy landing before the API one still renders.
+   */
+  truncated?: boolean;
+  /** The ceiling, in calendar days. 3650 (ten years). */
+  max_days?: number;
+}
+
+/** Built-in dashboard windows. Resolved server-side — see `DashboardWindow`. */
+export type TimeframePresetName = 'YTD' | '1Y' | 'ALL';
+
+/** The pill selected in the toolbar: a built-in, or a saved preset's id. */
+export type TimeframeSelection =
+  | { kind: 'preset'; preset: TimeframePresetName }
+  | { kind: 'custom'; id: string; start_date: string; end_date: string };
+
+/**
+ * The span a dashboard payload actually covers, echoed back by the API.
+ *
+ * Read rather than assumed: the client names a preset, the server decides what
+ * it means. Keeping one definition of "YTD" is the point — two would drift.
+ */
+export interface DashboardWindow {
+  /** The built-in that produced it, or null for an explicit date range. */
+  preset: TimeframePresetName | null;
+  /** Inclusive, market time. Null on either side means unbounded (ALL). */
+  start_date: string | null;
+  end_date: string | null;
+  /** True when the corrupt-date clamp fired. See EquityCurveSummary. */
+  truncated: boolean;
+  max_days: number;
+  closed_trades_in_window: number;
+  closed_trades_total: number;
+  /**
+   * Round trips excluded for carrying no exit time. `positions.exit_time` is
+   * NOT NULL, so this is expected to be zero — reported so that if it ever is
+   * not, the shortfall is visible rather than showing up as figures that
+   * quietly do not add up.
+   */
+  excluded_undated: number;
+}
+
+/**
+ * A saved custom window (GET /api/settings/timeframes).
+ *
+ * The built-in YTD/1Y/ALL pills deliberately have no row: they are
+ * definitions, not data. These live in the database rather than localStorage
+ * so a filter you look at every day follows you between devices.
+ */
+export interface TimeframePreset {
+  id: string;
+  name: string;
+  /** YYYY-MM-DD, market time. Inclusive on both ends. */
+  start_date: string;
+  end_date: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Body for POST and PUT /api/settings/timeframes. A full replacement. */
+export interface TimeframePresetPayload {
+  name: string;
+  start_date: string;
+  end_date: string;
 }
 
 /**
@@ -922,6 +994,16 @@ export interface DashboardStats {
    * rest of the dashboard instead of crashing on a missing key.
    */
   equity_curve?: EquityCurve;
+  /**
+   * The span every figure above was computed over.
+   *
+   * One window governs the whole payload, not just the curve: a 1Y chart
+   * beside an all-time win rate on one screen, with nothing saying they cover
+   * different spans, is worse than either figure alone.
+   *
+   * Optional for the same deploy-ordering reason as `equity_curve`.
+   */
+  window?: DashboardWindow;
 }
 
 // ---------------------------------------------------------------------------

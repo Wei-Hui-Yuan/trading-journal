@@ -4,7 +4,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Optional
@@ -15,12 +15,13 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import (
     CHAR,
     Boolean,
     Column,
     Computed,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -177,6 +178,32 @@ class AppSetting(Base):
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class TimeframePreset(Base):
+    """A saved dashboard window (migration 021).
+
+    The built-in YTD / 1Y / ALL pills are resolved in services.analytics and
+    deliberately have no rows here: they are definitions, and a row asserting
+    "1Y means 365 days" could disagree with the code that computes it.
+
+    These are the trader's own windows, which is why they live in the database
+    rather than in localStorage -- a filter you look at every day should not
+    disappear because you opened the journal on a different device.
+
+    Dates, not timestamps: a preset is a calendar range in market time, which
+    is the same unit the dashboard buckets closes into. See migration 021 for
+    why this is a table rather than JSONB on `app_settings`.
+    """
+
+    __tablename__ = "timeframe_presets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(Text, nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class SuppressedExecution(Base):
@@ -1996,6 +2023,203 @@ async def update_settings(
     await session.commit()
     await session.refresh(row)
     return SettingsOut.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# Saved timeframe presets
+# ---------------------------------------------------------------------------
+#
+# Custom dashboard windows, stored so they follow the trader between devices.
+# The built-in YTD / 1Y / ALL pills are NOT here -- they are resolved in
+# services.analytics, because a definition stored as data can disagree with the
+# code that computes it.
+
+
+class TimeframePresetIn(BaseModel):
+    """A window the trader wants to keep.
+
+    Both dates are required. A half-open saved preset ("since March", no end)
+    would mean something different every time it was opened, which is the one
+    thing a *saved* window must not do -- the ad-hoc query parameters on the
+    dashboard still accept an open end for exactly that use.
+    """
+
+    name: str = Field(..., min_length=1, max_length=60)
+    start_date: date
+    end_date: date
+
+    @field_validator("name")
+    @classmethod
+    def _trim_name(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name cannot be blank")
+        return trimmed
+
+    @model_validator(mode="after")
+    def _range_is_forwards(self) -> "TimeframePresetIn":
+        # Rejected here so the message names the field, rather than surfacing
+        # as timeframe_presets_range_check in a 500 the client cannot read.
+        if self.start_date > self.end_date:
+            raise ValueError("start_date must be on or before end_date")
+        return self
+
+
+class TimeframePresetOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    start_date: date
+    end_date: date
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+def _duplicate_preset_name(name: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"A timeframe named '{name}' already exists. Names are compared "
+            "ignoring case and surrounding spaces, so two pills cannot look "
+            "identical."
+        ),
+    )
+
+
+@app.get(
+    "/api/settings/timeframes",
+    response_model=list[TimeframePresetOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_timeframes(session: AsyncSession = Depends(get_session)):
+    """Saved custom windows, oldest first.
+
+    Oldest first so the toolbar is stable: pills keep their position as new
+    ones are added, and the one you reach for by muscle memory does not move.
+
+    A missing table degrades to an empty list rather than breaking the whole
+    dashboard toolbar, matching how list_disciplines handles migration 013/014
+    not having been applied. Only UndefinedTable is swallowed -- anything else
+    propagates, because "you have no saved timeframes" and "the database is
+    unreachable" must not look the same.
+    """
+    try:
+        rows = (
+            await session.execute(
+                select(TimeframePreset).order_by(
+                    TimeframePreset.created_at.asc(), TimeframePreset.id.asc()
+                )
+            )
+        ).scalars().all()
+    except ProgrammingError as exc:
+        if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            raise
+        logger.warning("timeframe_presets is missing; apply migration 021")
+        await session.rollback()
+        return []
+
+    return [TimeframePresetOut.model_validate(row) for row in rows]
+
+
+@app.post(
+    "/api/settings/timeframes",
+    response_model=TimeframePresetOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_timeframe(
+    params: TimeframePresetIn, session: AsyncSession = Depends(get_session)
+):
+    """Save a custom window."""
+    preset = TimeframePreset(
+        id=uuid.uuid4(),
+        name=params.name,
+        start_date=params.start_date,
+        end_date=params.end_date,
+    )
+    session.add(preset)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # uq_timeframe_presets_name, on lower(btrim(name)).
+        await session.rollback()
+        raise _duplicate_preset_name(params.name)
+    except ProgrammingError as exc:
+        await session.rollback()
+        if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The timeframe_presets table does not exist. Apply migration "
+                "021_timeframe_presets.sql to this database."
+            ),
+        )
+    await session.refresh(preset)
+    return TimeframePresetOut.model_validate(preset)
+
+
+@app.put(
+    "/api/settings/timeframes/{preset_id}",
+    response_model=TimeframePresetOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_timeframe(
+    preset_id: uuid.UUID,
+    params: TimeframePresetIn,
+    session: AsyncSession = Depends(get_session),
+):
+    """Rename a saved window or move its dates.
+
+    A full replacement rather than a patch: the three fields are one statement
+    about a window, and letting an end date be edited without its start in
+    view is how a range ends up backwards.
+    """
+    preset = await session.get(TimeframePreset, preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Timeframe not found.")
+
+    preset.name = params.name
+    preset.start_date = params.start_date
+    preset.end_date = params.end_date
+    preset.updated_at = datetime.now(timezone.utc)
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise _duplicate_preset_name(params.name)
+
+    await session.refresh(preset)
+    return TimeframePresetOut.model_validate(preset)
+
+
+@app.delete(
+    "/api/settings/timeframes/{preset_id}",
+    response_model=TimeframePresetOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_timeframe(
+    preset_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Remove a saved window.
+
+    Hard delete, unlike a cancelled plan. A plan you talked yourself out of is
+    evidence about your process; a filter you no longer want is furniture, and
+    keeping tombstones for it would only clutter the toolbar's query.
+
+    Returns the deleted row so the client can name it in a confirmation
+    without having to have held onto it.
+    """
+    preset = await session.get(TimeframePreset, preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Timeframe not found.")
+
+    out = TimeframePresetOut.model_validate(preset)
+    await session.delete(preset)
+    await session.commit()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4061,11 +4285,40 @@ async def review_position(
 
 
 @app.get("/api/analytics/dashboard", dependencies=[Depends(verify_clerk_token)])
-async def analytics_dashboard(session: AsyncSession = Depends(get_session)):
-    """Core stats plus the day/session heatmap grid."""
-    from services.analytics import build_dashboard
+async def analytics_dashboard(
+    preset: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Core stats, the day/session heatmap and the equity curve, for one window.
 
-    return await build_dashboard(session)
+    Three ways to ask, in descending precedence:
+
+      * `start_date` / `end_date` -- an explicit range, inclusive, in market
+        time. What a saved custom preset sends. Either bound may be omitted to
+        leave that side open.
+      * `preset` -- one of YTD, 1Y, ALL. Expanded server-side so the browser
+        never holds a second definition of what "YTD" means.
+      * neither -- defaults to 1Y, so a bare request is bounded rather than
+        plotting the entire ledger.
+
+    The window governs the WHOLE payload, not just the curve: a 1Y chart beside
+    an all-time win rate on one screen, with nothing saying they cover
+    different spans, is worse than either figure alone.
+
+    Round trips are selected by when they CLOSED. `start_date` after
+    `end_date`, or an unknown preset, is a 422 naming the problem rather than
+    an empty dashboard the user has to diagnose.
+    """
+    from services.analytics import build_dashboard, resolve_window
+
+    try:
+        window = resolve_window(preset, start_date, end_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return await build_dashboard(session, window)
 
 
 @app.get("/api/analytics/advanced", dependencies=[Depends(verify_clerk_token)])

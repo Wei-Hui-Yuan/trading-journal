@@ -10,7 +10,11 @@ import {
   createManualTrade,
   createPlan,
   createStrategy,
+  createTimeframe,
   deleteDiscipline,
+  deleteTimeframe,
+  getTimeframes,
+  updateTimeframe,
   deletePosition,
   deleteStrategy,
   deleteTrade,
@@ -70,6 +74,9 @@ import type {
   Trade,
   TradeDeleteResult,
   TradeAnnotationPayload,
+  TimeframePreset,
+  TimeframePresetPayload,
+  TimeframeSelection,
   UnsuppressResult,
 } from '@/types/api';
 
@@ -83,7 +90,21 @@ export const queryKeys = {
   positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
   disciplines: ['disciplines'] as const,
+  // Prefix. Every window is its own cache entry beneath it, so invalidating
+  // this one key refreshes all of them — which is what the sync, review and
+  // delete mutations already do, and must keep doing.
   dashboardStats: ['dashboardStats'] as const,
+  dashboardStatsFor: (selection?: TimeframeSelection) =>
+    [
+      'dashboardStats',
+      selection?.kind === 'custom'
+        ? // Keyed by the dates, not the preset id: renaming a saved window does
+          // not change what it selects, and two presets covering the same range
+          // can honestly share a cache entry.
+          `${selection.start_date}..${selection.end_date}`
+        : (selection?.preset ?? '1Y'),
+    ] as const,
+  timeframes: ['timeframes'] as const,
   advancedMetrics: ['advancedMetrics'] as const,
   settings: ['settings'] as const,
   // Written by the sync mutation, read by the header badge. Not a fetched
@@ -190,12 +211,71 @@ export function useStrategies() {
   });
 }
 
-/** Core stats + heatmap grid backing the dashboard. */
-export function useDashboardStats() {
+/**
+ * Core stats, heatmap and equity curve for one timeframe window.
+ *
+ * The window is part of the query key, so switching pills is a cached lookup
+ * after the first visit and flipping back and forth costs nothing. The key
+ * stays PREFIXED with 'dashboardStats', which is what keeps the seven existing
+ * `invalidateQueries({ queryKey: queryKeys.dashboardStats })` calls correct:
+ * React Query matches keys by prefix, so a sync still refreshes every window
+ * that has been looked at rather than only the one on screen.
+ */
+export function useDashboardStats(selection?: TimeframeSelection) {
   return useQuery<DashboardStats>({
-    queryKey: queryKeys.dashboardStats,
-    queryFn: getDashboardAnalytics,
+    queryKey: queryKeys.dashboardStatsFor(selection),
+    queryFn: () => getDashboardAnalytics(selection),
+    // A window that has already been fetched is worth keeping while another is
+    // loading, so switching pills does not blank the whole dashboard.
+    placeholderData: (previous) => previous,
   });
+}
+
+/** Saved custom windows for the timeframe toolbar. */
+export function useTimeframes() {
+  return useQuery<TimeframePreset[]>({
+    queryKey: queryKeys.timeframes,
+    queryFn: getTimeframes,
+    // Presets change only when the user edits them, and every mutation below
+    // invalidates. No reason to refetch on every dashboard mount.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * Add, edit or remove a saved window.
+ *
+ * All three invalidate the dashboard as well as the preset list. Editing a
+ * preset's dates changes what the pill means, and the payload already on
+ * screen was computed for the old range — leaving it would show figures
+ * labelled with a window they were not computed over.
+ */
+function useTimeframeMutation<TVariables>(
+  mutationFn: (variables: TVariables) => Promise<TimeframePreset>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation<TimeframePreset, Error, TVariables>({
+    mutationFn,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.timeframes });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+    },
+  });
+}
+
+export function useCreateTimeframe() {
+  return useTimeframeMutation<TimeframePresetPayload>(createTimeframe);
+}
+
+export function useUpdateTimeframe() {
+  return useTimeframeMutation<{ id: string; payload: TimeframePresetPayload }>(
+    ({ id, payload }) => updateTimeframe(id, payload)
+  );
+}
+
+export function useDeleteTimeframe() {
+  return useTimeframeMutation<string>(deleteTimeframe);
 }
 
 /** R-multiple, slippage and expectancy metrics for the Analytics tab. */

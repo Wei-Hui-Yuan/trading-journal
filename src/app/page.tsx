@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import dynamic from 'next/dynamic';
 import { AlertCircle, Loader2 } from 'lucide-react';
 
@@ -9,6 +9,10 @@ import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
 import { OpenPlansDock } from '@/components/OpenPlansDock';
+import {
+  DEFAULT_SELECTION,
+  TimeframeToolbar,
+} from '@/components/TimeframeToolbar';
 
 /**
  * Loaded on demand: Recharts pulls in d3 and costs ~100 kB, which is a third
@@ -32,7 +36,7 @@ const EquityCurveChart = dynamic(
     ),
   }
 );
-import type { KPIStats } from '@/types/api';
+import type { KPIStats, TimeframeSelection } from '@/types/api';
 import {
   usePendingPositions,
   useDashboardStats,
@@ -59,9 +63,21 @@ const EMPTY_STATS: KPIStats = {
 };
 
 export default function Home() {
+  // The window every figure on this page is computed over. Defaults to 1Y, so
+  // the first paint is bounded rather than plotting the whole ledger.
+  //
+  // Held here rather than inside the toolbar because it governs all three
+  // panels below — the strip, the heatmap and the curve read one payload, and
+  // that is what stops them describing different spans on one screen.
+  //
+  // Deliberately not persisted. "What has the last year looked like" is the
+  // question the dashboard exists to open on, and a window remembered from a
+  // one-off investigation last week is a figure you would read as current.
+  const [timeframe, setTimeframe] = useState<TimeframeSelection>(DEFAULT_SELECTION);
+
   // Both queries are served from the React Query cache, so mounting the inbox
   // and the stat strip does not double-fetch.
-  const dashboardQuery = useDashboardStats();
+  const dashboardQuery = useDashboardStats(timeframe);
   const pendingQuery = usePendingPositions();
 
   const pendingCount = pendingQuery.data?.length ?? 0;
@@ -90,6 +106,18 @@ export default function Home() {
 
       {/* Main Dashboard Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+
+        {/* Above the stat strip on purpose: this filters the strip, the
+            heatmap and the curve alike, and a control that governs the whole
+            page should not sit inside one panel of it. */}
+        <section>
+          <TimeframeToolbar
+            selection={timeframe}
+            onSelect={setTimeframe}
+            window={dashboardQuery.data?.window}
+            isFetching={dashboardQuery.isFetching}
+          />
+        </section>
 
         {/* Top KPI Stat Strip */}
         <section>
