@@ -5,7 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Optional
 from urllib.parse import urlsplit
@@ -1465,6 +1465,7 @@ async def create_plan(
 
     `planned_r` is not accepted or computed here -- Postgres generates it from
     entry, stop and target, so it cannot drift out of step with them.
+    `risk_amount` and `risk_percent` are derived for the same reason.
     """
     plan = PlannedTrade(
         id=uuid.uuid4(),
@@ -1480,12 +1481,69 @@ async def create_plan(
         thesis=params.thesis,
         status=PLAN_OPEN,
     )
+    await _derive_plan_risk(session, plan)
     session.add(plan)
     await session.commit()
     # planned_r and the timestamps were produced by the database; re-read
     # rather than report what we sent, which did not include them.
     await session.refresh(plan)
     return _plan_out(plan)
+
+
+async def _derive_plan_risk(session: AsyncSession, plan: PlannedTrade) -> None:
+    """Make a plan's risk agree with the plan's own numbers.
+
+    A plan's risk is not an opinion: entry, stop and quantity determine it
+    completely. `risk_amount` was nevertheless stored as whatever the sizing
+    calculator computed when the plan was first written, and PATCH applied only
+    the fields it was sent -- so editing the quantity from 4 to 1 left the
+    figure behind. The dock showed "Risk $20.00" on a plan whose own numbers
+    risked $5.00, with the entry, stop and quantity that contradict it printed
+    on the line below.
+
+    That is not only a display problem. When a plan attaches to a fill it
+    copies `risk_amount` onto the trade, and that column is what converts an
+    R-multiple back into money -- so a stale figure would have reported the
+    trade's R in dollars four times too large, permanently.
+
+    Deliberately unlike `trades.risk_amount`, which is a snapshot and must
+    never be recomputed: a trade sized against a $2,500 account has to keep
+    reading as 1% of $2,500 after the account grows. A plan is a live
+    intention, not history, so it should always describe what it would do if
+    taken right now.
+
+    Null rather than zero when it cannot be known -- no stop, no quantity, or
+    a stop on the wrong side of the entry. A long stopped above its entry has
+    no risk to state, and a negative one would read as a guaranteed profit.
+    """
+    entry, stop, quantity = plan.planned_entry, plan.stop_loss, plan.quantity
+
+    per_share = None
+    if entry is not None and stop is not None:
+        per_share = entry - stop if plan.direction == "BUY" else stop - entry
+
+    if per_share is None or per_share <= 0 or quantity is None or quantity <= 0:
+        plan.risk_amount = None
+        plan.risk_percent = None
+        return
+
+    plan.risk_amount = (per_share * quantity).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+    # Percent needs the account it is a percent OF. Nulled rather than left
+    # standing when that is unavailable: a percentage carried over from a
+    # different risk_amount is worse than no percentage.
+    account_size = (
+        await session.execute(select(AppSetting.account_size))
+    ).scalars().first()
+    plan.risk_percent = (
+        (plan.risk_amount / account_size * 100).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if account_size
+        else None
+    )
 
 
 @app.patch(
@@ -1535,6 +1593,11 @@ async def update_plan(
     }
     for key, value in changes.items():
         setattr(plan, key, to_decimal(value) if key in decimal_fields else value)
+
+    # After the edit, never before: quantity, entry and stop are exactly what
+    # risk is computed from, and applying only the fields that were sent is
+    # what let the stored figure drift away from them.
+    await _derive_plan_risk(session, plan)
 
     plan.updated_at = datetime.now(timezone.utc)
     await session.commit()

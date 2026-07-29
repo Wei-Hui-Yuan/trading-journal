@@ -54,6 +54,26 @@ function plannedReward(plan: TradePlan): number | null {
   return perShare * quantity;
 }
 
+/**
+ * What the plan loses if the stop is hit, in dollars.
+ *
+ * Derived from the plan's own entry, stop and quantity rather than read from
+ * `risk_amount`. That column is a snapshot taken when the plan was sized, and
+ * editing the quantity or a price afterwards used to leave it behind — a plan
+ * showing "Risk $20.00" while its own numbers risked $5.00. Deriving it here
+ * means the figure can never contradict the three prices printed beside it.
+ *
+ * Direction-aware, and null when the stop sits on the wrong side of the entry:
+ * a long stopped above its entry has no risk to state, and a negative one
+ * would read as a guaranteed profit.
+ */
+function plannedRisk(plan: TradePlan): number | null {
+  const { planned_entry: entry, stop_loss: stop, quantity, direction } = plan;
+  if (entry === null || stop === null || quantity === null) return null;
+  const perShare = direction === 'BUY' ? entry - stop : stop - entry;
+  return perShare > 0 ? perShare * quantity : null;
+}
+
 interface EditDraft {
   planned_entry: string;
   stop_loss: string;
@@ -164,6 +184,8 @@ export const OpenPlansDock: React.FC = () => {
       <div className="divide-y divide-obsidian-border/60">
         {rows.map((plan) => {
           const isEditing = editing === plan.id;
+          const reward = plannedReward(plan);
+          const risk = plannedRisk(plan);
           const busy =
             (cancelMutation.isPending && cancelMutation.variables === plan.id) ||
             (updateMutation.isPending && updateMutation.variables?.planId === plan.id);
@@ -192,13 +214,23 @@ export const OpenPlansDock: React.FC = () => {
                     {plan.planned_r.toFixed(2)}R planned
                     {/* The same ratio means very different things at different
                         sizes, so the money sits next to it rather than being
-                        left as arithmetic to do in your head. */}
-                    {(() => {
-                      const reward = plannedReward(plan);
-                      return reward === null ? null : (
-                        <span className="ml-1.5 text-win">+{money(reward)}</span>
-                      );
-                    })()}
+                        left as arithmetic to do in your head.
+
+                        Both sides of it. R is a ratio, so a good one can still
+                        be attached to a loss you would not accept — and the
+                        number that decides whether to take the trade is what
+                        the stop costs, not what the target pays. */}
+                    {reward !== null && (
+                      <span className="ml-1.5 text-win">+{money(reward)}</span>
+                    )}
+                    {risk !== null && (
+                      <span
+                        className="ml-1.5 text-loss"
+                        title="What this plan loses if the hard stop is hit, at the quantity planned."
+                      >
+                        -{money(risk)} at stop
+                      </span>
+                    )}
                   </span>
                 )}
 
@@ -251,10 +283,13 @@ export const OpenPlansDock: React.FC = () => {
                   <span>
                     Target <span className="text-win">{price(plan.take_profit)}</span>
                   </span>
-                  {plan.risk_amount !== null && (
+                  {/* Derived, not `plan.risk_amount`. Showing a stored figure
+                      next to the entry, stop and quantity it is supposed to
+                      come from invites exactly the contradiction it produced:
+                      "Risk $20.00" beside 1 share with a $5 stop distance. */}
+                  {risk !== null && (
                     <span>
-                      Risk{' '}
-                      <span className="text-slate-300">{money(plan.risk_amount)}</span>
+                      Risk <span className="text-slate-300">{money(risk)}</span>
                     </span>
                   )}
                 </div>
