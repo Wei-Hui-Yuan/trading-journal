@@ -931,9 +931,47 @@ export type DayName =
   | 'Friday';
 
 export interface CoreStats {
+  /**
+   * Money realised in the window, summed from closing FILLS.
+   *
+   * Not the sum of the round trips below it, and deliberately so. A `positions`
+   * row exists only once a ticker returns to flat, so summing round trips
+   * omitted every dollar banked scaling out of a position still held — which
+   * on this account was $75 of real losses, enough to report +66.20
+   * year-to-date where the broker said −6.14. See `open_run_pnl`.
+   */
   net_pnl: number;
   gross_pnl?: number;
+  /**
+   * ALL-IN cost: commission plus exchange, clearing and regulatory charges.
+   *
+   * Derived from IBKR's own `fifoPnlRealized` rather than from the commission
+   * column, which carries only the commission. That is what makes
+   * `gross_pnl - total_commission = net_pnl` reconcile to the IBKR statement
+   * to the cent — verified at $0.00 variance across YTD, 90-day and Q4 windows.
+   */
   total_commission?: number;
+  /**
+   * The IBKR commission alone, unmodified. The difference against
+   * `total_commission` is what the broker charges beyond commission — about
+   * 5.3¢ per closing fill.
+   */
+  ib_commission?: number;
+  /**
+   * Slices whose closing fill carried no broker figure, so their cost is the
+   * commission alone and excludes the other charges. Zero on a broker-only
+   * ledger; non-zero means the tie-out is approximate by that many slices.
+   */
+  unverified_legs?: number;
+  /**
+   * How much of `net_pnl` was banked out of positions that are still open.
+   *
+   * This is exactly the difference between `net_pnl` and the sum of the
+   * completed round trips, so the two can be shown side by side without the
+   * gap reading as a bug.
+   */
+  open_run_pnl?: number;
+  /** Completed round trips only. A partial exit is not a finished idea. */
   win_rate_pct: number;
   total_trades: number;
   /**
@@ -1108,7 +1146,20 @@ export interface DisciplineBreakdown {
 export interface KPIStats {
   netPnl: number;
   grossPnl: number;
+  /** ALL-IN cost. grossPnl - totalCommission = netPnl, to the cent. */
   totalCommission: number;
+  /** IBKR commission alone, for the split shown in the tooltip. */
+  ibCommission: number;
+  /** Slices with no broker figure behind them. Usually 0. */
+  unverifiedLegs: number;
+  /**
+   * Of `netPnl`, the part banked scaling out of positions still open.
+   *
+   * Shown so the strip can explain why net P&L is not the sum of the round
+   * trips underneath it. Before this existed that money was not merely
+   * unexplained — it was not counted at all.
+   */
+  openRunPnl: number;
   winRate: number;
   totalTrades: number;
   /** null when there are no losing trades - the ratio is unbounded. */

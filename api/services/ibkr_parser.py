@@ -48,6 +48,15 @@ _SYMBOL_KEYS = ("symbol", "underlyingSymbol")
 _QUANTITY_KEYS = ("quantity", "shares")
 _PRICE_KEYS = ("tradePrice", "price")
 _COMMISSION_KEYS = ("ibCommission", "commission")
+# IBKR's own realised P&L for this execution, NET of commission and of every
+# other charge -- exchange, clearing, regulatory. Summed over a period it
+# reproduces the figures in the IBKR app to the cent, which is what makes it
+# worth carrying: it is the only field that closes the gap between our gross
+# arithmetic and the broker's statement without re-implementing a fee schedule.
+#
+# Absent unless the Flex query exposes it, so it stays optional. Zero on an
+# opening fill, which is a real value and not the same as absent.
+_REALIZED_PNL_KEYS = ("fifoPnlRealized", "realizedPnl", "fifoPnlRealizedTotal")
 _DATETIME_KEYS = ("dateTime", "tradeDate", "reportDate")
 _ASSET_CLASS_KEYS = ("assetCategory", "assetClass")
 
@@ -76,6 +85,10 @@ class ParsedExecution:
     price: Optional[Decimal]
     commission: Optional[Decimal]
     execution_time: Optional[datetime]
+    # What IBKR says this fill actually realised, net of commission and of
+    # every other charge. None when the Flex query does not expose it; zero on
+    # an opening fill, which is a real value rather than a missing one.
+    fifo_pnl_realized: Optional[Decimal] = None
 
     @property
     def side(self) -> str:
@@ -240,6 +253,7 @@ def parse_execution_node(node: ET.Element) -> Optional[ParsedExecution]:
         price=_to_decimal(_first(attrs, _PRICE_KEYS)),
         commission=_to_decimal(_first(attrs, _COMMISSION_KEYS)),
         execution_time=parse_execution_datetime(_first(attrs, _DATETIME_KEYS)),
+        fifo_pnl_realized=_to_decimal(_first(attrs, _REALIZED_PNL_KEYS)),
     )
 
 
@@ -355,6 +369,9 @@ def to_staging_row(execution: ParsedExecution) -> dict[str, Any]:
         "quantity": execution.quantity,  # signed
         "price": execution.price,
         "commission": execution.commission,
+        # Kept with IBKR's own sign and meaning, like `quantity` above: staging
+        # is the unedited copy, and normalisation happens on promotion.
+        "fifo_pnl_realized": execution.fifo_pnl_realized,
         "execution_time": execution.execution_time,
         "processed": False,
     }

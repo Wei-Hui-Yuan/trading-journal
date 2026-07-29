@@ -78,6 +78,11 @@ class Execution:
     # does not know about commissions -- a backtest, an older test -- gets the
     # gross arithmetic it always got rather than a null.
     commission: Decimal = Decimal("0")
+    # What IBKR says this fill realised, net of commission AND of exchange,
+    # clearing and regulatory charges. None when unknown, which is the normal
+    # state for a hand-added repair fill and for anything the Flex window no
+    # longer reaches. See _reconcile_to_broker.
+    broker_realized_pnl: Optional[Decimal] = None
 
 
 @dataclass
@@ -127,14 +132,23 @@ class _Leg:
     exit_price: Decimal
     entry_date: datetime
     exit_date: datetime
-    # NET of commission -- what this slice actually put in the account.
+    # NET of ALL costs -- what this slice actually put in the account.
     realized_pnl: Decimal
     # The same figure before costs, and the costs themselves. Kept per leg
     # rather than derived later because commission is apportioned by the
     # fraction of each fill a leg consumed, and that fraction is only known
     # here.
     gross_pnl: Decimal = Decimal("0")
+    # ALL-IN cost: commission plus exchange, clearing and regulatory charges.
+    # Equal to ib_commission until _reconcile_to_broker replaces it with
+    # gross - broker_realized_pnl, which is the only figure that ties to the
+    # statement without re-implementing IBKR's fee schedule.
     commission: Decimal = Decimal("0")
+    # The apportioned raw ibCommission, kept for provenance.
+    ib_commission: Decimal = Decimal("0")
+    # This leg's share of the broker's own realised figure for its closing
+    # fill. None when the fill carried none.
+    broker_realized_pnl: Optional[Decimal] = None
 
 
 @dataclass
@@ -164,6 +178,11 @@ class MatchedPosition:
     realized_pnl: Decimal
     style: str
     fills: list[PositionFill] = field(default_factory=list)
+    # The FIFO pairings this round trip was folded from. Kept so they can be
+    # persisted to `realized_legs`, which is where money is bucketed by period
+    # -- a round trip that scaled out across a month boundary realised its P&L
+    # on two different dates, and only the legs know that.
+    legs: list["_Leg"] = field(default_factory=list)
     # Reported beside the net figure rather than instead of it. Cost is a
     # thing the trader controls -- through size, through how often they trade
     # -- and it cannot be managed while it is folded invisibly into P&L.
@@ -259,6 +278,79 @@ def replay_open_exposure(
     )
 
 
+def _reconcile_to_broker(
+    legs: list[_Leg], executions: dict[uuid.UUID, Execution]
+) -> None:
+    """Replace each leg's cost with the all-in figure the broker implies.
+
+    WHY THIS EXISTS. Our FIFO agrees with IBKR's lot matching exactly --
+    compared fill by fill across a year, every closing fill lands within $0.50
+    and the whole ledger within $9.14. What differs is COST. `ibCommission` is
+    the commission alone, while IBKR's realised P&L also nets exchange,
+    clearing and regulatory charges, which the Flex feed folds into cost basis
+    instead of reporting separately. That is about 5.3c per closing fill.
+
+    Rather than re-implement SEC Section 31 and FINRA TAF schedules and keep
+    them current forever, take the broker's own answer and work backwards:
+
+        all_in_cost = our_gross_pnl - broker_realized_pnl
+
+    Applied per CLOSING fill, because that is the grain IBKR reports on. The
+    figure already contains the buy-side charges too -- they are inside the
+    cost basis IBKR relieved -- so this REPLACES the apportioned commission
+    rather than adding to it. Adding would double-count the commission.
+
+    Be clear about what the result is: a plug. It is everything between our
+    gross and the broker's net, which is overwhelmingly fees but also absorbs
+    any small cost-basis difference. That is the point -- net P&L then matches
+    the statement to the cent by construction -- and it is why the figure is
+    labelled all-in rather than commission, and why `ib_commission` is kept
+    beside it untouched.
+
+    A fill with no broker figure keeps its apportioned ibCommission. Reported
+    rather than hidden: `broker_realized_pnl` stays None on those legs, and the
+    coverage is surfaced so a journal cannot quietly under-charge fees on rows
+    it could not verify.
+    """
+    by_close: dict[uuid.UUID, list[_Leg]] = {}
+    for leg in legs:
+        by_close.setdefault(leg.close_trade_id, []).append(leg)
+
+    for close_trade_id, fill_legs in by_close.items():
+        execution = executions.get(close_trade_id)
+        if execution is None or execution.broker_realized_pnl is None:
+            continue
+
+        gross = sum((leg.gross_pnl for leg in fill_legs), Decimal("0"))
+        all_in = gross - execution.broker_realized_pnl
+
+        # Split across the legs this fill closed, by quantity. Allocated so the
+        # parts sum to the whole exactly: every leg but the last is rounded,
+        # and the last takes the remainder. Distributing the rounding error
+        # instead would leave the period total a cent away from the statement,
+        # which is the entire thing this function exists to prevent.
+        total_qty = sum((leg.quantity for leg in fill_legs), Decimal("0"))
+        allocated = Decimal("0")
+        for index, leg in enumerate(fill_legs):
+            if index == len(fill_legs) - 1 or total_qty == 0:
+                share = all_in - allocated
+                broker_share = execution.broker_realized_pnl - sum(
+                    (l.broker_realized_pnl or Decimal("0")) for l in fill_legs[:index]
+                )
+            else:
+                weight = leg.quantity / total_qty
+                share = (all_in * weight).quantize(
+                    MONEY_PRECISION, rounding=ROUND_HALF_UP
+                )
+                broker_share = (execution.broker_realized_pnl * weight).quantize(
+                    MONEY_PRECISION, rounding=ROUND_HALF_UP
+                )
+            allocated += share
+            leg.commission = share
+            leg.broker_realized_pnl = broker_share
+            leg.realized_pnl = leg.gross_pnl - share
+
+
 def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
     """Fold the legs of one flat-to-flat span into a single position."""
     # Attribution per execution. A fill closing several lots appears once with
@@ -324,6 +416,7 @@ def _aggregate_round_trip(ticker: str, legs: list[_Leg]) -> MatchedPosition:
             [*opens.values(), *closes.values()],
             key=lambda f: (f.executed_at, f.role, str(f.trade_id)),
         ),
+        legs=list(legs),
     )
 
 
@@ -340,9 +433,16 @@ class MatchingResult:
     unmatched_closing_quantity: int = 0
     # P&L already banked by scaling out of a round trip that has not gone flat.
     # No position is emitted for it -- the trade is still open, and emitting one
-    # would count a half-finished idea as a completed trade -- but the figure is
-    # surfaced here so it is visibly deferred rather than silently dropped.
+    # would count a half-finished idea as a completed trade.
+    #
+    # This figure used to be the ONLY record of that money, and nothing read it,
+    # so every dollar realised on the way out of a position still held was
+    # missing from the journal entirely (migration 022). The legs below are now
+    # persisted; this stays as the convenient total.
     open_round_trip_realized_pnl: Decimal = Decimal("0")
+    # Those same legs, individually. Real realised money with no completed round
+    # trip to hang it on, so they are stored with position_id NULL.
+    open_legs: list["_Leg"] = field(default_factory=list)
     # Round trips that were in `positions` before this run and are not in it
     # now, because a backdated fill re-partitioned the FIFO queue. Reported
     # rather than swallowed: they carried P&L into every headline figure, and
@@ -445,6 +545,12 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
         # Quantity from this fill still looking for a counterparty.
         unallocated = execution.quantity
 
+        # Legs THIS execution closes. Collected separately from `legs`, which
+        # accumulates the whole round trip, because the broker reports realised
+        # P&L per execution -- so these, and only these, are what its figure
+        # has to be reconciled against.
+        closed_here: list[_Leg] = []
+
         # An execution closes existing lots only if it is on the opposite side.
         # A queue of BUY lots is closed by a SELL, and vice versa.
         while unallocated > 0 and open_lots and open_lots[0].execution.direction != execution.direction:
@@ -479,10 +585,17 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
                     entry_date=lot.execution.executed_at,
                     exit_date=execution.executed_at,
                     gross_pnl=gross,
+                    # Both start as the apportioned ibCommission.
+                    # _reconcile_to_broker replaces `commission` with the
+                    # all-in figure where the broker reported one, and leaves
+                    # `ib_commission` alone as the provenance record.
                     commission=commission,
+                    ib_commission=commission,
                     realized_pnl=gross - commission,
                 )
             )
+
+            closed_here.append(legs[-1])
 
             lot.remaining -= matched_qty
             unallocated -= matched_qty
@@ -490,6 +603,13 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
             # Lot fully closed -> retire it so the next one becomes the head.
             if lot.remaining == 0:
                 open_lots.popleft()
+
+        # Swap the apportioned commission for the all-in cost the broker's own
+        # realised figure implies. Done here, before the round trip is folded
+        # up, so the aggregate is built from reconciled legs rather than having
+        # to be corrected afterwards.
+        if closed_here:
+            _reconcile_to_broker(closed_here, {execution.trade_id: execution})
 
         # Going flat ends the round trip. Checked before the leftover opens a
         # new lot, so an oversell that flips long->short closes the long here
@@ -512,6 +632,10 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
     result.open_round_trip_realized_pnl = sum(
         (leg.realized_pnl for leg in legs), Decimal("0")
     )
+    # Persisted with position_id NULL. Real money, realised on a real date,
+    # with no completed round trip to hang it on -- which is exactly why it
+    # went missing from every figure before migration 022.
+    result.open_legs = list(legs)
     result.open_lots = list(open_lots)
     return result
 
@@ -548,6 +672,14 @@ async def load_executions_for_ticker(
             # Already normalised to a cost on the way into `trades` (positive
             # is paid, negative is a rebate), so the engine only subtracts.
             commission=Decimal(str(row.commission or 0)),
+            # The broker's own realised figure, when it sent one. None here is
+            # meaningful and must not become zero: zero is a real P&L, absent
+            # means "reconcile against the commission instead".
+            broker_realized_pnl=(
+                Decimal(str(row.broker_realized_pnl))
+                if row.broker_realized_pnl is not None
+                else None
+            ),
         )
         for row in rows
         # Skip anything that cannot participate in matching.
@@ -669,19 +801,25 @@ async def run_matching_for_ticker(
             result.reviews_discarded,
         )
 
+    position_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
     if result.positions:
-        await insert_positions(session, result.positions)
+        position_ids = await insert_positions(session, result.positions)
 
-    if stale or result.positions:
-        await session.commit()
+    # Legs are replaced outright rather than reconciled. Every column is
+    # derived from `trades` -- unlike `positions`, which carries the trader's
+    # review -- so there is nothing here worth preserving across a rebuild, and
+    # a delete-then-insert cannot leave a stale leg behind the way an
+    # append-only write left stale positions (see the docstring above).
+    await replace_realized_legs(session, ticker, result, position_ids)
 
+    await session.commit()
     return result
 
 
 async def insert_positions(
     session: AsyncSession, positions: list[MatchedPosition]
-) -> int:
-    """Upsert closed round trips into the `positions` table.
+) -> dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID]:
+    """Upsert closed round trips, returning (open, close) -> position id.
 
     One statement for the whole batch rather than a write per position.
 
@@ -762,7 +900,10 @@ async def insert_positions(
     position_ids = {(r.open_trade_id, r.close_trade_id): r.id for r in upserted}
 
     await _sync_position_fills(session, positions, position_ids)
-    return len(upserted)
+    # The mapping, not a count: the caller needs it to stamp each realised leg
+    # with the round trip it belongs to, and re-deriving it there would mean
+    # querying back rows this statement already returned.
+    return position_ids
 
 
 async def _sync_position_fills(
@@ -876,3 +1017,84 @@ async def _sync_position_fills(
         )
 
     return (len(changed), len(removed))
+
+
+async def replace_realized_legs(
+    session: AsyncSession,
+    ticker: str,
+    result: MatchingResult,
+    position_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID],
+) -> int:
+    """Make `realized_legs` describe exactly what FIFO realised on this ticker.
+
+    Money is realised by a closing FILL, not by a round trip. `positions` gets
+    a row only when a ticker returns to flat, so before migration 022 every
+    dollar banked on the way out of a position still held was recorded nowhere
+    -- MSFT alone had -63.34 of real, realised P&L that no figure in the app
+    could see. Legs are where that money lives now.
+
+    Replaced outright rather than reconciled. Every column here is derived from
+    `trades`; unlike `positions`, nothing a user typed is stored, so there is
+    nothing to preserve and a delete-then-insert cannot leave a stale row the
+    way an append-only write once left stale positions.
+
+    Legs from an unclosed run are written with `position_id = NULL`. That NULL
+    is the point: it is real money, realised on a real date, that has no
+    completed round trip to hang it on.
+    """
+    from main import RealizedLeg  # noqa: PLC0415 - deferred, avoids a cycle
+
+    # Every leg FIFO produced for this ticker: those folded into completed
+    # round trips, plus those left in the run that never went flat.
+    pairs: list[tuple[_Leg, Optional[uuid.UUID]]] = [
+        (leg, position_ids.get((position.open_trade_id, position.close_trade_id)))
+        for position in result.positions
+        for leg in position.legs
+    ]
+    pairs += [(leg, None) for leg in result.open_legs]
+
+    await session.execute(delete(RealizedLeg).where(RealizedLeg.symbol == ticker))
+
+    if not pairs:
+        return 0
+
+    await session.execute(
+        pg_insert(RealizedLeg).values([
+            {
+                "id": uuid.uuid4(),
+                "symbol": ticker,
+                "direction": leg.direction,
+                "quantity": leg.quantity,
+                "open_trade_id": leg.open_trade_id,
+                "close_trade_id": leg.close_trade_id,
+                "entry_price": leg.entry_price,
+                "exit_price": leg.exit_price,
+                "entry_time": leg.entry_date,
+                # The date every period figure buckets on.
+                "exit_time": leg.exit_date,
+                # Quantized on the way in for the same reason positions are:
+                # gross - commission = net has to hold in what is STORED, not
+                # only in what was computed, or three numbers rendered side by
+                # side disagree by a hundredth and read as a bug.
+                "gross_pnl": leg.gross_pnl.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP),
+                # ALL-IN, so gross - commission = the broker's own net.
+                "commission": leg.commission.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP),
+                # The raw apportioned ibCommission, untouched, beside it.
+                "ib_commission": leg.ib_commission.quantize(
+                    MONEY_PRECISION, rounding=ROUND_HALF_UP
+                ),
+                "broker_realized_pnl": (
+                    leg.broker_realized_pnl.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
+                    if leg.broker_realized_pnl is not None
+                    else None
+                ),
+                "realized_pnl": (
+                    leg.gross_pnl.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
+                    - leg.commission.quantize(MONEY_PRECISION, rounding=ROUND_HALF_UP)
+                ),
+                "position_id": position_id,
+            }
+            for leg, position_id in pairs
+        ])
+    )
+    return len(pairs)

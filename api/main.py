@@ -28,6 +28,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    bindparam,
     delete,
     func,
     literal,
@@ -253,6 +254,14 @@ class Trade(Base):
     # opposite sign and is negated on promotion, never abs()'d, because 10 of
     # the 328 fills on this account report a genuine rebate.
     commission = Column(Numeric(14, 6), nullable=False, default=Decimal("0"))
+    # What IBKR says this fill realised, net of commission AND of every other
+    # charge (migration 023). The column above stays the raw ibCommission and
+    # is never derived from this one -- provenance and reconciliation are two
+    # different jobs, and blending them would destroy the first.
+    #
+    # NULL means the broker never told us: a REPAIR- fill has no broker figure
+    # by definition, and the Flex window reaches back only 365 days.
+    broker_realized_pnl = Column(Numeric(12, 4), nullable=True)
     planned_entry = Column(Numeric(10, 4), nullable=True)
     stop_loss = Column(Numeric(10, 4), nullable=True)
     # Where the stop ACTUALLY sat, after any mid-trade moves. Separate from
@@ -499,6 +508,69 @@ class PositionFill(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class RealizedLeg(Base):
+    """One FIFO pairing, and the money it actually realised (migration 022).
+
+    WHERE MONEY LIVES. `positions` gets a row only when a ticker returns to
+    flat, which is the right grain for counting ideas and the wrong grain for
+    cash: selling half a position banks that P&L whatever happens to the other
+    half. Before this table, every dollar realised on the way out of a position
+    still held was recorded nowhere at all -- MSFT alone was carrying -63.34 of
+    real realised P&L that no figure in the app could see, and the year-to-date
+    total was wrong by 72.34 as a result.
+
+    It also fixes dating. A round trip's P&L used to be attributed entirely to
+    its FINAL exit, so scaling out in December and closing in January put every
+    dollar in January. A leg knows the date its own money was realised.
+
+    So: MONEY (net P&L, gross, commission, the equity curve, drawdown, every
+    windowed total) sums legs by `exit_time`. COUNTS (trade count, win rate,
+    profit factor, ROI, grades, reviews) stay on `positions`, one row per
+    completed idea. A partial exit moves the money and does not count as a
+    trade.
+
+    `position_id` is NULL when the run has not closed -- money banked, idea
+    still running. Purely derived from `trades`, so a rebuild replaces a
+    ticker's legs outright; there is no user-entered field to preserve.
+    """
+
+    __tablename__ = "realized_legs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    symbol = Column(String(20), nullable=False)
+    direction = Column(String(5), nullable=False)  # LONG | SHORT
+    quantity = Column(Numeric(18, 8), nullable=False)
+    open_trade_id = Column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="CASCADE"), nullable=False
+    )
+    close_trade_id = Column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="CASCADE"), nullable=False
+    )
+    entry_price = Column(Numeric(10, 4), nullable=False)
+    exit_price = Column(Numeric(10, 4), nullable=False)
+    entry_time = Column(DateTime(timezone=True), nullable=False)
+    # The date every period figure buckets on.
+    exit_time = Column(DateTime(timezone=True), nullable=False)
+    gross_pnl = Column(Numeric(14, 4), nullable=False)
+    # ALL-IN cost of this slice (migration 023): commission plus exchange,
+    # clearing and regulatory charges. Derived as gross_pnl minus the broker's
+    # own realised figure where there is one, so net P&L ties to the IBKR
+    # statement exactly instead of to the commission column alone.
+    commission = Column(Numeric(14, 4), nullable=False, default=Decimal("0"))
+    # The apportioned raw ibCommission, kept beside it. "What did I pay IBKR"
+    # and "what did this trade cost me in total" stay two answerable questions.
+    ib_commission = Column(Numeric(14, 4), nullable=False, default=Decimal("0"))
+    # The broker's figure for this leg's share of its closing fill. NULL when
+    # the fill carried none, which is what `commission` falling back to
+    # ib_commission is conditioned on -- and what coverage reporting counts.
+    broker_realized_pnl = Column(Numeric(14, 4), nullable=True)
+    realized_pnl = Column(Numeric(14, 4), nullable=False)
+    position_id = Column(
+        UUID(as_uuid=True), ForeignKey("positions.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class IBKRExecution(Base):
     """Raw broker fills, staged before promotion into `trades`.
 
@@ -515,6 +587,11 @@ class IBKRExecution(Base):
     quantity = Column(Numeric(18, 8), nullable=False)
     price = Column(Numeric(14, 6), nullable=True)
     commission = Column(Numeric(14, 6), nullable=True)
+    # IBKR's own realised P&L for this execution (migration 023), as sent: net
+    # of commission and of every other charge. Refreshed on every sync rather
+    # than written once, because IBKR re-lots occasionally and the figure for a
+    # fill can change after settlement.
+    fifo_pnl_realized = Column(Numeric(14, 6), nullable=True)
     execution_time = Column(DateTime(timezone=True), nullable=True)
     processed = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -818,6 +895,47 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     # were ingested on a previous run and already have a trades row.
     new_executions = [e for e in executions if e.transaction_id in staged_ids]
 
+    # --- 3b: refresh the broker's own realised P&L ------------------------
+    #
+    # Deliberately a SEPARATE statement from the staging insert above, not a
+    # DO UPDATE on it. That insert's RETURNING clause is what decides which
+    # executions are new and therefore get promoted; upgrading it to DO UPDATE
+    # would return every row and re-promote the entire history on every sync.
+    #
+    # Run over ALL parsed executions rather than just the new ones, which is
+    # what makes an ordinary sync self-healing: fills ingested before migration
+    # 023, or before the Flex query exposed the field, acquire their broker
+    # figure the next time a statement covers them. IBKR also re-lots
+    # occasionally, so the value is refreshed rather than written once.
+    broker_pnl = [
+        {"tid": e.transaction_id, "pnl": e.fifo_pnl_realized}
+        for e in executions
+        if e.fifo_pnl_realized is not None
+    ]
+    if broker_pnl:
+        # Core updates against `__table__`, not the ORM classes. Handed an ORM
+        # entity plus a list of dicts, SQLAlchemy reads it as a bulk update BY
+        # PRIMARY KEY and rejects rows that carry none -- these are keyed on
+        # the broker's transaction id, not on `id`. Targeting the table is what
+        # keeps this an ordinary executemany.
+        await session.execute(
+            update(IBKRExecution.__table__)
+            .where(IBKRExecution.__table__.c.transaction_id == bindparam("tid"))
+            .values(fifo_pnl_realized=bindparam("pnl")),
+            broker_pnl,
+        )
+        # And onto the ledger, for rows that already existed. New rows carry it
+        # from the promotion below; this catches everything older.
+        await session.execute(
+            update(Trade.__table__)
+            .where(
+                Trade.__table__.c.ibkr_exec_id
+                == "IBKR-" + IBKRExecution.__table__.c.transaction_id,
+                IBKRExecution.__table__.c.fifo_pnl_realized.is_not(None),
+            )
+            .values(broker_realized_pnl=IBKRExecution.__table__.c.fifo_pnl_realized)
+        )
+
     # --- 4: promote into the trades ledger --------------------------------
     trade_rows = [
         {
@@ -835,6 +953,9 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             # Sign flipped exactly once, here, from IBKR's debit convention to
             # a cost the engine can subtract. See commission_cost.
             "commission": e.commission_cost,
+            # Carried as IBKR states it -- already net of every charge, and a
+            # P&L rather than a cost, so no sign flip applies.
+            "broker_realized_pnl": e.fifo_pnl_realized,
             "source_tag": "IBKR",
         }
         for e in new_executions

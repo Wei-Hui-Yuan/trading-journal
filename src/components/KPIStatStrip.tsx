@@ -41,7 +41,32 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
             </span>
           </div>
           <div className="flex justify-between items-center text-xs">
-            <span className="text-obsidian-muted text-[11px]">Broker Fees &amp; Commissions:</span>
+            {/* "All-in", not "commissions", because that is what it is. The
+                figure is derived from IBKR's own realised P&L rather than from
+                the commission column, so it also carries the exchange,
+                clearing and regulatory charges IBKR nets but does not report
+                separately — about 5.3c per closing fill. That is precisely
+                what makes the three lines here sum to the statement. */}
+            <span
+              className="text-obsidian-muted text-[11px] cursor-help border-b border-dotted border-obsidian-border"
+              title={
+                `IBKR commission: ${formatMoney(-stats.ibCommission)}\n` +
+                `Exchange, clearing & regulatory: ${formatMoney(
+                  -(stats.totalCommission - stats.ibCommission)
+                )}\n\n` +
+                'Derived from the broker’s own realised P&L, so Net P&L ' +
+                'matches your IBKR statement exactly.' +
+                (stats.unverifiedLegs > 0
+                  ? `\n\nNote: ${stats.unverifiedLegs} slice(s) had no broker figure, ` +
+                    'so their cost is the commission alone.'
+                  : '')
+              }
+            >
+              Broker Fees &amp; Commissions:
+              {stats.unverifiedLegs > 0 && (
+                <span className="ml-1 text-amber-500" aria-hidden>*</span>
+              )}
+            </span>
             {/* Negated INSIDE formatMoney, not prefixed outside it. The
                 formatter already signs its own output, so a literal `-` in
                 front produced `-+$97.65` — the same mistake formatSignedPercent
@@ -56,6 +81,31 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
               {formatMoney(-stats.totalCommission)}
             </span>
           </div>
+          {/* Only when there is some, because most windows have none.
+
+              This is money already banked out of positions still open, and it
+              is the reason Net P&L is not the sum of the closed round trips
+              below. It used to be missing from every figure in the app --
+              MSFT alone was carrying $63 of realised losses that no total
+              could see -- so naming it is the point, not a detail. */}
+          {stats.openRunPnl !== 0 && (
+            <div className="flex justify-between items-center text-xs">
+              <span
+                className="text-obsidian-muted text-[11px] cursor-help border-b border-dotted border-obsidian-border"
+                title={
+                  'Realised by scaling out of positions you still hold. Already ' +
+                  'in Net P&L, but not in the closed round trips below — those ' +
+                  'trades have not finished, so they do not count toward win ' +
+                  'rate or trade count.'
+                }
+              >
+                From open positions:
+              </span>
+              <span className={stats.openRunPnl >= 0 ? 'text-win font-semibold' : 'text-loss font-semibold'}>
+                {formatMoney(stats.openRunPnl)}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 

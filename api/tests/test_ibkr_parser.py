@@ -319,6 +319,11 @@ class TestStagingRow:
         assert sorted(row.keys()) == [
             "commission",
             "execution_time",
+            # IBKR's own realised P&L for the fill (migration 023). Net of
+            # commission AND of the exchange, clearing and regulatory charges
+            # the commission column does not carry, which is what lets the
+            # dashboard tie to the statement to the cent.
+            "fifo_pnl_realized",
             "price",
             "processed",
             "quantity",

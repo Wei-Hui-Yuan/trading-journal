@@ -247,6 +247,36 @@ class ClosedPosition:
     commission: Optional[Decimal] = None
 
 
+@dataclass(frozen=True)
+class RealizedLeg:
+    """One slice of realised money, and the moment it was realised.
+
+    The unit every period figure buckets on. A `ClosedPosition` is one idea and
+    carries a single exit date; a leg is one closing fill, so a round trip that
+    scaled out across a boundary contributes to both sides of it -- which is
+    the only way a windowed total can agree with a broker statement.
+
+    `position_id` is None when the run never went flat: real money, banked out
+    of a position still held. That is the P&L that had no home at all before
+    migration 022.
+    """
+
+    realized_pnl: Decimal
+    gross_pnl: Decimal
+    # ALL-IN cost (migration 023): commission plus exchange, clearing and
+    # regulatory charges, derived from the broker's own realised figure. This
+    # is what makes gross - commission = net tie to the IBKR statement.
+    commission: Decimal
+    exit_time: datetime
+    position_id: Optional[Any] = None
+    # The raw apportioned ibCommission, for the "what did I pay IBKR" split.
+    ib_commission: Decimal = Decimal("0")
+    # None when the broker never reported one for this leg's closing fill, in
+    # which case `commission` fell back to ib_commission and this leg's cost is
+    # unverified. Counted rather than assumed.
+    broker_realized_pnl: Optional[Decimal] = None
+
+
 @dataclass
 class _Bucket:
     """Running totals for one heatmap cell."""
@@ -295,14 +325,44 @@ class _Bucket:
         }
 
 
-def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
-    """Headline performance numbers across every closed position."""
+def compute_core_stats(
+    positions: list[ClosedPosition],
+    legs: Optional[list["RealizedLeg"]] = None,
+) -> dict[str, Any]:
+    """Headline performance numbers.
+
+    TWO GRAINS, DELIBERATELY. Money comes from `legs`; counts come from
+    `positions`.
+
+    Money is realised by a closing FILL. Selling half a position banks that P&L
+    whatever happens to the other half, and a `positions` row does not exist
+    until the ticker returns to flat -- so summing positions silently omitted
+    every dollar realised out of a position still held. On this account that
+    was -72.34 year-to-date, enough to turn a reported +66.20 into the broker's
+    actual -6.14. See migration 022.
+
+    Counts stay on completed round trips, because that is what a trade IS. A
+    partial exit is not an idea finished, and letting it increment trade_count
+    or win rate would undo the flat-to-flat aggregation that keeps one trade
+    counted once.
+
+    So `net_pnl` can move while `total_trades` does not, and that is correct
+    rather than an inconsistency. `open_run_pnl` is reported separately so the
+    difference is nameable: it is exactly the money banked out of positions
+    still open.
+
+    `legs=None` falls back to summing positions, preserving the old behaviour
+    for callers that have no legs to give (older tests, backtests).
+    """
     total_trades = len(positions)
-    if not total_trades:
+    if not total_trades and not legs:
         return {
             "net_pnl": 0.0,
             "gross_pnl": 0.0,
             "total_commission": 0.0,
+            "ib_commission": 0.0,
+            "unverified_legs": 0,
+            "open_run_pnl": 0.0,
             "win_rate_pct": 0.0,
             "total_trades": 0,
             "profit_factor": 0.0,
@@ -318,11 +378,17 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
     roi_sum = Decimal("0")
     roi_count = 0
 
+    open_run_pnl = Decimal("0")
+    ib_commission = Decimal("0")
+    # Legs whose closing fill carried no broker figure, so their cost is the
+    # apportioned ibCommission alone and excludes exchange and regulatory
+    # charges. Zero on a broker-only ledger; non-zero means the reconciliation
+    # to the statement is approximate for that many slices, which the UI has to
+    # be able to say rather than quietly present as exact.
+    unverified = 0
+
     for position in positions:
         pnl = position.realized_pnl
-        net_pnl += pnl
-        total_gross_pnl += position.gross_pnl if position.gross_pnl is not None else pnl
-        total_commission += position.commission if position.commission is not None else Decimal("0")
 
         if pnl > 0:
             gross_profit += pnl
@@ -336,6 +402,30 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
         if cost_basis > 0:
             roi_sum += pnl / cost_basis * Decimal("100")
             roi_count += 1
+
+    if legs is None:
+        # No legs supplied: fall back to the round-trip sum. Understates by any
+        # money banked out of a still-open position, which is precisely the bug
+        # migration 022 fixed -- so this path exists only for callers that have
+        # no legs to give, never for the dashboard.
+        for position in positions:
+            net_pnl += position.realized_pnl
+            total_gross_pnl += (
+                position.gross_pnl if position.gross_pnl is not None else position.realized_pnl
+            )
+            total_commission += (
+                position.commission if position.commission is not None else Decimal("0")
+            )
+    else:
+        for leg in legs:
+            net_pnl += leg.realized_pnl
+            total_gross_pnl += leg.gross_pnl
+            total_commission += leg.commission
+            ib_commission += leg.ib_commission
+            if leg.broker_realized_pnl is None:
+                unverified += 1
+            if leg.position_id is None:
+                open_run_pnl += leg.realized_pnl
 
     # Profit factor is gross wins / gross losses, which is undefined when there
     # are no losses. It must NOT be float('inf'): JSON has no infinity literal,
@@ -351,8 +441,22 @@ def compute_core_stats(positions: list[ClosedPosition]) -> dict[str, Any]:
     return {
         "net_pnl": float(net_pnl),
         "gross_pnl": float(total_gross_pnl),
+        # ALL-IN: commission plus exchange, clearing and regulatory charges.
+        # gross_pnl - total_commission = net_pnl exactly, and net_pnl equals
+        # what the IBKR statement says for the same window.
         "total_commission": float(total_commission),
-        "win_rate_pct": round(wins / total_trades * 100, 2),
+        # The IBKR commission alone. The difference between the two is what the
+        # broker charges beyond commission -- about 5.3c per closing fill --
+        # which is worth being able to see rather than having it blended away.
+        "ib_commission": float(ib_commission),
+        # Slices whose cost could not be reconciled to a broker figure.
+        "unverified_legs": unverified,
+        # Of `net_pnl`, how much was banked scaling out of positions that are
+        # still open. Named rather than buried: it is the reason net_pnl and
+        # the sum of the round trips below it can differ, and an unexplained
+        # difference between two figures on one screen reads as a bug.
+        "open_run_pnl": float(open_run_pnl),
+        "win_rate_pct": round(wins / total_trades * 100, 2) if total_trades else 0.0,
         "total_trades": total_trades,
         "profit_factor": profit_factor,
         "avg_roi_pct": float(round(roi_sum / roi_count, 2)) if roi_count else 0.0,
@@ -535,8 +639,89 @@ def clamp_to_max_span(
     return kept, True
 
 
+def clamp_legs_to_max_span(
+    legs: Iterable[RealizedLeg],
+) -> tuple[list[RealizedLeg], bool]:
+    """clamp_to_max_span, for legs. Same ceiling, same reasoning.
+
+    Needed separately because the curve's span is driven by whatever it plots,
+    and once it plots legs a corrupt timestamp on a leg stretches it exactly as
+    a corrupt position date used to.
+    """
+    materialised = list(legs)
+    days = [
+        leg.exit_time.astimezone(MARKET_TZ).date()
+        for leg in materialised
+        if leg.exit_time is not None
+    ]
+    if not days:
+        return materialised, False
+
+    floor = max(days) - timedelta(days=MAX_CURVE_DAYS)
+    if min(days) >= floor:
+        return materialised, False
+
+    kept = [
+        leg
+        for leg in materialised
+        if leg.exit_time is not None
+        and leg.exit_time.astimezone(MARKET_TZ).date() >= floor
+    ]
+    logger.warning(
+        "Equity curve span clamped to %d days: %d of %d realised legs are dated "
+        "before %s and were excluded.",
+        MAX_CURVE_DAYS, len(materialised) - len(kept), len(materialised), floor.isoformat(),
+    )
+    return kept, True
+
+
+async def load_realized_legs(session: AsyncSession) -> list[RealizedLeg]:
+    """Every realised slice of money in the ledger.
+
+    Imported locally so this module never participates in an import cycle with
+    the FastAPI app that calls it.
+    """
+    from main import RealizedLeg as RealizedLegRow  # noqa: PLC0415
+
+    rows = (await session.execute(select(RealizedLegRow))).scalars().all()
+
+    return [
+        RealizedLeg(
+            realized_pnl=Decimal(str(row.realized_pnl)),
+            gross_pnl=Decimal(str(row.gross_pnl)),
+            commission=Decimal(str(row.commission or 0)),
+            exit_time=row.exit_time,
+            position_id=row.position_id,
+            ib_commission=Decimal(str(row.ib_commission or 0)),
+            broker_realized_pnl=(
+                Decimal(str(row.broker_realized_pnl))
+                if row.broker_realized_pnl is not None
+                else None
+            ),
+        )
+        for row in rows
+        if row.realized_pnl is not None and row.exit_time is not None
+    ]
+
+
+def filter_legs_by_window(
+    legs: Iterable[RealizedLeg], window: Window
+) -> list[RealizedLeg]:
+    """Keep money realised inside the window, by the date it was realised."""
+    if window.is_unbounded:
+        return list(legs)
+    return [
+        leg
+        for leg in legs
+        if window.contains(leg.exit_time.astimezone(MARKET_TZ).date())
+    ]
+
+
 def build_equity_curve(
-    positions: Iterable[ClosedPosition], *, truncated: bool = False
+    positions: Iterable[ClosedPosition],
+    *,
+    truncated: bool = False,
+    legs: Optional[Iterable[RealizedLeg]] = None,
 ) -> dict[str, Any]:
     """Cumulative realised P&L over time, with the drawdown it went through.
 
@@ -545,6 +730,14 @@ def build_equity_curve(
     which the broker feed carries -- inventing one by working backwards from
     today's account size would silently assume the account was never funded
     twice. This is the sum of closed P&L, which the data does support.
+
+    Plotted from LEGS when they are supplied -- one point of money per closing
+    fill, dated when that fill happened. A round trip carries a single exit
+    date, so drawing the curve from round trips put every dollar of a
+    scaled-out position on the day it finally closed, and omitted outright any
+    money banked out of a position still open. Both are wrong on a chart whose
+    whole job is when the account moved. `positions` remains the fallback for
+    callers with no legs.
 
     Dated by EXIT time. A trade opened in March and closed in July moved the
     balance in July, and dating it by entry would draw a curve that recovered
@@ -566,11 +759,22 @@ def build_equity_curve(
     positions, clamped_here = clamp_to_max_span(positions)
     truncated = truncated or clamped_here
 
-    dated = [
-        (day, p.realized_pnl)
-        for p in positions
-        if (day := _exit_day(p)) is not None
-    ]
+    if legs is not None:
+        legs, legs_clamped = clamp_legs_to_max_span(legs)
+        truncated = truncated or legs_clamped
+
+    if legs is None:
+        dated = [
+            (day, p.realized_pnl)
+            for p in positions
+            if (day := _exit_day(p)) is not None
+        ]
+    else:
+        dated = [
+            (leg.exit_time.astimezone(MARKET_TZ).date(), leg.realized_pnl)
+            for leg in legs
+            if leg.exit_time is not None
+        ]
 
     if not dated:
         return {
@@ -591,10 +795,19 @@ def build_equity_curve(
         }
 
     daily_pnl: dict[Any, Decimal] = {}
-    daily_count: dict[Any, int] = {}
     for day, pnl in dated:
         daily_pnl[day] = daily_pnl.get(day, Decimal("0")) + pnl
-        daily_count[day] = daily_count.get(day, 0) + 1
+
+    # Counted from ROUND TRIPS, not from the legs the money came from. The
+    # tooltip says "3 trades" and has to mean three ideas finished; scaling out
+    # of one position four times is one trade, and counting legs would report
+    # four. Money and counts come from different grains on purpose -- the same
+    # split core_stats makes.
+    daily_count: dict[Any, int] = {}
+    for position in positions:
+        day = _exit_day(position)
+        if day is not None:
+            daily_count[day] = daily_count.get(day, 0) + 1
 
     first_day, last_day = min(daily_pnl), max(daily_pnl)
 
@@ -652,7 +865,9 @@ def build_equity_curve(
             "current_drawdown": float(cumulative - peak),
             "trading_days": len(daily_pnl),
             "calendar_days": (last_day - first_day).days + 1,
-            "closed_trades": len(dated),
+            # Completed round trips, not the legs the money came from -- same
+            # split as daily_count above and as core_stats.
+            "closed_trades": sum(daily_count.values()),
             # True when closes older than the ceiling were dropped. The UI says
             # so on the chart rather than letting a cut curve read as history.
             "truncated": truncated,
@@ -680,6 +895,16 @@ async def build_dashboard(
     windowed, undated = filter_by_exit_window(everything, window)
     clamped, truncated = clamp_to_max_span(windowed)
 
+    # Money, at its own grain. Selected by the date each slice was REALISED,
+    # which is why a windowed total can now agree with a broker statement: a
+    # round trip that scaled out either side of the boundary contributes to
+    # both windows, and money banked out of a position still open contributes
+    # at all. See migration 022.
+    all_legs = await load_realized_legs(session)
+    legs = filter_legs_by_window(all_legs, window)
+    legs, legs_truncated = clamp_legs_to_max_span(legs)
+    truncated = truncated or legs_truncated
+
     return {
         # Echoed back so the UI can label what it is showing, and so a
         # truncated or empty result carries its own explanation instead of
@@ -696,10 +921,18 @@ async def build_dashboard(
             # so that if it ever is not, the shortfall is visible rather than
             # showing up as figures that quietly do not add up.
             "excluded_undated": undated,
+            # Realisation events behind the money. Higher than the trade count
+            # whenever a position was scaled out of, and the difference is the
+            # reason the two grains exist.
+            "realized_legs_in_window": len(legs),
         },
-        "core_stats": compute_core_stats(clamped),
+        "core_stats": compute_core_stats(clamped, legs),
+        # Stays on completed round trips: the heatmap answers "which session do
+        # I ENTER well in", which is a question about finished ideas. Its cell
+        # totals therefore need not sum to core_stats.net_pnl -- the gap is
+        # core_stats.open_run_pnl, which is named for exactly that reason.
         "heatmap": build_heatmap(clamped),
-        "equity_curve": build_equity_curve(clamped, truncated=truncated),
+        "equity_curve": build_equity_curve(clamped, truncated=truncated, legs=legs),
     }
 
 

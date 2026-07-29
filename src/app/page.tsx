@@ -54,6 +54,9 @@ const API_HOST = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 const EMPTY_STATS: KPIStats = {
   netPnl: 0,
   grossPnl: 0,
+  openRunPnl: 0,
+  ibCommission: 0,
+  unverifiedLegs: 0,
   totalCommission: 0,
   winRate: 0,
   totalTrades: 0,
@@ -88,6 +91,9 @@ export default function Home() {
     ? {
         netPnl: core.net_pnl,
         grossPnl: core.gross_pnl ?? core.net_pnl,
+        openRunPnl: core.open_run_pnl ?? 0,
+        ibCommission: core.ib_commission ?? 0,
+        unverifiedLegs: core.unverified_legs ?? 0,
         totalCommission: core.total_commission ?? 0,
         winRate: core.win_rate_pct,
         totalTrades: core.total_trades,
