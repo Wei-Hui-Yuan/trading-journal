@@ -288,6 +288,16 @@ export interface IngestResult {
   positions_removed?: number;
   /** How many of those carried a review. That part cannot be reconstructed. */
   reviews_discarded?: number;
+  /**
+   * Tickers this sync re-matched because an earlier run promoted their fills
+   * and then died before building round trips from them — a container restart,
+   * a redeploy, a dropped connection.
+   *
+   * Normally empty. When it is not, those fills had been sitting in the ledger
+   * as exposure no statistic could see, and every figure derived from those
+   * tickers has just moved.
+   */
+  symbols_recovered?: string[];
 }
 
 /** One day on the equity curve. Every calendar day gets one, trades or not. */

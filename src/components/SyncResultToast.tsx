@@ -186,6 +186,24 @@ export const SyncResultToast: React.FC = () => {
                 </p>
               )}
 
+              {/* An earlier sync imported these fills and died before building
+                  round trips from them, so they sat in the ledger as exposure
+                  nothing could see. This run repaired it — which means P&L and
+                  trade count just moved for a reason none of the counters
+                  above explain. */}
+              {(result.symbols_recovered?.length ?? 0) > 0 && (
+                <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[11px] leading-relaxed text-amber-200/90">
+                  <span className="font-semibold">
+                    Recovered {result.symbols_recovered!.length} ticker
+                    {result.symbols_recovered!.length === 1 ? '' : 's'} from an
+                    interrupted sync.
+                  </span>{' '}
+                  {result.symbols_recovered!.join(', ')} had fills imported but
+                  never matched into round trips. They are counted now, so your
+                  totals have changed.
+                </p>
+              )}
+
               {/* Called out rather than left as a number in the list: this is
                   the one outcome that changed a trade's recorded intent, and
                   it is worth checking the sync matched the plan you meant. */}

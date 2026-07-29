@@ -671,6 +671,44 @@ class IngestResult(BaseModel):
     # How many of those carried a review. This is the part that cannot be
     # reconstructed, so it gets its own number.
     reviews_discarded: int = 0
+    # Tickers this sync re-matched because a PREVIOUS run promoted their fills
+    # and then died before building positions from them. Normally empty, and
+    # never something to discover silently: a non-empty list means the ledger
+    # had been under-reporting until this run, and every figure derived from
+    # those tickers has just moved.
+    symbols_recovered: list[str] = []
+
+
+async def _symbols_awaiting_match(session: AsyncSession) -> list[str]:
+    """Tickers with staged fills that no position has been built from yet.
+
+    The resume set. A staging row is marked `processed` only after FIFO has run
+    for its symbol, so anything still unmarked is work an earlier run started
+    and did not finish -- promoted into `trades`, then interrupted before the
+    round trips were built. Migration 005 added the column for exactly this and
+    indexed it; it was simply being set too early to serve.
+
+    Deliberately not "every ticker with a fill that has no position_fills row".
+    That reads as the same question and is not: an OPEN position's fills have
+    no position_fills row by definition, so it returns every ticker holding a
+    running trade, on every sync, forever -- and cannot distinguish one from a
+    fill that was genuinely stranded. Measured here it names three tickers
+    where the right answer is none, and rebuilding those three costs ~146ms of
+    round trips per sync that buys nothing. The queries themselves are within
+    5ms of each other; the waste is the work they trigger, and it grows with
+    the number of positions held open.
+    """
+    return sorted(
+        set((
+            await session.execute(
+                select(IBKRExecution.symbol)
+                # `is_not(True)`, not `== False`: the column is nullable and a
+                # NULL means "never marked", which is the state being sought.
+                .where(IBKRExecution.processed.is_not(True))
+                .distinct()
+            )
+        ).scalars().all())
+    )
 
 
 @app.post(
@@ -791,14 +829,6 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         )
         created_ids = [row[0] for row in (await session.execute(trade_stmt)).fetchall()]
 
-    # Mark staged rows processed so a later failure does not re-promote them.
-    if staged_ids:
-        await session.execute(
-            update(IBKRExecution)
-            .where(IBKRExecution.transaction_id.in_(staged_ids))
-            .values(processed=True)
-        )
-
     # --- 4b: match new fills against open plans ---------------------------
     # Before matching, so a position is built from trades that already carry
     # the stop and target their plan specified.
@@ -807,7 +837,33 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     await session.commit()
 
     # --- 5: re-run FIFO for every affected symbol -------------------------
-    symbols = sorted({e.symbol for e in new_executions})
+    #
+    # This run's symbols, PLUS anything a previous run left unfinished.
+    #
+    # The staging rows are the record of what still needs matching, which is
+    # what `processed` was added for -- migration 005 documents it as existing
+    # so "a partial failure mid-ingest can be resumed", and indexes it. It was
+    # being set in the transaction ABOVE, before the work it guards had run, so
+    # it prevented the resume instead of enabling it: a crash between that
+    # commit and this loop left the fills in `trades` with no positions built
+    # from them, and the next sync could not find them. `staged_ids` holds only
+    # rows that were new to staging, so re-fetching the same executions returns
+    # nothing and the tickers are never revisited. The fills sit in the ledger
+    # as phantom open exposure that no statistic can see.
+    #
+    # Deliberately NOT "every ticker with a fill that has no position_fills
+    # row". That looks equivalent and is not: an OPEN position's fills have no
+    # position_fills row by definition, so it re-matches every open ticker on
+    # every sync forever -- 3 of them here, permanently, growing with the book
+    # -- and cannot tell a stranded fill from a running trade. This query is
+    # exact, hits idx_ibkr_exec_processed, and normally returns nothing.
+    #
+    recovered = sorted(
+        set(await _symbols_awaiting_match(session))
+        - {e.symbol for e in new_executions}
+    )
+    symbols = sorted({e.symbol for e in new_executions} | set(recovered))
+
     positions_matched = 0
     positions_removed = 0
     reviews_discarded = 0
@@ -819,6 +875,26 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         # a newer one has already matched, re-partitioning that ticker's queue.
         positions_removed += result.positions_removed
         reviews_discarded += result.reviews_discarded
+
+    # Only now. A staged row is "processed" once a position has been built from
+    # it, not once it has been copied into `trades` -- anything else marks the
+    # work done before it is, which is the whole of C4. Its own commit, after
+    # the loop, so a crash at any point above leaves the flag unset and the
+    # next sync picks the work back up.
+    if staged_ids:
+        await session.execute(
+            update(IBKRExecution)
+            .where(IBKRExecution.transaction_id.in_(staged_ids))
+            .values(processed=True)
+        )
+    if recovered:
+        await session.execute(
+            update(IBKRExecution)
+            .where(IBKRExecution.symbol.in_(recovered))
+            .values(processed=True)
+        )
+    if staged_ids or recovered:
+        await session.commit()
 
     return IngestResult(
         executions_parsed=len(executions),
@@ -835,6 +911,85 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         plans_attached=plans_attached,
         positions_removed=positions_removed,
         reviews_discarded=reviews_discarded,
+        symbols_recovered=recovered,
+    )
+
+
+class RematchResult(BaseModel):
+    """What re-running FIFO changed."""
+
+    tickers: list[str]
+    positions_matched: int
+    positions_removed: int
+    reviews_discarded: int
+
+
+@app.post(
+    "/api/rematch",
+    response_model=RematchResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def rematch(
+    ticker: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Rebuild round trips from the executions currently in the ledger.
+
+    A repair tool, not part of any page load. The sync recovers from its own
+    interruptions now -- unmatched staging rows are picked up by the next run
+    -- but that only covers fills whose staging rows are still unprocessed. A
+    ledger already in that state before the fix, or one edited directly, has no
+    other way back.
+
+    Safe to run at any time: matching is authoritative and idempotent, so a
+    ticker whose positions already agree with its fills is left byte-identical,
+    reviews and grades included. Anything reported as removed was a round trip
+    FIFO no longer produces.
+
+    Without `ticker` this walks every symbol in the ledger, which costs a few
+    database round trips each -- fine for a repair, too slow to put on a page.
+    Pass a ticker when you know which one is wrong.
+    """
+    from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        run_matching_for_ticker,
+    )
+
+    if ticker:
+        wanted = ticker.strip().upper()
+        exists = (
+            await session.execute(
+                select(Trade.id).where(Trade.ticker == wanted).limit(1)
+            )
+        ).scalars().first()
+        if exists is None:
+            raise HTTPException(
+                status_code=404, detail=f"No executions in the ledger for {wanted}."
+            )
+        tickers = [wanted]
+    else:
+        tickers = sorted(
+            set((await session.execute(select(Trade.ticker).distinct())).scalars().all())
+        )
+
+    matched = removed = discarded = 0
+    for symbol in tickers:
+        result = await run_matching_for_ticker(session, symbol, persist=True)
+        matched += len(result.positions)
+        removed += result.positions_removed
+        discarded += result.reviews_discarded
+
+    if removed:
+        logger.warning(
+            "Manual re-match over %d ticker(s) removed %d round trip(s) and "
+            "discarded %d review(s).",
+            len(tickers), removed, discarded,
+        )
+
+    return RematchResult(
+        tickers=tickers,
+        positions_matched=matched,
+        positions_removed=removed,
+        reviews_discarded=discarded,
     )
 
 
