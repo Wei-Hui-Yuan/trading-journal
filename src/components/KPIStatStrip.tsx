@@ -42,8 +42,18 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
           </div>
           <div className="flex justify-between items-center text-xs">
             <span className="text-obsidian-muted text-[11px]">Broker Fees &amp; Commissions:</span>
+            {/* Negated INSIDE formatMoney, not prefixed outside it. The
+                formatter already signs its own output, so a literal `-` in
+                front produced `-+$97.65` — the same mistake formatSignedPercent
+                documents as having produced `+-0.63%`.
+
+                Commission is stored as a cost, so a positive figure is money
+                paid and reads here as negative. Negating first also gets the
+                two edge cases right for free: zero renders `$0.00` rather than
+                `-$0.00`, and a net rebate renders `+$12.50` rather than
+                `--$12.50`. */}
             <span className="text-amber-400 font-semibold">
-              -{formatMoney(stats.totalCommission)}
+              {formatMoney(-stats.totalCommission)}
             </span>
           </div>
         </div>
