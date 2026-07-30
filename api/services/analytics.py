@@ -375,8 +375,15 @@ def compute_core_stats(
     gross_profit = Decimal("0")  # sum of winning P&L
     gross_loss = Decimal("0")  # sum of |losing P&L|
     wins = 0
-    roi_sum = Decimal("0")
-    roi_count = 0
+    # Capital-weighted, not a mean of per-position ROI%: summed separately and
+    # divided once, below, so a $1 position's +300% cannot swing the figure as
+    # hard as a $1,000 position's +5%. Both sums are restricted to the same
+    # cost_basis > 0 positions in the loop, so the ratio is always taken over
+    # money actually measured on both sides -- see the note at its use for why
+    # that has to be `pnl` (position grain) and not the `net_pnl` this function
+    # builds from `legs`.
+    total_cost = Decimal("0")
+    roi_pnl_sum = Decimal("0")
 
     open_run_pnl = Decimal("0")
     ib_commission = Decimal("0")
@@ -400,8 +407,8 @@ def compute_core_stats(
         # denominator: a zero entry price or quantity would otherwise raise.
         cost_basis = position.entry_price * position.quantity
         if cost_basis > 0:
-            roi_sum += pnl / cost_basis * Decimal("100")
-            roi_count += 1
+            total_cost += cost_basis
+            roi_pnl_sum += pnl
 
     if legs is None:
         # No legs supplied: fall back to the round-trip sum. Understates by any
@@ -459,7 +466,19 @@ def compute_core_stats(
         "win_rate_pct": round(wins / total_trades * 100, 2) if total_trades else 0.0,
         "total_trades": total_trades,
         "profit_factor": profit_factor,
-        "avg_roi_pct": float(round(roi_sum / roi_count, 2)) if roi_count else 0.0,
+        # roi_pnl_sum, not net_pnl: net_pnl is leg-grain when legs are given
+        # (the dashboard's normal case) and includes open_run_pnl, money
+        # banked out of a position that is still open and therefore has no
+        # `positions` row -- none of its cost basis is in total_cost. Dividing
+        # that money by a denominator that never counted it would overstate
+        # or understate the figure by however much is currently banked on
+        # open positions, which is not hypothetical: -75.33 on this ledger the
+        # day this was measured. roi_pnl_sum sums the same position.realized_pnl
+        # the loop above already gated on cost_basis > 0, so the ratio is
+        # always over capital actually measured on both sides.
+        "avg_roi_pct": (
+            float(round(roi_pnl_sum / total_cost * 100, 2)) if total_cost > 0 else 0.0
+        ),
     }
 
 
@@ -952,7 +971,10 @@ class ReviewedTrade:
     trade_id: str
     ticker: str
     direction: str  # BUY (long) / SELL (short)
-    quantity: int
+    # Decimal, not int: trades.quantity is NUMERIC(18,8), and a fractional
+    # share position -- 0.65 shares is real on this account -- truncated to 0
+    # under int().
+    quantity: Decimal
     actual_entry: Decimal
     exit_price: Optional[Decimal]
     planned_entry: Optional[Decimal]
@@ -1381,7 +1403,7 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                 trade_id=str(position.id),
                 ticker=position.symbol,
                 direction=direction,
-                quantity=int(position.quantity or 0),
+                quantity=Decimal(str(position.quantity or 0)),
                 actual_entry=Decimal(str(position.entry_price)),
                 exit_price=Decimal(str(position.exit_price)),
                 planned_entry=(

@@ -1,15 +1,23 @@
 """Advanced performance metrics: R-multiple, slippage, expectancy."""
 
+import dataclasses
+import inspect
+import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
 from services.analytics import (
+    ClosedPosition,
+    RealizedLeg,
     ReviewedTrade,
     compute_advanced_metrics,
+    compute_core_stats,
     compute_expectancy,
     compute_r_multiple,
     compute_slippage,
+    load_reviewed_trades,
 )
 
 
@@ -154,3 +162,128 @@ class TestJsonSafety:
         assert m["avg_r"] is None
         assert m["expectancy_r"] is None
         assert m["avg_slippage"] is None
+
+
+def make_position(pnl, entry_price, quantity, exit_day=601):
+    at = datetime(2026, exit_day // 100, exit_day % 100, 19, 0, tzinfo=timezone.utc)
+    return ClosedPosition(
+        realized_pnl=Decimal(str(pnl)), gross_pnl=Decimal(str(pnl)),
+        commission=Decimal("0"), entry_price=Decimal(str(entry_price)),
+        quantity=Decimal(str(quantity)), entry_time=at, exit_time=at,
+    )
+
+
+def make_leg(pnl, exit_day=610, position_id=None):
+    return RealizedLeg(
+        realized_pnl=Decimal(str(pnl)), gross_pnl=Decimal(str(pnl)),
+        commission=Decimal("0"),
+        exit_time=datetime(2026, exit_day // 100, exit_day % 100, 19, 0, tzinfo=timezone.utc),
+        position_id=position_id,
+    )
+
+
+class TestCapitalWeightedROI:
+    """avg_roi_pct has to weight by capital, not average the percentages.
+
+    A $1 position at +300% and a $1,000 position at +5% are not equally
+    informative about what happened to the money -- the unweighted mean of
+    the two percentages reports 152.5%, a number nobody's account returned.
+    """
+
+    def test_a_tiny_position_cannot_dominate_a_large_one(self):
+        tiny = make_position(pnl="3", entry_price="1", quantity="1")  # +300%
+        large = make_position(pnl="50", entry_price="1000", quantity="1")  # +5%
+
+        stats = compute_core_stats([tiny, large])
+
+        old_unweighted_mean = (300.0 + 5.0) / 2  # what the bug reported: 152.5
+        assert stats["avg_roi_pct"] != pytest.approx(old_unweighted_mean, abs=1.0)
+        # (3 + 50) / (1 + 1000) * 100
+        assert stats["avg_roi_pct"] == pytest.approx(5.29, abs=0.01)
+
+    def test_weighting_uses_position_pnl_not_leg_grain_net_pnl(self):
+        """The grain mismatch this fix has to avoid introducing.
+
+        net_pnl is leg-grain when legs are supplied (the dashboard's normal
+        case) and includes open_run_pnl -- money banked scaling out of a
+        position that is still open, and therefore has no `positions` row and
+        no entry in the cost-basis sum at all. Dividing that money by a
+        denominator that never counted it would make "capital-weighted" ROI
+        depend on capital it never measured. avg_roi_pct must come from the
+        same positions total_cost is built from, not from net_pnl.
+        """
+        position = make_position(pnl="50", entry_price="100", quantity="1")  # cost basis 100
+        # Money banked on a DIFFERENT, still-open position: position_id=None
+        # is exactly what marks a leg as carrying no round trip.
+        open_leg = make_leg(pnl="-30", position_id=None)
+        closing_leg = make_leg(pnl="50", position_id=uuid.uuid4())
+
+        stats = compute_core_stats([position], [closing_leg, open_leg])
+
+        assert stats["net_pnl"] == 20.0, "leg-grain: 50 booked - 30 banked against"
+        assert stats["open_run_pnl"] == -30.0
+        # Using net_pnl here instead of the position's own pnl would give
+        # (50 - 30) / 100 * 100 == 20.0. The correct figure reflects only the
+        # one position total_cost actually measured: 50 / 100 * 100.
+        assert stats["avg_roi_pct"] == 50.0
+
+    def test_zero_cost_basis_positions_are_excluded_both_sides(self):
+        """A position with no entry price contributes to neither sum -- not a
+        divide-by-zero, and not a phantom 0% dragging the average down."""
+        free = make_position(pnl="10", entry_price="0", quantity="5")
+        priced = make_position(pnl="20", entry_price="50", quantity="1")
+
+        stats = compute_core_stats([free, priced])
+        assert stats["avg_roi_pct"] == 40.0  # 20 / 50 * 100 -- `free` excluded entirely
+
+    def test_all_zero_cost_basis_reports_zero_not_a_crash(self):
+        stats = compute_core_stats([make_position(pnl="10", entry_price="0", quantity="5")])
+        assert stats["avg_roi_pct"] == 0.0
+
+    def test_weighting_is_the_same_with_or_without_legs(self):
+        """The ROI sums are built in the loop that runs before the legs /
+        no-legs branch, so which grain net_pnl ends up on must not change
+        what avg_roi_pct reports."""
+        position = make_position(pnl="50", entry_price="100", quantity="1")
+        closing_leg = make_leg(pnl="50", position_id=uuid.uuid4())
+
+        with_legs = compute_core_stats([position], [closing_leg])
+        without_legs = compute_core_stats([position])
+        assert with_legs["avg_roi_pct"] == without_legs["avg_roi_pct"] == 50.0
+
+
+class TestReviewedTradeQuantity:
+    """quantity has to survive a fractional share, not truncate it to 0."""
+
+    def test_the_field_is_a_decimal_not_an_int(self):
+        """analytics.py uses `from __future__ import annotations`, so a
+        dataclass field's annotation is stored as the string it was written
+        as, not the evaluated type object."""
+        matched = next(f for f in dataclasses.fields(ReviewedTrade) if f.name == "quantity")
+        assert matched.type == "Decimal"
+
+    def test_a_fractional_quantity_survives_construction(self):
+        trade = dataclasses.replace(make_trade(), quantity=Decimal("0.65"))
+        assert trade.quantity == Decimal("0.65")
+
+    def test_load_reviewed_trades_converts_without_truncating(self):
+        """Pins the exact expression load_reviewed_trades uses. This file has
+        no DB session to drive the function end to end, so the conversion is
+        pinned structurally here and exercised directly below: `int(x or 0)`
+        truncates 0.65 to 0; `Decimal(str(x or 0))` does not."""
+        source = inspect.getsource(load_reviewed_trades)
+        assert "quantity=Decimal(str(position.quantity or 0))" in source
+        assert "quantity=int(" not in source
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (Decimal("0.65"), Decimal("0.65")),
+            (Decimal("10"), Decimal("10")),
+            (None, Decimal("0")),
+            (Decimal("0"), Decimal("0")),
+        ],
+    )
+    def test_the_conversion_itself_for_every_shape_of_input(self, raw, expected):
+        """The expression load_reviewed_trades uses, exercised directly."""
+        assert Decimal(str(raw or 0)) == expected
