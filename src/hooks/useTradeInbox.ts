@@ -291,8 +291,9 @@ export function useAdvancedMetrics() {
  *
  * Invalidation lives here rather than in the button so any caller gets a
  * correct cache refresh: the ingest promotes staged fills into `trades` and
- * re-runs FIFO matching, so new positions can appear in the inbox and shift
- * every dashboard figure.
+ * re-runs FIFO matching, so new positions can appear in the inbox, shift
+ * every dashboard figure, and change what a mounted Trade Ledger or
+ * analytics card is already showing.
  */
 export function useSyncBroker() {
   const queryClient = useQueryClient();
@@ -302,6 +303,12 @@ export function useSyncBroker() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+      // A sync promotes fills into trades and re-runs FIFO matching, so the
+      // ledger and every analytics card built on it go stale the same way an
+      // annotation or a manual entry already does.
+      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
 
       // A run where some Flex queries did not return is NOT a success. IBKR
       // rate-limits report generation per token, and its cooldown outlasts a
@@ -363,8 +370,9 @@ export function useLastSync(): LastSyncState | undefined {
  * Hand-log an execution.
  *
  * The backend re-runs FIFO matching on save, so a closing fill can produce a
- * new position immediately. Both the inbox queue and the dashboard are
- * invalidated so the queue and heatmap reflect it without a reload.
+ * new position immediately. The inbox queue, the dashboard, the ledger and
+ * every analytics card built on the round trips are all invalidated so none
+ * of them still shows pre-save data without a reload.
  */
 export function useCreateManualTrade() {
   const queryClient = useQueryClient();
@@ -377,6 +385,11 @@ export function useCreateManualTrade() {
       // The ledger always gains a row, even when the fill opens rather than
       // closes a position — which is the case the inbox cannot show.
       queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+      // A closing fill also produces a round trip immediately (the backend
+      // re-runs FIFO matching on save), so the journal and every analytics
+      // card built on it need to refresh too, not just the ledger's raw list.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
     },
   });
 }
