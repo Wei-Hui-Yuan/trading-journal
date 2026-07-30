@@ -30,6 +30,7 @@ from sqlalchemy import (
     Text,
     bindparam,
     delete,
+    exists,
     func,
     literal,
     or_,
@@ -765,6 +766,16 @@ class IngestResult(BaseModel):
     # currency conversions in a multi-currency account, which outnumbered the
     # real fills and would otherwise each become a position.
     skipped_non_tradeable: int
+    # Genuine fills IBKR reported with no execution time. Promoting one with a
+    # fabricated `datetime.now()` would insert it whenever this sync happened
+    # to run rather than when it actually filled, corrupting FIFO match order
+    # and misplacing it on the heatmap. Left unpromoted and unprocessed
+    # instead, so a future sync with a corrected statement can pick it up.
+    skipped_undated: int = 0
+    # Genuine fills with no price. Same treatment: promoting one would price
+    # the trade at 0, so it is left out of `trades` and its staging row left
+    # unprocessed rather than marked done for work that was never performed.
+    skipped_unpriced: int = 0
     # Queries that did not return this run -- IBKR rate-limits report
     # generation per token, and its cooldown outlasts a request. Reported
     # rather than swallowed so a partial sync never looks like a full one.
@@ -953,6 +964,33 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         )
 
     # --- 4: promote into the trades ledger --------------------------------
+    #
+    # Undated and unpriced fills are both left out, and both for the same
+    # reason: there is no honest value to promote them with. A fabricated
+    # `datetime.now()` would insert an old fill wherever this sync happened to
+    # run, corrupting FIFO match order and misplacing it on the heatmap; a
+    # fabricated price of 0 would misprice the trade outright. Logged rather
+    # than silently dropped -- a fill missing either field is a data-quality
+    # problem in what IBKR sent, worth a human's attention via the repair-fill
+    # modal, not a routine skip. Left unprocessed in staging (below) so a
+    # later statement carrying the correction is not treated as a duplicate.
+    skipped_undated_execs = [e for e in new_executions if e.execution_time is None]
+    skipped_unpriced_execs = [e for e in new_executions if e.price is None]
+    if skipped_undated_execs:
+        logger.error(
+            "Ingest: %d execution(s) had no execution_time and were not "
+            "promoted to trades: %s",
+            len(skipped_undated_execs),
+            [e.transaction_id for e in skipped_undated_execs],
+        )
+    if skipped_unpriced_execs:
+        logger.error(
+            "Ingest: %d execution(s) had no price and were not promoted to "
+            "trades: %s",
+            len(skipped_unpriced_execs),
+            [e.transaction_id for e in skipped_unpriced_execs],
+        )
+
     trade_rows = [
         {
             "id": uuid.uuid4(),
@@ -961,9 +999,8 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             "ticker": e.symbol[:10],
             "direction": e.side,
             "style": UNCLASSIFIED_STYLE,
-            "entry_date": e.execution_time or datetime.now(MARKET_TZ),
-            # IBKR's execution price is the fill actually received.
-            "actual_entry": e.price if e.price is not None else 0,
+            "entry_date": e.execution_time,
+            "actual_entry": e.price,
             # Side lives in `direction`; store magnitude only.
             "quantity": e.abs_quantity,
             # Sign flipped exactly once, here, from IBKR's debit convention to
@@ -976,7 +1013,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             "source_tag": "IBKR",
         }
         for e in new_executions
-        if e.price is not None
+        if e.price is not None and e.execution_time is not None
     ]
 
     # Fills the user has deleted on purpose. ON CONFLICT DO NOTHING cannot
@@ -1049,24 +1086,29 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         positions_removed += result.positions_removed
         reviews_discarded += result.reviews_discarded
 
-    # Only now. A staged row is "processed" once a position has been built from
-    # it, not once it has been copied into `trades` -- anything else marks the
-    # work done before it is, which is the whole of C4. Its own commit, after
-    # the loop, so a crash at any point above leaves the flag unset and the
-    # next sync picks the work back up.
-    if staged_ids:
+    # Only now, and only rows a trade actually exists for. A staged row earns
+    # `processed = True` by being promoted into `trades` -- not by being
+    # staged (an unpriced or undated fill is staged but deliberately never
+    # promoted, above; marking it processed here would be I6 again: the next
+    # sync would see a duplicate in staging, not the still-missing fill it
+    # actually is) and not by its ticker being one of `recovered` (that set is
+    # scoped by symbol, and a symbol can hold both promoted and permanently
+    # unpromotable rows side by side -- scoping this update the same way would
+    # sweep the unpromoted one up as a side effect of its neighbours
+    # resolving). Its own commit, after the loop, so a crash at any point
+    # above leaves the flag unset and the next sync picks the work back up.
+    if symbols:
         await session.execute(
             update(IBKRExecution)
-            .where(IBKRExecution.transaction_id.in_(staged_ids))
+            .where(
+                IBKRExecution.symbol.in_(symbols),
+                IBKRExecution.processed.is_not(True),
+                exists().where(
+                    Trade.ibkr_exec_id == "IBKR-" + IBKRExecution.transaction_id
+                ),
+            )
             .values(processed=True)
         )
-    if recovered:
-        await session.execute(
-            update(IBKRExecution)
-            .where(IBKRExecution.symbol.in_(recovered))
-            .values(processed=True)
-        )
-    if staged_ids or recovered:
         await session.commit()
 
     return IngestResult(
@@ -1078,6 +1120,8 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         positions_matched=positions_matched,
         symbols_touched=symbols,
         skipped_non_tradeable=skipped_non_tradeable,
+        skipped_undated=len(skipped_undated_execs),
+        skipped_unpriced=len(skipped_unpriced_execs),
         queries_failed=query_failures,
         rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
         suppressed_skipped=resurrected,
@@ -2530,12 +2574,25 @@ async def update_strategy(
     for field, value in params.model_dump(exclude_unset=True).items():
         setattr(strategy, field, value)
 
+    # Captured before the commit is attempted, not after it fails: a failed
+    # flush expires the ORM instance immediately (not just on the rollback()
+    # below), so reading strategy.name from the except block would need a
+    # lazy reload the async session cannot do implicitly -- it raises
+    # PendingRollbackError before rollback() and MissingGreenlet after it.
+    # This is the name the update is actually about either way: the new
+    # value if `name` was in the payload, or the untouched existing one if it
+    # was not -- unlike params.name, which is None on a partial update that
+    # never touched name, and would name "None" as the conflict instead of
+    # the value the constraint actually concerns.
+    attempted_name = strategy.name
+
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
         raise HTTPException(
-            status_code=409, detail=f"A strategy named '{params.name}' already exists"
+            status_code=409,
+            detail=f"A strategy named '{attempted_name}' already exists",
         )
     await session.refresh(strategy)
     return StrategyOut.model_validate(strategy)
@@ -3331,8 +3388,11 @@ async def update_execution(
         reviews_discarded = sum(1 for p in affected if _position_has_review(p))
         await session.execute(delete(Position).where(Position.id.in_(affected_ids)))
 
-    await session.commit()
-
+    # No commit here. The edit above, the delete just issued, and the rebuild
+    # below all land in run_matching_for_ticker's own commit -- one
+    # transaction, so a crash before that commit leaves the fill and its
+    # positions exactly as they were, instead of the fill edited and its
+    # positions gone with nothing rebuilt to replace them.
     result = await run_matching_for_ticker(session, ticker, persist=True)
     await session.refresh(trade)
 
@@ -3543,10 +3603,13 @@ async def delete_trade(
         suppressed = True
 
     await session.delete(trade)
-    await session.commit()
 
-    # Rebuild from what actually remains. Idempotent, so untouched round trips
-    # on this ticker are not duplicated.
+    # No commit here. The delete above (trade, its positions, the suppression
+    # tombstone) and the rebuild below share run_matching_for_ticker's commit,
+    # so a crash before that commit leaves the trade in place with its
+    # positions untouched, instead of gone with nothing rebuilt in their
+    # place. Idempotent besides: untouched round trips on this ticker are not
+    # duplicated.
     result = await run_matching_for_ticker(session, ticker, persist=True)
 
     return TradeDeleteResult(

@@ -15,6 +15,7 @@ would be easy to simplify back into a bug:
     executions underneath, for a round trip that never happened.
 """
 
+import inspect
 import os
 import uuid
 from datetime import datetime
@@ -131,3 +132,44 @@ def test_position_delete_reports_executions_not_just_the_row():
     )
     assert result.executions_deleted == 3
     assert result.suppressed_from_future_syncs == 3
+
+
+# ---------------------------------------------------------------------------
+# I7 -- the delete and the rebuild share one transaction
+# ---------------------------------------------------------------------------
+#
+# Both handlers used to commit the position delete (and, in delete_trade, the
+# trade delete and suppression tombstone) BEFORE calling
+# run_matching_for_ticker, which has its own commit at the end. A crash in
+# that window -- a redeploy, an OOM, a dropped Supabase connection -- left the
+# delete permanent with nothing rebuilt to replace it: a round trip and its
+# review gone, and (for update_execution) a fill sitting there edited with no
+# positions describing it at all.
+#
+# Verified live against Supabase: wrapping session.commit with a call-counting
+# spy during a real update_execution and a real delete_trade shows exactly
+# one call in each, where the unfixed code made two. The savepoint-rollback
+# pattern used for the DB checks elsewhere in this suite cannot observe this
+# property at all -- join_transaction_mode="create_savepoint" turns every
+# commit() into a savepoint release, so a two-commit sequence and a
+# one-commit sequence are undone identically by the outer rollback. Counting
+# calls during a real invocation is the only way to see the difference, which
+# is why this is pinned here structurally instead.
+
+
+def _between(source: str, start_marker: str, end_marker: str) -> str:
+    start = source.index(start_marker)
+    end = source.index(end_marker, start)
+    return source[start:end]
+
+
+def test_update_execution_has_no_commit_between_the_delete_and_the_rebuild():
+    source = inspect.getsource(main.update_execution)
+    between = _between(source, "delete(Position)", "run_matching_for_ticker(")
+    assert "session.commit()" not in between
+
+
+def test_delete_trade_has_no_commit_between_the_delete_and_the_rebuild():
+    source = inspect.getsource(main.delete_trade)
+    between = _between(source, "await session.delete(trade)", "run_matching_for_ticker(")
+    assert "session.commit()" not in between
