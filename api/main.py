@@ -262,6 +262,10 @@ class Trade(Base):
     # NULL means the broker never told us: a REPAIR- fill has no broker figure
     # by definition, and the Flex window reaches back only 365 days.
     broker_realized_pnl = Column(Numeric(12, 4), nullable=True)
+    # All-in acquisition cost the broker reported (migration 024): notional
+    # plus commission plus tax. Consulted only for fills that open a long,
+    # which is what makes an open position's basis tie to the statement.
+    broker_cost_basis = Column(Numeric(18, 8), nullable=True)
     planned_entry = Column(Numeric(10, 4), nullable=True)
     stop_loss = Column(Numeric(10, 4), nullable=True)
     # Where the stop ACTUALLY sat, after any mid-trade moves. Separate from
@@ -592,6 +596,9 @@ class IBKRExecution(Base):
     # than written once, because IBKR re-lots occasionally and the figure for a
     # fill can change after settlement.
     fifo_pnl_realized = Column(Numeric(14, 6), nullable=True)
+    # IBKR's `cost` for this fill (migration 024). All-in acquisition cost on
+    # a BUY; the basis relieved on a SELL.
+    broker_cost = Column(Numeric(18, 8), nullable=True)
     execution_time = Column(DateTime(timezone=True), nullable=True)
     processed = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -908,9 +915,9 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     # figure the next time a statement covers them. IBKR also re-lots
     # occasionally, so the value is refreshed rather than written once.
     broker_pnl = [
-        {"tid": e.transaction_id, "pnl": e.fifo_pnl_realized}
+        {"tid": e.transaction_id, "pnl": e.fifo_pnl_realized, "cost": e.broker_cost}
         for e in executions
-        if e.fifo_pnl_realized is not None
+        if e.fifo_pnl_realized is not None or e.broker_cost is not None
     ]
     if broker_pnl:
         # Core updates against `__table__`, not the ORM classes. Handed an ORM
@@ -921,7 +928,10 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         await session.execute(
             update(IBKRExecution.__table__)
             .where(IBKRExecution.__table__.c.transaction_id == bindparam("tid"))
-            .values(fifo_pnl_realized=bindparam("pnl")),
+            .values(
+                fifo_pnl_realized=bindparam("pnl"),
+                broker_cost=bindparam("cost"),
+            ),
             broker_pnl,
         )
         # And onto the ledger, for rows that already existed. New rows carry it
@@ -931,9 +941,15 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             .where(
                 Trade.__table__.c.ibkr_exec_id
                 == "IBKR-" + IBKRExecution.__table__.c.transaction_id,
-                IBKRExecution.__table__.c.fifo_pnl_realized.is_not(None),
+                or_(
+                    IBKRExecution.__table__.c.fifo_pnl_realized.is_not(None),
+                    IBKRExecution.__table__.c.broker_cost.is_not(None),
+                ),
             )
-            .values(broker_realized_pnl=IBKRExecution.__table__.c.fifo_pnl_realized)
+            .values(
+                broker_realized_pnl=IBKRExecution.__table__.c.fifo_pnl_realized,
+                broker_cost_basis=IBKRExecution.__table__.c.broker_cost,
+            )
         )
 
     # --- 4: promote into the trades ledger --------------------------------
@@ -956,6 +972,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             # Carried as IBKR states it -- already net of every charge, and a
             # P&L rather than a cost, so no sign flip applies.
             "broker_realized_pnl": e.fifo_pnl_realized,
+            "broker_cost_basis": e.broker_cost,
             "source_tag": "IBKR",
         }
         for e in new_executions
@@ -3073,6 +3090,41 @@ async def _consumed_quantity_by_trade(
     }
 
 
+def _acquisition_premium(trade: Trade, quantity: Decimal) -> Decimal:
+    """Cost above the fill price for `quantity` shares of this fill.
+
+    Capitalised into an open position's basis, because that is what the broker
+    does. Preferring the broker's own `cost` over our commission column is not
+    pedantry: IBKR Singapore charges 9% GST on commission, folds it into the
+    basis, and reports it only as a separate "Sales Tax" line. Using commission
+    alone left NFLX reading 94.5299 against a statement figure of 94.540340167.
+
+    Taken from `broker_cost_basis` when the fill bought shares, since on a BUY
+    IBKR's `cost` is the all-in acquisition cost -- notional plus commission
+    plus tax -- and dividing it out needs no tax rate anywhere in this code. A
+    hardcoded 9% would be wrong the next time Singapore moves it, and silently.
+
+    Everything else falls back to raw commission: on a SELL, IBKR reports `cost`
+    as the basis RELIEVED rather than proceeds, so it says nothing about what
+    opening a short cost. Approximate by the tax on that path, and honest about
+    which path it is.
+
+    Scaled to `quantity` so a fill half-consumed by a closed round trip
+    contributes half its cost here and half to that round trip's P&L.
+    """
+    size = trade.quantity or Decimal("0")
+    if size == 0:
+        return Decimal("0")
+
+    share = quantity / size
+    basis = trade.broker_cost_basis
+    if (trade.direction or "").upper() == "BUY" and basis is not None and basis > 0:
+        premium = Decimal(str(basis)) - size * (trade.actual_entry or Decimal("0"))
+        return premium * share
+
+    return (trade.commission or Decimal("0")) * share
+
+
 def _unmatched_quantity(trade: Trade, consumed: dict[uuid.UUID, Decimal]) -> Decimal:
     """Shares of this execution that no closed round trip accounts for."""
     remaining = (trade.quantity or Decimal("0")) - consumed.get(
@@ -4223,16 +4275,25 @@ async def list_round_trips(
             continue
 
         net_direction = "BUY" if signed > 0 else "SELL"
-        # Replayed rather than averaged. Taking the mean of every same-direction
-        # fill treats shares that have already been sold as though they were
-        # still held: MSFT reported 415.45, the average of all 17 shares ever
-        # bought, when only 2 remained at 409.40.
+        # Replayed on a FIFO basis, INCLUSIVE of the commission paid to acquire
+        # the shares -- both because that is what the IBKR statement reports,
+        # and so this row reconciles against it. Average-cost was measurably
+        # wrong here: MSFT read 409.40 against a statement figure of 407.298903.
+        # Its predecessor was worse, averaging all 17 shares ever bought for
+        # 415.45 while only 2 remained.
         #
         # Replayed over the UNMATCHED remainder of each execution, not its full
         # size, or the flipping sell would contribute all 15 of its shares to a
-        # position that is only 5.
+        # position that is only 5. Commission is scaled to that same remainder,
+        # so a fill half-consumed by a closed round trip contributes half its
+        # cost here and half to that round trip's P&L.
         exposure = replay_open_exposure(
-            (t.direction, remaining, t.actual_entry or Decimal("0"))
+            (
+                t.direction,
+                remaining,
+                t.actual_entry or Decimal("0"),
+                _acquisition_premium(t, remaining),
+            )
             for t, remaining in group
         )
         avg_entry = exposure.average_cost

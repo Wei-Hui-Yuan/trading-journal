@@ -57,6 +57,10 @@ _COMMISSION_KEYS = ("ibCommission", "commission")
 # Absent unless the Flex query exposes it, so it stays optional. Zero on an
 # opening fill, which is a real value and not the same as absent.
 _REALIZED_PNL_KEYS = ("fifoPnlRealized", "realizedPnl", "fifoPnlRealizedTotal")
+# The broker's all-in acquisition cost for the fill: notional plus commission
+# plus tax. On a SELL this is the basis RELIEVED rather than proceeds, so it is
+# only meaningful for fills that open a long. See migration 024.
+_COST_KEYS = ("cost", "costBasis")
 _DATETIME_KEYS = ("dateTime", "tradeDate", "reportDate")
 _ASSET_CLASS_KEYS = ("assetCategory", "assetClass")
 
@@ -89,6 +93,9 @@ class ParsedExecution:
     # every other charge. None when the Flex query does not expose it; zero on
     # an opening fill, which is a real value rather than a missing one.
     fifo_pnl_realized: Optional[Decimal] = None
+    # IBKR's `cost` for this fill. All-in acquisition cost on a BUY; the basis
+    # relieved on a SELL, which is not the same thing and is not used as one.
+    broker_cost: Optional[Decimal] = None
 
     @property
     def side(self) -> str:
@@ -254,6 +261,7 @@ def parse_execution_node(node: ET.Element) -> Optional[ParsedExecution]:
         commission=_to_decimal(_first(attrs, _COMMISSION_KEYS)),
         execution_time=parse_execution_datetime(_first(attrs, _DATETIME_KEYS)),
         fifo_pnl_realized=_to_decimal(_first(attrs, _REALIZED_PNL_KEYS)),
+        broker_cost=_to_decimal(_first(attrs, _COST_KEYS)),
     )
 
 
@@ -372,6 +380,7 @@ def to_staging_row(execution: ParsedExecution) -> dict[str, Any]:
         # Kept with IBKR's own sign and meaning, like `quantity` above: staging
         # is the unedited copy, and normalisation happens on promotion.
         "fifo_pnl_realized": execution.fifo_pnl_realized,
+        "broker_cost": execution.broker_cost,
         "execution_time": execution.execution_time,
         "processed": False,
     }

@@ -317,6 +317,10 @@ class TestStagingRow:
         assert row["quantity"] == -50, "sign must survive into staging"
         assert row["processed"] is False
         assert sorted(row.keys()) == [
+            # IBKR's all-in acquisition cost for the fill (migration 024):
+            # notional + commission + tax. What lets an open position's basis
+            # tie to the statement without hardcoding a GST rate.
+            "broker_cost",
             "commission",
             "execution_time",
             # IBKR's own realised P&L for the fill (migration 023). Net of

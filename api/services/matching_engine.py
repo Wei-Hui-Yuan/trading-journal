@@ -213,66 +213,121 @@ class OpenExposure:
 
     # Signed: positive is long, negative is short.
     net_quantity: Decimal
-    # Average cost of what REMAINS, not of everything ever bought.
+    # Cost of the shares that REMAIN, on the same FIFO basis the broker uses,
+    # inclusive of the commission paid to acquire them.
     average_cost: Decimal
 
 
+@dataclass
+class _BasisLot:
+    """An unsold parcel of shares and what it actually cost to acquire.
+
+    `commission_per_share` is capitalised into the basis rather than expensed,
+    because that is what the broker does -- IBKR's reported cost basis for an
+    open position includes the commission paid to buy it. Held per share so a
+    partial sale takes the right fraction of it away with the shares.
+    """
+
+    remaining: Decimal
+    price: Decimal
+    commission_per_share: Decimal = Decimal("0")
+
+    @property
+    def unit_cost(self) -> Decimal:
+        # Commission is a COST (positive paid, negative rebate), so it adds.
+        # A rebated fill therefore sits marginally BELOW its trade price, which
+        # is exactly what the statement shows: MSFT's remaining lot reads
+        # 407.298903 against a 407.30 fill.
+        return self.price + self.commission_per_share
+
+
 def replay_open_exposure(
-    fills: Iterable[tuple[str, Decimal, Decimal]],
+    fills: Iterable[
+        tuple[str, Decimal, Decimal] | tuple[str, Decimal, Decimal, Decimal]
+    ],
 ) -> OpenExposure:
-    """Net position and average cost, replayed fill by fill in time order.
+    """Net position and cost of the remainder, replayed fill by fill in order.
 
-    Uses the AVERAGE-COST method, deliberately, because that is what the broker
-    reports and what the trader will compare against. The naive alternative --
-    averaging every same-direction fill -- ignores that some of those shares
-    have already been sold, and reports the cost of a position that no longer
-    exists: MSFT read 415.45, the mean of all 17 shares ever bought, when only
-    2 remained at 409.40.
+    FIFO, matching the broker. This used to use average-cost, on the stated
+    grounds that average-cost "is what the broker reports" -- and the claim was
+    never checked against a statement. It is wrong. IBKR reports a FIFO basis,
+    and the difference is not academic: on MSFT, FIFO says the 2 remaining
+    shares cost 407.30 and average-cost said 409.40, against a statement
+    reading 407.298903. Two dollars a share, on the figure the journal invites
+    you to reconcile.
 
-    Note this differs from the FIFO basis the matching engine uses to realise
-    P&L. They answer different questions. FIFO decides which lot a sale closes;
-    this reports what the untouched remainder cost on average. A trader
-    reconciling against IBKR wants the latter.
+    Its predecessor was worse still -- it averaged every same-direction fill,
+    counting shares already sold as though they were still held, and reported
+    415.45 for that same position. This is the second correction to the same
+    number, so the statement figure is now pinned in a test.
 
-    Reducing fills leave the average untouched -- selling half a position does
-    not change what the other half cost -- so only opening fills move it. A
-    fill that overshoots flat flips the position and starts a fresh basis at
-    its own price.
+    Commission is CAPITALISED into the basis, again because the broker does it:
+    a fill's commission is part of what the shares cost, and it travels with
+    them as they are consumed. Only the acquiring commission counts -- the
+    commission on a sale is a cost of exiting, already inside that sale's
+    realised P&L, and adding it here would charge it twice.
+
+    Reducing fills consume the oldest parcels first and leave the survivors'
+    cost untouched: selling half a position does not change what the other half
+    cost. A fill that overshoots flat flips the position and opens a fresh
+    parcel at its own price, carrying none of the old basis across.
     """
     position = Decimal("0")
-    cost = Decimal("0")
+    lots: deque[_BasisLot] = deque()
 
-    for direction, quantity, price in fills:
+    for fill in fills:
+        direction, quantity, price = fill[0], fill[1], fill[2]
+        # Optional so a caller with no commission data -- a backtest, a preview
+        # -- gets the price-only basis it always got rather than a crash.
+        commission = fill[3] if len(fill) > 3 else Decimal("0")
         if quantity is None or price is None:
             continue
         signed = quantity if (direction or BUY).upper() == BUY else -quantity
         if signed == 0:
             continue
 
+        per_share = (commission or Decimal("0")) / abs(signed)
+
         opening = position == 0 or (position > 0) == (signed > 0)
         if opening:
-            cost += abs(signed) * price
+            lots.append(_BasisLot(abs(signed), price, per_share))
             position += signed
             continue
 
-        # Reducing. Take the closed portion out at the current average so the
-        # remainder keeps the cost it always had.
-        closed = min(abs(signed), abs(position))
-        average = cost / abs(position)
-        cost -= closed * average
+        # Reducing. Retire the oldest parcels first; whatever is left keeps the
+        # cost it always had.
+        closing = min(abs(signed), abs(position))
+        left = closing
+        while left > 0 and lots:
+            lot = lots[0]
+            taken = min(left, lot.remaining)
+            lot.remaining -= taken
+            left -= taken
+            if lot.remaining == 0:
+                lots.popleft()
         position += signed
 
-        overshoot = abs(signed) - closed
+        overshoot = abs(signed) - closing
         if overshoot > 0:
-            # Crossed through flat: the excess opens the other way, and the old
-            # basis is not carried into a position of the opposite sign.
-            cost = overshoot * price
+            # Crossed through flat: the excess opens the other way, and none of
+            # the old basis survives into a position of the opposite sign.
+            lots.clear()
+            lots.append(_BasisLot(overshoot, price, per_share))
 
     if position == 0:
         return OpenExposure(Decimal("0"), Decimal("0"))
+
+    held = sum((lot.remaining for lot in lots), Decimal("0"))
+    if held == 0:
+        # Defensive: a net position with no parcels behind it would be a bug in
+        # the loop above, and reporting a division error is worse than
+        # reporting the position with no basis.
+        return OpenExposure(net_quantity=position, average_cost=Decimal("0"))
+
+    cost = sum((lot.remaining * lot.unit_cost for lot in lots), Decimal("0"))
     return OpenExposure(
         net_quantity=position,
-        average_cost=(cost / abs(position)).quantize(
+        average_cost=(cost / held).quantize(
             PRICE_PRECISION, rounding=ROUND_HALF_UP
         ),
     )
