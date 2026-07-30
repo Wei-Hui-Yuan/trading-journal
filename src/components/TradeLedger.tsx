@@ -607,6 +607,7 @@ export const TradeLedger: React.FC = () => {
   const [planError, setPlanError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
+  const [selectedStrategy, setSelectedStrategy] = useState<string>('all');
   // Which fill is being corrected, and the in-progress values. Kept as strings
   // for the same reason the manual form does: a controlled number input has to
   // represent "empty" and mid-typing states that Number() would mangle.
@@ -622,9 +623,16 @@ export const TradeLedger: React.FC = () => {
     return (roundTrips ?? []).filter((rt) => {
       if (filter === 'open' && rt.kind !== 'open') return false;
       if (filter === 'closed' && rt.kind !== 'closed') return false;
+      if (selectedStrategy === 'unassigned' && rt.strategy_id !== null) return false;
+      if (
+        selectedStrategy !== 'all' &&
+        selectedStrategy !== 'unassigned' &&
+        rt.strategy_id !== selectedStrategy
+      )
+        return false;
       return !term || rt.symbol.includes(term);
     });
-  }, [roundTrips, filter, query]);
+  }, [roundTrips, filter, query, selectedStrategy]);
 
   const openCount = useMemo(
     () => (roundTrips ?? []).filter((rt) => rt.kind === 'open').length,
@@ -743,6 +751,19 @@ export const TradeLedger: React.FC = () => {
             </button>
           ))}
         </div>
+        <select
+          value={selectedStrategy}
+          onChange={(e) => setSelectedStrategy(e.target.value)}
+          className="rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-[11px] uppercase tracking-wider text-obsidian-muted transition-colors focus:border-slate-600 focus:outline-none"
+        >
+          <option value="all">All Strategies</option>
+          <option value="unassigned">Unassigned</option>
+          {(strategies ?? []).map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
       </div>
 
       {deleteNotice && (
