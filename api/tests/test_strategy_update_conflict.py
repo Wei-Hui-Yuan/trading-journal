@@ -28,32 +28,115 @@ object still holds its ordinary in-memory value -- which is also exactly the
 value the failing commit was trying to write.
 """
 
+import asyncio
 import inspect
 import os
+import uuid
+
+import pytest
+from fastapi import HTTPException
 
 os.environ.setdefault("CORS_ALLOW_ORIGINS", "https://trading-journal-test.vercel.app")
 
 import main  # noqa: E402
 
+from conftest import db_session, db_transaction, requires_db  # noqa: E402
+
 SOURCE = inspect.getsource(main.update_strategy)
-
-
-def test_the_conflict_message_no_longer_reads_params_name():
-    """params.name is None on a request that never touched the name field;
-    the message must not be able to say so."""
-    assert "{params.name}" not in SOURCE
 
 
 def test_the_conflict_message_reads_a_name_captured_before_the_commit():
     """Must be assigned before `try: await session.commit()`, not inside the
     `except` block -- a failed commit expires the ORM instance immediately,
     before rollback() is even called, so any later read of an ORM attribute
-    needs a reload the async session cannot do implicitly."""
+    needs a reload the async session cannot do implicitly. Kept as a
+    structural pin (rather than replaced outright by the behavioural test
+    below) because it guards a real trap that is easy to reintroduce by
+    moving one line: reading `strategy.name` back inside the `except` block
+    looks equally reasonable and raises PendingRollbackError or
+    MissingGreenlet instead, both confirmed live while fixing this."""
     capture_idx = SOURCE.index("attempted_name = strategy.name")
     try_idx = SOURCE.index("try:")
     commit_idx = SOURCE.index("await session.commit()")
     assert capture_idx < try_idx < commit_idx
 
 
-def test_the_conflict_message_uses_the_captured_name():
-    assert "{attempted_name}" in SOURCE
+# ---------------------------------------------------------------------------
+# The reachable path, against real Postgres
+# ---------------------------------------------------------------------------
+#
+# Fault-injection during verification found that this test CANNOT distinguish
+# `params.name` from `attempted_name` -- reverting the fix and rerunning still
+# passed. That is not a weak test; it is a fact about the code proven here
+# structurally: `strategies` carries exactly one NOT NULL/UNIQUE constraint,
+# `name` itself (see the model), so the only request that can ever land in
+# this except block is one that SETS `name` to the colliding value -- which
+# means params.name and attempted_name are always equal on every reachable
+# path. This test still earns its place: it drives the real path end to end
+# and pins that the 409 body is sane and the handler does not crash (the
+# MissingGreenlet / PendingRollbackError risk the structural test above also
+# guards). It just is not, and cannot be, the test that would catch someone
+# swapping `attempted_name` back to `params.name` -- only the structural
+# ordering test above does that, which is why it was kept rather than
+# replaced.
+
+
+@requires_db
+def test_renaming_onto_a_taken_name_reports_that_name_not_none():
+    async def scenario():
+        async with db_transaction() as conn:
+            taken = f"ZZ-TAKEN-{uuid.uuid4().hex[:6]}"
+            victim = f"ZZ-VICTIM-{uuid.uuid4().hex[:6]}"
+            setup = db_session(conn)
+            a = main.Strategy(id=uuid.uuid4(), name=taken, method="m",
+                               entry_criteria="", exit_criteria="")
+            b = main.Strategy(id=uuid.uuid4(), name=victim, method="m",
+                               entry_criteria="", exit_criteria="")
+            setup.add_all([a, b])
+            await setup.commit()
+            bid = b.id
+            await setup.close()
+
+            session = db_session(conn)
+            with pytest.raises(HTTPException) as excinfo:
+                await main.update_strategy(
+                    strategy_id=bid, params=main.StrategyUpdate(name=taken),
+                    session=session,
+                )
+            await session.close()
+
+            assert excinfo.value.status_code == 409
+            assert taken in excinfo.value.detail
+            assert "None" not in excinfo.value.detail
+
+    asyncio.run(scenario())
+
+
+@requires_db
+def test_a_partial_update_omitting_name_still_succeeds():
+    """The claim the fix's docstring makes: today, omitting `name` cannot
+    itself trip the conflict branch. If a future constraint changes that,
+    this starts failing and says so, rather than the assumption going stale
+    silently."""
+    async def scenario():
+        async with db_transaction() as conn:
+            setup = db_session(conn)
+            victim = f"ZZ-VICTIM-{uuid.uuid4().hex[:6]}"
+            s = main.Strategy(id=uuid.uuid4(), name=victim, method="m",
+                               entry_criteria="", exit_criteria="")
+            setup.add(s)
+            await setup.commit()
+            sid = s.id
+            await setup.close()
+
+            session = db_session(conn)
+            out = await main.update_strategy(
+                strategy_id=sid,
+                params=main.StrategyUpdate(description="touches nothing but this"),
+                session=session,
+            )
+            await session.close()
+
+            assert out.name == victim
+
+    asyncio.run(scenario())

@@ -766,16 +766,33 @@ class IngestResult(BaseModel):
     # currency conversions in a multi-currency account, which outnumbered the
     # real fills and would otherwise each become a position.
     skipped_non_tradeable: int
-    # Genuine fills IBKR reported with no execution time. Promoting one with a
-    # fabricated `datetime.now()` would insert it whenever this sync happened
-    # to run rather than when it actually filled, corrupting FIFO match order
-    # and misplacing it on the heatmap. Left unpromoted and unprocessed
-    # instead, so a future sync with a corrected statement can pick it up.
+    # Genuine fills IBKR reported with no execution time, THIS RUN. Promoting
+    # one with a fabricated `datetime.now()` would insert it whenever this
+    # sync happened to run rather than when it actually filled, corrupting
+    # FIFO match order and misplacing it on the heatmap. Left unpromoted and
+    # unprocessed instead, so a future sync with a corrected statement can
+    # pick it up. Can overlap with skipped_unpriced below -- a fill missing
+    # both fields counts in both.
     skipped_undated: int = 0
-    # Genuine fills with no price. Same treatment: promoting one would price
-    # the trade at 0, so it is left out of `trades` and its staging row left
-    # unprocessed rather than marked done for work that was never performed.
+    # Genuine fills with no price, THIS RUN. Same treatment: promoting one
+    # would price the trade at 0, so it is left out of `trades` and its
+    # staging row left unprocessed rather than marked done for work that was
+    # never performed.
     skipped_unpriced: int = 0
+    # The true number of fills not promoted THIS RUN -- the union of the two
+    # counters above, not their sum. A fill missing both price and
+    # execution_time is one skipped fill, not two, and this is the number that
+    # answers "how many fills did this sync actually fail to import".
+    skipped_unusable: int = 0
+    # How many staging rows, RIGHT NOW, can never earn `processed = True` --
+    # queried fresh each sync rather than counted from this run's statement,
+    # because the condition is standing, not an event. Stays nonzero across
+    # every subsequent sync until IBKR resends the fill corrected or it is
+    # added by hand via the repair-fill modal. See `_stranded_fills`.
+    stranded_fills: int = 0
+    # The distinct tickers those rows belong to, so the user knows where to
+    # look without a database query.
+    stranded_symbols: list[str] = []
     # Queries that did not return this run -- IBKR rate-limits report
     # generation per token, and its cooldown outlasts a request. Reported
     # rather than swallowed so a partial sync never looks like a full one.
@@ -809,14 +826,30 @@ class IngestResult(BaseModel):
     symbols_recovered: list[str] = []
 
 
+def _promoted_into_trades():
+    """True exactly when some `trades` row was promoted from this staging row.
+
+    The one definition of "promoted", shared by the processed-flag update in
+    `ingest_ibkr` and the resume/stranded split below. They must never drift
+    onto different predicates -- if the update used a looser one than this
+    function, it could mark a row `processed` that this function still
+    considers outstanding, or vice versa, and the two would disagree about
+    which rows still need attention.
+    """
+    return exists().where(
+        Trade.ibkr_exec_id == "IBKR-" + IBKRExecution.transaction_id
+    )
+
+
 async def _symbols_awaiting_match(session: AsyncSession) -> list[str]:
-    """Tickers with staged fills that no position has been built from yet.
+    """Tickers with staged fills that were promoted but no position built yet.
 
     The resume set. A staging row is marked `processed` only after FIFO has run
-    for its symbol, so anything still unmarked is work an earlier run started
-    and did not finish -- promoted into `trades`, then interrupted before the
-    round trips were built. Migration 005 added the column for exactly this and
-    indexed it; it was simply being set too early to serve.
+    for its symbol, so anything still unmarked AND backed by a `trades` row is
+    work an earlier run started and did not finish -- promoted, then
+    interrupted before the round trips were built. Migration 005 added the
+    column for exactly this and indexed it; it was simply being set too early
+    to serve.
 
     Deliberately not "every ticker with a fill that has no position_fills row".
     That reads as the same question and is not: an OPEN position's fills have
@@ -827,6 +860,13 @@ async def _symbols_awaiting_match(session: AsyncSession) -> list[str]:
     round trips per sync that buys nothing. The queries themselves are within
     5ms of each other; the waste is the work they trigger, and it grows with
     the number of positions held open.
+
+    Also deliberately not "every unprocessed staging row" any more. A row with
+    no execution_time or no price is unprocessed forever -- ingest_ibkr's step
+    4 promotes neither into `trades` on purpose -- and including it here fed it
+    into `recovered`, which told the UI a ticker's fills "were imported but
+    never matched" when they were never imported at all. See
+    `_stranded_fills` for that set.
     """
     return sorted(
         set((
@@ -834,11 +874,69 @@ async def _symbols_awaiting_match(session: AsyncSession) -> list[str]:
                 select(IBKRExecution.symbol)
                 # `is_not(True)`, not `== False`: the column is nullable and a
                 # NULL means "never marked", which is the state being sought.
-                .where(IBKRExecution.processed.is_not(True))
+                .where(
+                    IBKRExecution.processed.is_not(True),
+                    _promoted_into_trades(),
+                )
                 .distinct()
             )
         ).scalars().all())
     )
+
+
+async def _stranded_fills(session: AsyncSession) -> list[str]:
+    """One symbol per staging row stranded by a data-quality problem IBKR sent.
+
+    Deliberately narrower than "unprocessed and no backing trade" -- that
+    weaker predicate also matches a fill that WAS priced and dated, WAS
+    promoted, and was then deliberately deleted: `delete_trade` removes the
+    `trades` row and tombstones it in `suppressed_executions`, but never
+    touches the staging row, so an execution deleted before its symbol's
+    processed-flag update could run (an ingest crash mid-run, followed by the
+    user deleting the just-promoted trade before the next sync resumes it) is
+    unprocessed with no backing trade for a reason that has nothing to do with
+    what IBKR sent. Requiring price or execution_time to actually be NULL is
+    what distinguishes "IBKR never gave us enough to import this" from "this
+    was imported and removed on purpose" -- a suppressed fill like that now
+    matches neither this function nor `_symbols_awaiting_match`, which is
+    correct: there is nothing left to report about it either way.
+
+    A hand-repair does not clear a genuine match here: the repair-fill modal
+    mints a fresh `REPAIR-<uuid>` id for the correction, never
+    `IBKR-<transaction_id>`, so it cannot satisfy `_promoted_into_trades()`.
+    The only way one of these clears is IBKR resending the same
+    transaction_id with the missing field filled in, inside the rolling Flex
+    query window.
+
+    Returns one entry per stranded ROW, not deduplicated by symbol -- callers
+    read `len(...)` as the fill count and `sorted(set(...))` as the affected
+    tickers, without a second query.
+    """
+    return (
+        await session.execute(
+            select(IBKRExecution.symbol).where(
+                IBKRExecution.processed.is_not(True),
+                or_(
+                    IBKRExecution.price.is_(None),
+                    IBKRExecution.execution_time.is_(None),
+                ),
+                ~_promoted_into_trades(),
+            )
+        )
+    ).scalars().all()
+
+
+async def _stranded_summary(session: AsyncSession) -> tuple[int, list[str]]:
+    """(count, symbols) for `_stranded_fills`, queried fresh.
+
+    The STANDING total `IngestResult.stranded_fills` / `stranded_symbols`
+    report -- not a per-run delta like `skipped_undated` / `skipped_unpriced`
+    below, which count only what THIS run's statement contained. A stranded
+    row sits in the ledger across every sync until it is resolved, so the
+    count queried here does too.
+    """
+    rows = await _stranded_fills(session)
+    return len(rows), sorted(set(rows))
 
 
 @app.post(
@@ -884,6 +982,10 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
 
     executions = list(merged.values())
     if not executions:
+        # Queried even on an empty run: stranded_fills is a standing condition
+        # of the ledger, not an event this run produced, so it must not go
+        # quiet just because IBKR had nothing new to report.
+        stranded_count, stranded_syms = await _stranded_summary(session)
         return IngestResult(
             executions_parsed=0,
             staged_new=0,
@@ -897,6 +999,8 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             rate_limited=any(
                 ibkr_client.is_transient_failure(f) for f in query_failures
             ),
+            stranded_fills=stranded_count,
+            stranded_symbols=stranded_syms,
         )
 
     # --- 3: stage, skipping anything already seen -------------------------
@@ -976,6 +1080,12 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     # later statement carrying the correction is not treated as a duplicate.
     skipped_undated_execs = [e for e in new_executions if e.execution_time is None]
     skipped_unpriced_execs = [e for e in new_executions if e.price is None]
+    # The union, not the sum of the two lists above -- a fill missing both
+    # fields appears in both and must still count once here.
+    skipped_unusable_execs = [
+        e for e in new_executions
+        if e.execution_time is None or e.price is None
+    ]
     if skipped_undated_execs:
         logger.error(
             "Ingest: %d execution(s) had no execution_time and were not "
@@ -1086,30 +1196,36 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         positions_removed += result.positions_removed
         reviews_discarded += result.reviews_discarded
 
-    # Only now, and only rows a trade actually exists for. A staged row earns
-    # `processed = True` by being promoted into `trades` -- not by being
-    # staged (an unpriced or undated fill is staged but deliberately never
-    # promoted, above; marking it processed here would be I6 again: the next
-    # sync would see a duplicate in staging, not the still-missing fill it
-    # actually is) and not by its ticker being one of `recovered` (that set is
-    # scoped by symbol, and a symbol can hold both promoted and permanently
-    # unpromotable rows side by side -- scoping this update the same way would
-    # sweep the unpromoted one up as a side effect of its neighbours
-    # resolving). Its own commit, after the loop, so a crash at any point
-    # above leaves the flag unset and the next sync picks the work back up.
+    # Only now, and only rows `_promoted_into_trades()` actually finds a
+    # `trades` row for. A staged row earns `processed = True` by being
+    # promoted -- not by being staged (an unpriced or undated fill is staged
+    # but deliberately never promoted, above; marking it processed here would
+    # be I6 again: the next sync would see a duplicate in staging, not the
+    # still-missing fill it actually is) and not by its ticker being one of
+    # `symbols` alone (a symbol can hold both promoted and permanently
+    # unpromotable rows side by side, and `symbols` is scoped by ticker, not
+    # by row -- the EXISTS check is what keeps this update from sweeping the
+    # unpromoted one up as a side effect of its neighbours resolving; as of
+    # the resume/stranded split above, `_symbols_awaiting_match` also no
+    # longer offers a permanently-stranded ticker as a reason to re-touch this
+    # symbol, but the EXISTS check remains the actual guarantee, not that).
+    # Its own commit, after the loop, so a crash at any point above leaves the
+    # flag unset and the next sync picks the work back up.
     if symbols:
         await session.execute(
             update(IBKRExecution)
             .where(
                 IBKRExecution.symbol.in_(symbols),
                 IBKRExecution.processed.is_not(True),
-                exists().where(
-                    Trade.ibkr_exec_id == "IBKR-" + IBKRExecution.transaction_id
-                ),
+                _promoted_into_trades(),
             )
             .values(processed=True)
         )
         await session.commit()
+
+    # Queried fresh after the update above, so a row THIS run just promoted
+    # (and is therefore no longer stranded) is not still counted.
+    stranded_count, stranded_syms = await _stranded_summary(session)
 
     return IngestResult(
         executions_parsed=len(executions),
@@ -1122,6 +1238,9 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         skipped_non_tradeable=skipped_non_tradeable,
         skipped_undated=len(skipped_undated_execs),
         skipped_unpriced=len(skipped_unpriced_execs),
+        skipped_unusable=len(skipped_unusable_execs),
+        stranded_fills=stranded_count,
+        stranded_symbols=stranded_syms,
         queries_failed=query_failures,
         rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
         suppressed_skipped=resurrected,

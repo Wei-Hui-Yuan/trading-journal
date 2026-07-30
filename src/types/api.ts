@@ -262,6 +262,31 @@ export interface IngestResult {
    */
   skipped_non_tradeable: number;
   /**
+   * Fills IBKR reported THIS RUN with no execution time. Promoting one with a
+   * fabricated "now" would corrupt FIFO match order and misplace it on the
+   * heatmap, so it is left out of the ledger entirely rather than guessed at.
+   * Can overlap with skipped_unpriced — a fill missing both counts in both.
+   */
+  skipped_undated?: number;
+  /** Fills reported THIS RUN with no price. Same treatment, same reason. */
+  skipped_unpriced?: number;
+  /**
+   * The true count of fills not imported THIS RUN — the union of the two
+   * counters above, not their sum, so a fill missing both fields is not
+   * double-counted.
+   */
+  skipped_unusable?: number;
+  /**
+   * How many fills, RIGHT NOW, can never be imported without help — queried
+   * fresh every sync rather than counted from this run alone, because the
+   * condition is standing, not an event. Stays nonzero on every subsequent
+   * sync until IBKR resends the fill corrected, or it is added by hand via
+   * the repair-fill modal.
+   */
+  stranded_fills?: number;
+  /** The distinct tickers those fills belong to. */
+  stranded_symbols?: string[];
+  /**
    * Queries that did not return on this run. IBKR rate-limits report
    * generation per token and its cooldown outlasts a request, so a sync can
    * legitimately return part of the picture — this says which part is missing

@@ -15,10 +15,11 @@ would be easy to simplify back into a bug:
     executions underneath, for a round trip that never happened.
 """
 
-import inspect
+import asyncio
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -26,6 +27,8 @@ from pydantic import ValidationError
 os.environ.setdefault("CORS_ALLOW_ORIGINS", "https://trading-journal-test.vercel.app")
 
 import main  # noqa: E402
+
+from conftest import db_session, db_transaction, requires_db  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -146,30 +149,186 @@ def test_position_delete_reports_executions_not_just_the_row():
 # review gone, and (for update_execution) a fill sitting there edited with no
 # positions describing it at all.
 #
-# Verified live against Supabase: wrapping session.commit with a call-counting
-# spy during a real update_execution and a real delete_trade shows exactly
-# one call in each, where the unfixed code made two. The savepoint-rollback
-# pattern used for the DB checks elsewhere in this suite cannot observe this
-# property at all -- join_transaction_mode="create_savepoint" turns every
+# These tests simulate exactly that crash -- monkeypatching
+# `run_matching_for_ticker` to raise partway through the handler -- and check
+# what a real Postgres transaction did about it, not what the source text
+# says. Each has a CONTROL that reproduces the UNFIXED ordering (commit, then
+# crash) and asserts it DOES lose the data; without that control a test that
+# merely finds the position still present after the fixed code proves
+# nothing about whether it would have caught a regression.
+#
+# The commit message on the original fix claimed the savepoint-rollback
+# pattern used elsewhere in this suite "cannot observe this property at all",
+# reasoning that join_transaction_mode="create_savepoint" turns every
 # commit() into a savepoint release, so a two-commit sequence and a
-# one-commit sequence are undone identically by the outer rollback. Counting
-# calls during a real invocation is the only way to see the difference, which
-# is why this is pinned here structurally instead.
+# one-commit sequence are undone identically by the outer rollback. That is
+# incorrect, and the fixture setup below is exactly why: an EARLY commit
+# releases the savepoint holding the fixture rows, which makes them part of
+# the OUTER transaction and therefore durable across the handler session's
+# own close(); without that early commit, close() rolls back only the
+# handler's savepoint and the fixture rows are untouched. The difference is
+# visible as long as the fixture is committed in a session that predates the
+# one under test -- see `_build_closed_round_trip` below.
 
 
-def _between(source: str, start_marker: str, end_marker: str) -> str:
-    start = source.index(start_marker)
-    end = source.index(end_marker, start)
-    return source[start:end]
+async def _build_closed_round_trip(conn) -> tuple[uuid.UUID, uuid.UUID]:
+    """A closed round trip with a review, committed into the OUTER
+    transaction (not left in a savepoint the handler's own close() would
+    undo). Returns (open_trade_id, position_id).
+    """
+    setup = db_session(conn)
+    sym = f"ZZ{uuid.uuid4().hex[:6].upper()}"[:10]
+    now = datetime.now(main.MARKET_TZ)
+    open_id, close_id, pos_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    setup.add_all([
+        main.Trade(
+            id=open_id, ibkr_exec_id=f"IBKR-{uuid.uuid4().hex[:12]}", ticker=sym,
+            direction="BUY", style="Unclassified", quantity=Decimal("10"),
+            actual_entry=Decimal("100"), entry_date=now - timedelta(days=2),
+            source_tag="IBKR",
+        ),
+        main.Trade(
+            id=close_id, ibkr_exec_id=f"IBKR-{uuid.uuid4().hex[:12]}", ticker=sym,
+            direction="SELL", style="Unclassified", quantity=Decimal("10"),
+            actual_entry=Decimal("110"), entry_date=now - timedelta(days=1),
+            source_tag="IBKR",
+        ),
+    ])
+    await setup.flush()
+    setup.add(main.Position(
+        id=pos_id, symbol=sym, direction="LONG", style="Unclassified",
+        quantity=Decimal("10"), entry_price=Decimal("100"), exit_price=Decimal("110"),
+        entry_time=now - timedelta(days=2), exit_time=now - timedelta(days=1),
+        realized_pnl=Decimal("100"), gross_pnl=Decimal("100"), commission=Decimal("0"),
+        open_trade_id=open_id, close_trade_id=close_id,
+        review_status="reviewed", review_went_well="must survive a crashed rebuild",
+    ))
+    await setup.flush()
+    setup.add_all([
+        main.PositionFill(
+            id=uuid.uuid4(), position_id=pos_id, trade_id=open_id, role="OPEN",
+            quantity=Decimal("10"), price=Decimal("100"), executed_at=now - timedelta(days=2),
+        ),
+        main.PositionFill(
+            id=uuid.uuid4(), position_id=pos_id, trade_id=close_id, role="CLOSE",
+            quantity=Decimal("10"), price=Decimal("110"), executed_at=now - timedelta(days=1),
+        ),
+    ])
+    await setup.flush()
+    await setup.commit()
+    await setup.close()
+    return open_id, pos_id
 
 
-def test_update_execution_has_no_commit_between_the_delete_and_the_rebuild():
-    source = inspect.getsource(main.update_execution)
-    between = _between(source, "delete(Position)", "run_matching_for_ticker(")
-    assert "session.commit()" not in between
+async def _survives(conn, open_id, pos_id) -> tuple[bool, bool, str | None]:
+    """(position survived, trade survived, its review text) from a session
+    that has seen none of the handler-under-test's work."""
+    check = db_session(conn)
+    pos = (await check.execute(
+        main.select(main.Position.id, main.Position.review_went_well)
+        .where(main.Position.id == pos_id)
+    )).first()
+    trade = (await check.execute(
+        main.select(main.Trade.id).where(main.Trade.id == open_id)
+    )).first()
+    await check.close()
+    return pos is not None, trade is not None, (pos.review_went_well if pos else None)
 
 
-def test_delete_trade_has_no_commit_between_the_delete_and_the_rebuild():
-    source = inspect.getsource(main.delete_trade)
-    between = _between(source, "await session.delete(trade)", "run_matching_for_ticker(")
-    assert "session.commit()" not in between
+def _crash_matching(monkeypatch, session, *, commit_first: bool):
+    """Make run_matching_for_ticker raise, optionally after a commit --
+    `commit_first=True` reproduces the UNFIXED ordering (delete committed,
+    then the rebuild dies); `commit_first=False` is what the current handlers
+    actually do."""
+    import services.matching_engine as me
+
+    async def boom(*a, **k):
+        if commit_first:
+            await session.commit()
+        raise RuntimeError("simulated crash during rebuild")
+
+    monkeypatch.setattr(me, "run_matching_for_ticker", boom)
+
+
+@requires_db
+def test_update_execution_keeps_its_positions_if_the_rebuild_crashes(monkeypatch):
+    async def scenario():
+        async with db_transaction() as conn:
+            open_id, pos_id = await _build_closed_round_trip(conn)
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=False)
+
+            with pytest.raises(RuntimeError):
+                await main.update_execution(
+                    trade_id=open_id, params=main.ExecutionUpdate(price=105.0),
+                    session=session,
+                )
+            await session.close()
+
+            pos_ok, trade_ok, review = await _survives(conn, open_id, pos_id)
+            assert pos_ok, "the position must survive a crash before any commit"
+            assert trade_ok
+            assert review == "must survive a crashed rebuild"
+
+    asyncio.run(scenario())
+
+
+@requires_db
+def test_update_execution_control_loses_its_positions_with_the_unfixed_ordering(monkeypatch):
+    """The control: prove this probe CAN see the bug, by reproducing it."""
+    async def scenario():
+        async with db_transaction() as conn:
+            open_id, pos_id = await _build_closed_round_trip(conn)
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=True)
+
+            with pytest.raises(RuntimeError):
+                await main.update_execution(
+                    trade_id=open_id, params=main.ExecutionUpdate(price=105.0),
+                    session=session,
+                )
+            await session.close()
+
+            pos_ok, trade_ok, _review = await _survives(conn, open_id, pos_id)
+            assert not pos_ok, "the control must actually lose the position"
+
+    asyncio.run(scenario())
+
+
+@requires_db
+def test_delete_trade_keeps_its_positions_if_the_rebuild_crashes(monkeypatch):
+    async def scenario():
+        async with db_transaction() as conn:
+            open_id, pos_id = await _build_closed_round_trip(conn)
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=False)
+
+            with pytest.raises(RuntimeError):
+                await main.delete_trade(trade_id=open_id, reason="probe", session=session)
+            await session.close()
+
+            pos_ok, trade_ok, review = await _survives(conn, open_id, pos_id)
+            assert pos_ok, "the position must survive a crash before any commit"
+            assert trade_ok, "the trade itself must not have been deleted either"
+            assert review == "must survive a crashed rebuild"
+
+    asyncio.run(scenario())
+
+
+@requires_db
+def test_delete_trade_control_loses_its_positions_with_the_unfixed_ordering(monkeypatch):
+    async def scenario():
+        async with db_transaction() as conn:
+            open_id, pos_id = await _build_closed_round_trip(conn)
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=True)
+
+            with pytest.raises(RuntimeError):
+                await main.delete_trade(trade_id=open_id, reason="probe", session=session)
+            await session.close()
+
+            pos_ok, _trade_ok, _review = await _survives(conn, open_id, pos_id)
+            assert not pos_ok, "the control must actually lose the position"
+
+    asyncio.run(scenario())

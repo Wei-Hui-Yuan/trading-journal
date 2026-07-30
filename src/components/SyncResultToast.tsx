@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, Check, Clock, X, XCircle } from 'lucide-react';
+import { AlertTriangle, Check, Clock, Wrench, X, XCircle } from 'lucide-react';
 
 import { useAcknowledgeSync, useLastSync } from '@/hooks/useTradeInbox';
 
@@ -201,6 +201,36 @@ export const SyncResultToast: React.FC = () => {
                   {result.symbols_recovered!.join(', ')} had fills imported but
                   never matched into round trips. They are counted now, so your
                   totals have changed.
+                </p>
+              )}
+
+              {/* A STANDING condition, not a per-sync event — deliberately
+                  distinct in wording and styling from "Recovered" above. That
+                  banner reports fills that WERE imported and just got matched
+                  late; this one reports fills that were never imported at
+                  all, and says so on every sync until a human resolves it.
+                  Neither the wrench icon nor "the repair-fill modal" phrase
+                  is decorative: this is the same fix path TradeLedger already
+                  points to for a hand-typed correction. */}
+              {(result.stranded_fills ?? 0) > 0 && (
+                <p className="mt-3 rounded-lg border border-slate-600/40 bg-slate-800/40 px-2.5 py-2 text-[11px] leading-relaxed text-slate-300">
+                  <span className="inline-flex items-center gap-1 font-semibold text-slate-200">
+                    <Wrench className="h-3 w-3 shrink-0" />
+                    {result.stranded_fills} fill
+                    {result.stranded_fills === 1 ? '' : 's'} still cannot be
+                    imported.
+                  </span>{' '}
+                  IBKR sent{' '}
+                  {result.stranded_fills === 1 ? 'it' : 'them'} with no price,
+                  no execution time, or another data issue, so{' '}
+                  {result.stranded_fills === 1 ? 'it is' : 'they are'} not in
+                  the ledger and not counted in any figure above.{' '}
+                  {(result.stranded_symbols?.length ?? 0) > 0 && (
+                    <>Affects {result.stranded_symbols!.join(', ')}. </>
+                  )}
+                  Add {result.stranded_fills === 1 ? 'it' : 'them'} by hand
+                  from the repair-fill modal, or wait for IBKR to resend a
+                  corrected statement — this will keep showing up until then.
                 </p>
               )}
 
