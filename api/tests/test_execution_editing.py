@@ -73,6 +73,41 @@ def test_empty_update_is_distinguishable_from_a_field_set_to_none():
     assert "execution_time" in explicit.model_fields_set
 
 
+@requires_db
+def test_clearing_the_execution_time_is_refused_before_anything_is_touched():
+    """`trades.entry_date` is NOT NULL, and the test above is exactly why an
+    explicit null gets this far: the field is Optional so it can be OMITTED,
+    and ExecutionUpdatePayload types it `string | null`.
+
+    Assigning it through reached the driver as a not-null violation and came
+    back as an opaque 500 -- and it did so AFTER the round trips built on this
+    fill had been deleted in the same handler. The transaction rolls that back,
+    so nothing was lost, but the user was told "internal error" for a request
+    the API could have named the problem with.
+    """
+    async def scenario():
+        async with db_transaction() as conn:
+            open_id, pos_id = await _build_closed_round_trip(conn)
+            session = db_session(conn)
+
+            with pytest.raises(main.HTTPException) as caught:
+                await main.update_execution(
+                    trade_id=open_id,
+                    params=main.ExecutionUpdate(execution_time=None),
+                    session=session,
+                )
+            await session.close()
+
+            assert caught.value.status_code == 422, "not a 500"
+            assert "execution_time" in caught.value.detail
+
+            pos_ok, trade_ok, _ = await _survives(conn, open_id, pos_id)
+            assert pos_ok, "refused before the positions were deleted"
+            assert trade_ok
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Suppression — what makes a deletion stick
 # ---------------------------------------------------------------------------

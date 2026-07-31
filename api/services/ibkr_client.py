@@ -66,6 +66,32 @@ SEND_RETRY_DELAY_SECONDS = 5.0
 # per-token rate limit rather than tripping it and recovering.
 BETWEEN_QUERIES_SECONDS = 3.0
 
+# Ceiling on the whole handshake, across every configured query.
+#
+# WHY A BUDGET AND NOT A LONGER CLIENT TIMEOUT. One query's worst case is
+# already ~266s: 3 SendRequest attempts (2 x 5s backoff, each with a 30s HTTP
+# timeout) plus 5 GetStatement polls (4 x 4s backoff, same timeout). Every
+# second of that is legitimate -- IBKR compiles the report on demand. But
+# IBKR_QUERY_ID takes a LIST, and running two is the documented configuration,
+# so the honest worst case is ~535s. The browser gives up at 300s.
+#
+# What that costs is not the wait, it is the reporting. A client-side timeout
+# throws away a run that had not failed: IBKR was already asked to compile the
+# report, fills may have been staged, and the user is told "no response from
+# the server" about work whose outcome is simply unknown to them.
+#
+# Bounding the SERVER instead makes the endpoint answer within the client's
+# window by construction, and a query that runs out of budget lands in the
+# partial-result path that already exists -- reported in `queries_failed`,
+# rendered by the sync toast, and picked up by the next run, because ingestion
+# is idempotent. 240s leaves the request headroom for the staging, promotion
+# and FIFO work that follows the fetch.
+#
+# The real fix remains a 202 with a job id to poll: a request whose duration is
+# bounded by a third party's compile time does not belong in a synchronous
+# round trip. This makes the synchronous version honest until then.
+TOTAL_BUDGET_SECONDS = 240.0
+
 
 class IBKRError(RuntimeError):
     """Any failure talking to the Flex service."""
@@ -221,6 +247,11 @@ async def fetch_statements(
     would routinely return nothing at all. Reporting the failure alongside the
     partial result keeps that visible instead of silently losing a date range,
     and ingestion is idempotent so the next run fills the gap.
+
+    The whole loop is bounded by TOTAL_BUDGET_SECONDS. A query that exhausts it
+    is reported exactly like one IBKR refused -- the caller already knows how to
+    render a partial run, and a timeout the server names is worth far more than
+    one the browser discovers.
     """
     if token is None or query_ids is None:
         token, query_ids = get_credentials()
@@ -228,12 +259,46 @@ async def fetch_statements(
     statements: list[tuple[str, ET.Element]] = []
     failures: list[str] = []
 
+    deadline = asyncio.get_running_loop().time() + TOTAL_BUDGET_SECONDS
+
     for index, query_id in enumerate(query_ids):
         # Space the requests out. Cheaper to wait than to trip the limit.
         if index:
             await asyncio.sleep(BETWEEN_QUERIES_SECONDS)
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            logger.warning(
+                "IBKR query %s skipped: the %.0fs budget was spent on earlier "
+                "queries", query_id, TOTAL_BUDGET_SECONDS,
+            )
+            failures.append(
+                f"query {query_id}: skipped, the {TOTAL_BUDGET_SECONDS:.0f}s "
+                "budget for this sync was already spent. Run the sync again."
+            )
+            continue
+
+        # Divided by what is LEFT to run, so one slow query cannot starve the
+        # rest -- and so the common case, where a query returns in seconds,
+        # still hands its unused share to the next one.
+        share = remaining / (len(query_ids) - index)
+
         try:
-            statements.append((query_id, await fetch_statement(token, query_id)))
+            statements.append(
+                (query_id, await asyncio.wait_for(
+                    fetch_statement(token, query_id), timeout=share
+                ))
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "IBKR query %s gave up after %.0fs of its share of the sync "
+                "budget", query_id, share,
+            )
+            failures.append(
+                f"query {query_id}: IBKR had not returned a statement after "
+                f"{share:.0f}s. This usually means the report is still "
+                "compiling -- run the sync again shortly."
+            )
         except IBKRError as exc:
             logger.warning("IBKR query %s failed: %s", query_id, exc)
             failures.append(f"query {query_id}: {exc}")

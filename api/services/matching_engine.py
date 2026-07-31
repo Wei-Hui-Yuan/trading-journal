@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,18 @@ PRICE_PRECISION = Decimal("0.0001")
 # across the legs it covers divides, so the result must be quantized somewhere;
 # doing it once per round trip keeps gross - commission = net exact.
 MONEY_PRECISION = Decimal("0.0001")
+
+# How far the broker-implied all-in cost may sit from the commission we know
+# about before it is refused. See _plug_is_plausible.
+#
+# The charges this is meant to absorb -- exchange, clearing, SEC Section 31,
+# FINRA TAF -- are a few basis points of notional at most; measured on this
+# account they run about 5.3c per closing fill. 0.5% of the leg's notional is
+# roughly a hundred times that rate, so a genuine fee can never trip it, and
+# the flat floor keeps a small fill from being judged on a denominator of a few
+# dollars.
+PLUG_TOLERANCE_RATE = Decimal("0.005")
+PLUG_TOLERANCE_FLOOR = Decimal("1.00")
 
 
 @dataclass(frozen=True)
@@ -333,6 +345,44 @@ def replay_open_exposure(
     )
 
 
+def _plug_is_plausible(all_in: Decimal, fill_legs: list[_Leg]) -> bool:
+    """Whether `our_gross - broker_realized_pnl` can honestly be a cost.
+
+    The subtraction in _reconcile_to_broker assumes both sides describe the
+    SAME shares. When they do, the remainder is fees and lands within a few
+    cents of the commission already apportioned. When they do not, it is the
+    difference between two unrelated P&L figures, and booking it as commission
+    is not a rounding error -- it rewrites the trade.
+
+    That mismatch is reachable in this ledger, by two routes that already
+    exist:
+
+      * A stranded staging row. Ingest deliberately refuses to promote a fill
+        with no price or no execution_time (there is no honest value to invent),
+        and reports the backlog as `stranded_fills` on every sync. If the
+        stranded one is an OPENING fill, its ticker's closing fill still
+        arrives carrying IBKR's figure for shares this ledger cannot see.
+      * A position opened before the Flex window. The query reaches back a
+        year; a holding older than that has no opening fill here at all.
+
+    Measured on the first case: our gross for the 5 shares we knew about was
+    +50.00, IBKR's figure for its own 10 was +98.90, and the plug booked
+    -48.90 as commission -- a fabricated rebate that dragged the leg's stored
+    realised P&L up to 98.90, double what those shares actually made.
+
+    Bounded against NOTIONAL rather than against gross P&L. Gross is near zero
+    on a scratch trade, and a bound that collapses there would reject the fees
+    on exactly the trades whose fees matter most relative to the result.
+    Notional is what the regulatory charges are actually levied on.
+    """
+    notional = sum(
+        (leg.exit_price * leg.quantity for leg in fill_legs), Decimal("0")
+    )
+    ib_commission = sum((leg.ib_commission for leg in fill_legs), Decimal("0"))
+    tolerance = abs(notional) * PLUG_TOLERANCE_RATE + PLUG_TOLERANCE_FLOOR
+    return abs(all_in - ib_commission) <= tolerance
+
+
 def _reconcile_to_broker(
     legs: list[_Leg], executions: dict[uuid.UUID, Execution]
 ) -> None:
@@ -366,6 +416,9 @@ def _reconcile_to_broker(
     rather than hidden: `broker_realized_pnl` stays None on those legs, and the
     coverage is surfaced so a journal cannot quietly under-charge fees on rows
     it could not verify.
+
+    A figure that cannot be a fee is refused the same way -- see
+    _plug_is_plausible for why that is not a theoretical case here.
     """
     by_close: dict[uuid.UUID, list[_Leg]] = {}
     for leg in legs:
@@ -378,6 +431,26 @@ def _reconcile_to_broker(
 
         gross = sum((leg.gross_pnl for leg in fill_legs), Decimal("0"))
         all_in = gross - execution.broker_realized_pnl
+
+        if not _plug_is_plausible(all_in, fill_legs):
+            # Left on the apportioned ibCommission, and left flagged unverified,
+            # which is exactly how a fill carrying no broker figure is already
+            # treated. Nothing else about the legs is touched.
+            logger.warning(
+                "Ignoring the broker's realised figure for closing fill %s on "
+                "%s: it implies an all-in cost of %s against %s of apportioned "
+                "commission on %s shares, which is not a fee. The opening fill "
+                "this ledger matched is almost certainly not the one IBKR "
+                "relieved -- check for stranded staging rows on this ticker, "
+                "or a position opened before the Flex query window. Falling "
+                "back to commission; these legs are reported as unverified.",
+                close_trade_id,
+                fill_legs[0].direction,
+                all_in,
+                sum((leg.ib_commission for leg in fill_legs), Decimal("0")),
+                sum((leg.quantity for leg in fill_legs), Decimal("0")),
+            )
+            continue
 
         # Split across the legs this fill closed, by quantity. Allocated so the
         # parts sum to the whole exactly: every leg but the last is rounded,
@@ -695,6 +768,64 @@ def match_executions(executions: Iterable[Execution]) -> MatchingResult:
     return result
 
 
+# Namespace for this project's advisory locks, so `pg_advisory_xact_lock`
+# cannot collide with anything else that ever takes one on this database.
+# Arbitrary, and only has to be stable.
+TICKER_LOCK_NAMESPACE = 0x7A15
+
+
+async def lock_ticker(session: AsyncSession, ticker: str) -> None:
+    """Serialize everything that rebuilds one ticker's derived rows.
+
+    WHY. Matching is a read-modify-write across three tables: it reads every
+    fill for the ticker, decides which stored round trips FIFO no longer
+    produces, deletes those, and replaces `realized_legs` for the symbol
+    outright. Nothing about that is atomic against a SECOND matcher, and two
+    are easy to have -- a broker sync now runs for up to
+    ibkr_client.TOTAL_BUDGET_SECONDS, and a fill can be edited, deleted or
+    repaired from the journal throughout.
+
+    The failure is a lost update, not a visible gap. Measured, on real
+    concurrent transactions: a round trip worth +100 over 10 shares, a repair
+    fill lands and re-matching correctly reports +400 over 20, then a sync that
+    had read the ledger BEFORE that fill finishes on its stale snapshot,
+    deletes the corrected row and writes its own back. The ledger ends at +100,
+    the repair fill becomes unmatched open exposure, and nothing raises. The
+    money figure is wrong and durable.
+
+    A row lock cannot express this. `SELECT ... FOR UPDATE` over `trades` locks
+    the rows that exist when it runs, and the race is driven by a fill that
+    does not exist yet -- a phantom, which row locks do not cover under READ
+    COMMITTED -- so a ticker whose first-ever fills arrive concurrently is not
+    protected at all. It would also lock the immutable execution log in order
+    to guard derived tables, which is the wrong object. An advisory lock is on
+    the NAME, so it holds whether or not any row exists.
+
+    xact, never session-scoped. Supabase is reached through the transaction
+    mode pooler on 6543, which hands the connection to a different client at
+    COMMIT; a `pg_advisory_lock` taken there would never be released and would
+    wedge the pool. `pg_advisory_xact_lock` is released by the server at
+    COMMIT or ROLLBACK, so it cannot leak.
+
+    MUST BE THE FIRST LOCK THE TRANSACTION TAKES. `delete_trade` and
+    `update_execution` delete positions before they re-match; if the ticker
+    lock were acquired only inside `run_matching_for_ticker`, one session would
+    hold position rows while waiting for the lock, and another would hold the
+    lock while waiting for those rows -- a lock-order inversion Postgres
+    resolves by killing one of them with a deadlock error. Those handlers
+    therefore call this before touching anything. Re-acquiring it here in the
+    same transaction is free: advisory locks are re-entrant, and every level is
+    released at COMMIT.
+
+    Two tickers CAN hash to one lock key. The cost is that they serialize with
+    each other unnecessarily; correctness is unaffected.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:namespace, hashtext(:ticker))"),
+        {"namespace": TICKER_LOCK_NAMESPACE, "ticker": ticker},
+    )
+
+
 async def load_executions_for_ticker(
     session: AsyncSession,
     ticker: str,
@@ -794,6 +925,16 @@ async def run_matching_for_ticker(
             "cannot decide which of its positions are stale."
         )
 
+    # BEFORE the read, not after it. The point of the lock is that the fills
+    # this run computes from cannot change under it, so acquiring it once the
+    # snapshot has already been taken would serialize the writes while leaving
+    # the read-modify-write race exactly as it was.
+    #
+    # Only when persisting. A preview, a backtest or the reconciliation audit
+    # writes nothing, so it has no reason to make a concurrent sync wait.
+    if persist:
+        await lock_ticker(session, ticker)
+
     executions = await load_executions_for_ticker(
         session, ticker, only_unclassified=only_unclassified
     )
@@ -889,11 +1030,16 @@ async def insert_positions(
     to its executions; its review belongs to the trader.
 
     `position_fills` is resynced the same way, so the drill-down cannot end up
-    describing a different trade from the position above it. Returns the number
-    of positions written.
+    describing a different trade from the position above it.
     """
     if not positions:
-        return 0
+        # An empty MAPPING, matching the annotation and every other return path.
+        # This was `return 0`, a leftover from when the function returned a
+        # count: harmless only because the sole caller guards on
+        # `if result.positions`, and a silent TypeError in
+        # `replace_realized_legs` -- which calls `.get()` on this -- the moment
+        # a second caller did not.
+        return {}
 
     # Deferred to avoid a circular import with the FastAPI app.
     from main import Position, PositionFill  # noqa: PLC0415

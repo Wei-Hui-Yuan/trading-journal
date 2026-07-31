@@ -168,7 +168,15 @@ class _StubSession:
     async def get(self, _model, key):
         return self.target if key == self.target.id else None
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
+        # The ticker lock comes first and is raw SQL, so it has no
+        # column_descriptions to tell statements apart by. Recorded under its
+        # own name: these tests assert the guard refuses BEFORE anything is
+        # written, and taking an advisory lock writes nothing.
+        if not hasattr(stmt, "column_descriptions"):
+            self.statements.append("pg_advisory_xact_lock")
+            return _Result([])
+
         selected = stmt.column_descriptions[0]["name"]
         self.statements.append(selected)
         if selected == "trade_id":
@@ -233,8 +241,17 @@ def test_the_refusal_happens_before_anything_is_written():
     with pytest.raises(HTTPException):
         run(main.delete_position(position_id=target.id, session=session))
 
-    # It looked up the fills and the neighbouring positions, and stopped.
-    assert session.statements == ["trade_id", "position_id", "Position"]
+    # It took the ticker lock, looked up the fills and the neighbouring
+    # positions, and stopped.
+    #
+    # The lock comes FIRST and that position is load-bearing, not incidental:
+    # this handler deletes positions and trades further down, and a transaction
+    # that grabbed those rows before the ticker lock would invert the lock
+    # order against a concurrent sync -- which Postgres resolves by killing one
+    # of them. See matching_engine.lock_ticker.
+    assert session.statements == [
+        "pg_advisory_xact_lock", "trade_id", "position_id", "Position"
+    ]
 
 
 def test_nothing_is_shared_means_nothing_to_refuse():

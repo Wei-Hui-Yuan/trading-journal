@@ -478,10 +478,20 @@ export async function ingestIBKR(): Promise<IngestResult> {
     // failed. Nothing was written, so the ledger stayed correct, but the run
     // was wasted and IBKR had already been asked to build the report.
     //
-    // This covers one query's worst case. A many-query sync can still exceed
-    // it, and the real fix is for ingest to return 202 with a job id and be
-    // polled -- a request whose duration is bounded by a third party's
-    // compile time does not belong in a synchronous round trip.
+    // This number is now the OUTER half of a pair, and must stay above the
+    // server's own ceiling rather than guessing at one. IBKR_QUERY_ID takes a
+    // list, and two queries is the documented configuration, so the honest
+    // worst case here was ~535s against this 300s -- a sync the browser
+    // abandoned while the server was still legitimately working, reported to
+    // the user as "no response". ibkr_client.TOTAL_BUDGET_SECONDS (240s) now
+    // bounds the fetch server-side and turns an over-run into an ordinary
+    // partial result in `queries_failed`, which the sync toast already
+    // renders. Keep the 60s of slack: it covers the staging, promotion and
+    // FIFO matching that run after the fetch.
+    //
+    // The real fix is still for ingest to return 202 with a job id and be
+    // polled -- a request whose duration is bounded by a third party's compile
+    // time does not belong in a synchronous round trip.
     timeout: 300_000,
   });
   return data;
@@ -563,10 +573,14 @@ export async function deleteTimeframe(id: string): Promise<TimeframePreset> {
 }
 
 /**
- * PATCH /api/positions/{id}/review
+ * PUT /api/positions/{id}/review
  *
- * Only the keys present in `payload` are applied; the backend always sets
- * review_status to 'completed' on success.
+ * The API registers PUT and PATCH on one handler, and the body is a partial
+ * update either way (`exclude_unset`), so both are accurate. This sends PUT;
+ * the docstring used to say PATCH, which is the verb the Trade Inbox uses.
+ *
+ * Only the keys present in `payload` are applied. The backend sets
+ * review_status to 'reviewed' on success unless `mark_reviewed: false` is sent.
  */
 export async function updatePositionReview(
   id: string,

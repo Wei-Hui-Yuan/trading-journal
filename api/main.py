@@ -2260,8 +2260,7 @@ class SettingsOut(BaseModel):
     risk_percent: float
     updated_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SettingsUpdate(BaseModel):
@@ -2590,8 +2589,7 @@ class StrategyOut(BaseModel):
     def _null_to_empty(cls, value: Optional[str]) -> str:
         return value or ""
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 async def _strategy_usage(session: AsyncSession) -> dict[uuid.UUID, StrategyUsage]:
@@ -2842,8 +2840,7 @@ class DisciplineOut(BaseModel):
     name: str
     created_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 DEFAULT_DISCIPLINES = [
@@ -3051,8 +3048,7 @@ class PositionOut(BaseModel):
     def _null_to_list(cls, value: Optional[list[str]]) -> list[str]:
         return list(value or [])
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 async def _disciplines_by_position(
@@ -3110,8 +3106,7 @@ class PositionFillOut(BaseModel):
     price: float
     executed_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @app.get("/health")
@@ -3192,8 +3187,7 @@ class TradeOut(BaseModel):
     is_matched: bool
     created_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TradeAnnotationUpdate(BaseModel):
@@ -3450,6 +3444,7 @@ async def update_execution(
     explain.
     """
     from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        lock_ticker,
         run_matching_for_ticker,
     )
 
@@ -3462,6 +3457,12 @@ async def update_execution(
         raise HTTPException(status_code=422, detail="No fields to update.")
 
     ticker = trade.ticker
+
+    # Before the position delete below, not just inside the rebuild. Holding
+    # position rows while waiting for the ticker lock, against a sync holding
+    # the ticker lock while waiting for those rows, is a lock-order inversion
+    # Postgres breaks by killing one transaction outright. See lock_ticker.
+    await lock_ticker(session, ticker)
 
     # Snapshot once, before the first mutation. Re-snapshotting on a later edit
     # would overwrite the broker's figures with the previous edit's and destroy
@@ -3482,7 +3483,22 @@ async def update_execution(
         trade.actual_entry = Decimal(str(changes["price"]))
     if "execution_time" in changes:
         when = changes["execution_time"]
-        if when is not None and when.tzinfo is None:
+        if when is None:
+            # `trades.entry_date` is NOT NULL, and an explicit null here is
+            # reachable: the field is Optional so it can be OMITTED, and
+            # ExecutionUpdatePayload types it `string | null`. Assigning it
+            # through reached the driver as a not-null violation and surfaced
+            # as an opaque 500 -- after the round trips built on this fill had
+            # already been deleted, since that happens further down in the same
+            # transaction. Refused here, before anything is touched.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "execution_time cannot be cleared. Omit the field to leave "
+                    "the fill's time unchanged, or send a new timestamp."
+                ),
+            )
+        if when.tzinfo is None:
             # datetime-local inputs arrive bare; anchor to market time, exactly
             # as manual entry does, or the heatmap buckets them by the server's
             # timezone instead.
@@ -3548,8 +3564,7 @@ class SuppressedExecutionOut(BaseModel):
     executed_at: Optional[datetime]
     created_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @app.get(
@@ -3669,6 +3684,7 @@ async def delete_trade(
     the user to discover.
     """
     from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        lock_ticker,
         run_matching_for_ticker,
     )
 
@@ -3677,6 +3693,11 @@ async def delete_trade(
         raise HTTPException(status_code=404, detail="Trade not found")
 
     ticker = trade.ticker
+
+    # First lock this transaction takes, ahead of the position delete below.
+    # See lock_ticker: acquiring it only inside the rebuild would invert the
+    # lock order against a concurrent sync and deadlock.
+    await lock_ticker(session, ticker)
 
     # Captured before the delete: position_fills.trade_id is ON DELETE CASCADE,
     # so the link disappears with the trade and the positions become
@@ -3927,6 +3948,7 @@ async def delete_position(
     GET /api/positions/{id}/delete-impact and shown the user what else goes.
     """
     from services.matching_engine import (  # noqa: PLC0415 - avoids import cycle
+        lock_ticker,
         run_matching_for_ticker,
     )
 
@@ -3935,6 +3957,13 @@ async def delete_position(
         raise HTTPException(status_code=404, detail="Position not found")
 
     ticker = position.symbol
+
+    # Ahead of the position and trade deletes below, for the lock-ordering
+    # reason in lock_ticker. This handler commits before it re-matches, so it
+    # takes the lock twice; advisory locks are re-entrant and every level is
+    # released at COMMIT, so that costs nothing.
+    await lock_ticker(session, ticker)
+
     trade_ids = await _executions_behind(session, position_id)
 
     # An oversell that flips long to short closes one round trip and opens the

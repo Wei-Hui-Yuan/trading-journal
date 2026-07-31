@@ -335,3 +335,77 @@ def test_an_open_run_is_reconciled_too():
     ])
     assert result.positions == []
     assert sum(l.realized_pnl for l in result.open_legs) == Decimal("-42.00")
+
+
+# ---------------------------------------------------------------------------
+# The plug has to stay a plug
+# ---------------------------------------------------------------------------
+#
+# `all_in = our_gross - broker_realized_pnl` is only a cost while both sides
+# describe the SAME shares. When they do not, the subtraction is the difference
+# between two unrelated P&L figures, and booking it as commission rewrites the
+# trade rather than costing it.
+#
+# Not hypothetical here. Ingest deliberately refuses to promote a fill with no
+# price or no execution_time and reports the backlog as `stranded_fills` on
+# every sync; if the stranded one OPENED the position, the closing fill still
+# arrives carrying IBKR's figure for shares this ledger cannot see. A position
+# opened before the 365-day Flex window does the same.
+
+
+def test_a_broker_figure_covering_shares_we_never_saw_is_refused():
+    """The regression. We know about 5 of the 10 shares IBKR relieved, so its
+    +98.90 is for twice our position: the plug booked -48.90 as commission --
+    a fabricated rebate -- and dragged stored P&L to 98.90 on a 5-share leg."""
+    result = match_executions([
+        bex(1, "BUY", 5, 100, 0, commission="0.35"),
+        bex(2, "SELL", 5, 110, 60, commission="0.35", broker="98.90"),
+    ])
+    position = result.positions[0]
+
+    assert position.gross_pnl == Decimal("50.0000"), "5 shares, 10 points"
+    assert position.commission == Decimal("0.7000"), "the commission we know of"
+    assert position.realized_pnl == Decimal("49.3000"), "not IBKR's 98.90"
+
+    leg = position.legs[0]
+    assert leg.commission == leg.ib_commission, "fell back, did not plug"
+    assert leg.broker_realized_pnl is None, "counts toward unverified_legs"
+
+
+def test_a_genuine_fee_is_still_taken_from_the_broker():
+    """The guard must not cost the feature its purpose. IBKR's extra charges
+    run about 5.3c per closing fill against commission -- far inside the band,
+    so this still ties to the statement rather than to ibCommission alone."""
+    result = match_executions([
+        bex(1, "BUY", 10, 100, 0, commission="1.00"),
+        bex(2, "SELL", 10, 110, 60, commission="1.00", broker="97.947"),
+    ])
+    leg = result.positions[0].legs[0]
+    assert leg.commission == Decimal("2.053"), "all-in: commission plus 5.3c"
+    assert leg.ib_commission == Decimal("2.00"), "raw, untouched, beside it"
+    assert leg.broker_realized_pnl == Decimal("97.947"), "verified"
+
+
+def test_the_band_is_measured_against_notional_not_gross():
+    """A scratch trade has a gross near zero, and a bound that scaled with it
+    would reject the fees on exactly the trades whose fees decide the outcome.
+    Bought and sold at the same price; the only thing realised IS the cost."""
+    result = match_executions([
+        bex(1, "BUY", 100, 50, 0, commission="1.00"),
+        bex(2, "SELL", 100, 50, 60, commission="1.00", broker="-2.14"),
+    ])
+    leg = result.positions[0].legs[0]
+    assert leg.gross_pnl == Decimal("0")
+    assert leg.commission == Decimal("2.14"), "all-in, taken from the broker"
+    assert leg.broker_realized_pnl == Decimal("-2.14"), "verified, not refused"
+
+
+def test_a_refused_figure_leaves_gross_minus_commission_exact():
+    """Whatever the guard decides, the identity every surface renders on has to
+    survive it."""
+    result = match_executions([
+        bex(1, "BUY", 5, 100, 0, commission="0.35"),
+        bex(2, "SELL", 5, 110, 60, commission="0.35", broker="98.90"),
+    ])
+    position = result.positions[0]
+    assert position.gross_pnl - position.commission == position.realized_pnl
