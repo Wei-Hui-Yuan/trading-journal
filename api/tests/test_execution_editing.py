@@ -367,3 +367,97 @@ def test_delete_trade_control_loses_its_positions_with_the_unfixed_ordering(monk
             assert not pos_ok, "the control must actually lose the position"
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# I7, extended -- create_manual_trade shares one commit with its own rebuild
+# ---------------------------------------------------------------------------
+#
+# This handler used to commit the new trade ALONE (`session.add(trade)`,
+# `await session.commit()`) before calling `run_matching_for_ticker`, unlike
+# the three siblings above. A crash in that window -- a redeploy, an OOM, a
+# dropped Supabase connection -- left the trade permanently committed with no
+# round trip ever built from it.
+#
+# That is a worse outcome here than on the other three handlers. An orphaned
+# IBKR-sourced fill is at least findable: `_symbols_awaiting_match` looks for
+# unprocessed `ibkr_executions` rows that WERE promoted into `trades`, and the
+# next sync recovers them automatically. A REPAIR- id never satisfies
+# `_promoted_into_trades()` -- it has no staging row at all -- so nothing
+# notices, and no ordinary sync ever revisits the ticker again on its own. The
+# only way back is a human noticing the discrepancy and calling
+# POST /api/rematch by hand.
+#
+# The fix removes the standalone commit; `session.add` merely stages the row,
+# autoflush carries it into the matcher's own read, and everything --
+# insertion and rebuild alike -- lands in run_matching_for_ticker's one commit.
+
+
+async def _trade_exists_for_ticker(conn, ticker: str) -> bool:
+    """Whether any Trade row exists for this ticker, from a session that has
+    seen none of the handler-under-test's own work."""
+    check = db_session(conn)
+    row = (await check.execute(
+        main.select(main.Trade.id).where(main.Trade.ticker == ticker)
+    )).first()
+    await check.close()
+    return row is not None
+
+
+@requires_db
+def test_create_manual_trade_does_not_orphan_the_fill_if_the_rebuild_crashes(monkeypatch):
+    async def scenario():
+        async with db_transaction() as conn:
+            ticker = f"ZZ{uuid.uuid4().hex[:6].upper()}"[:10]
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=False)
+
+            with pytest.raises(RuntimeError):
+                await main.create_manual_trade(
+                    params=main.ManualTradeCreate(
+                        symbol=ticker, side="BUY", quantity=10, price=100
+                    ),
+                    session=session,
+                )
+            await session.close()
+
+            assert not await _trade_exists_for_ticker(conn, ticker), (
+                "a crash before any commit must leave nothing behind -- "
+                "not even the trade itself, since nothing was ever built "
+                "from it"
+            )
+
+    asyncio.run(scenario())
+
+
+@requires_db
+def test_create_manual_trade_control_orphans_the_fill_with_the_unfixed_ordering(
+    monkeypatch,
+):
+    """The control: prove this probe CAN see the bug.
+
+    `commit_first=True` durably commits the staged trade before the simulated
+    crash -- exactly what the removed `await session.commit()` used to do,
+    just moved one call frame over -- so the trade survives with no position
+    ever built from it. That gap is the orphan.
+    """
+    async def scenario():
+        async with db_transaction() as conn:
+            ticker = f"ZZ{uuid.uuid4().hex[:6].upper()}"[:10]
+            session = db_session(conn)
+            _crash_matching(monkeypatch, session, commit_first=True)
+
+            with pytest.raises(RuntimeError):
+                await main.create_manual_trade(
+                    params=main.ManualTradeCreate(
+                        symbol=ticker, side="BUY", quantity=10, price=100
+                    ),
+                    session=session,
+                )
+            await session.close()
+
+            assert await _trade_exists_for_ticker(conn, ticker), (
+                "the control must actually orphan the trade"
+            )
+
+    asyncio.run(scenario())

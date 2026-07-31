@@ -1498,9 +1498,25 @@ async def create_manual_trade(
         source_tag="Repair",
     )
     session.add(trade)
-    await session.commit()
-    await session.refresh(trade)
 
+    # No commit here. This used to commit the trade alone before calling the
+    # matcher, which is the same shape update_execution, delete_trade and
+    # delete_position were fixed away from (see their docstrings): a crash
+    # between that commit and the rebuild's own -- a redeploy, an OOM, a
+    # dropped Supabase connection -- left the trade permanently committed with
+    # no round trip built from it. That is worse here than on those three
+    # handlers, because a REPAIR- id never satisfies `_promoted_into_trades()`,
+    # so `_symbols_awaiting_match` cannot find it and no ordinary sync will ever
+    # revisit this ticker on its own; the only way back is a human noticing and
+    # calling POST /api/rematch by hand.
+    #
+    # `session.add` only stages the row; nothing about it needs its own commit
+    # to reach the matcher's read. Autoflush (never disabled on this session)
+    # issues the INSERT ahead of any query in the same transaction, so
+    # load_executions_for_ticker sees it without a round trip having happened,
+    # and `expire_on_commit=False` means every attribute read below stays valid
+    # off the Python object after run_matching_for_ticker's own commit.
+    #
     # Re-run matching for this ticker. Authoritative rather than additive: this
     # fill is almost certainly backdated -- that is what repairing a dropped
     # execution means -- and a fill inserted before existing ones re-partitions
