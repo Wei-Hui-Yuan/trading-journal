@@ -1,11 +1,15 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   annotateTrade,
   attachPlan,
   cancelPlan,
+  deletePlanChart,
+  getPlanChart,
+  uploadPlanChart,
   createDiscipline,
   createManualTrade,
   createPlan,
@@ -116,6 +120,10 @@ export const queryKeys = {
   // those are two different cache entries.
   plansRoot: ['plans'] as const,
   plans: (status: string) => ['plans', status] as const,
+  // Kept OUTSIDE plansRoot on purpose. Editing a plan's levels invalidates
+  // plansRoot constantly, and the screenshot has not changed — nesting this
+  // under it would re-download the image on every unrelated edit.
+  planChart: (planId: string) => ['planChart', planId] as const,
 };
 
 /** Positions awaiting review — the Trade Inbox queue. */
@@ -450,6 +458,71 @@ export function useCancelPlan() {
     mutationFn: cancelPlan,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+    },
+  });
+}
+
+/**
+ * The chart screenshot attached to a plan, as a URL an <img> can use.
+ *
+ * The endpoint needs the Clerk bearer token, which an <img src> cannot carry,
+ * so the bytes are fetched through the authenticated client and wrapped in an
+ * object URL. That URL owns memory until it is revoked, which is what the
+ * effect below is for — without it, every ledger row opened would leak the
+ * full image for the lifetime of the tab.
+ */
+export function usePlanChart(planId: string | null, enabled = true) {
+  const query = useQuery<Blob>({
+    queryKey: queryKeys.planChart(planId ?? ''),
+    queryFn: () => getPlanChart(planId as string),
+    enabled: Boolean(planId) && enabled,
+    // The image for a given plan does not change unless the user replaces it,
+    // and doing so invalidates this key explicitly.
+    staleTime: Infinity,
+    gcTime: 10 * 60 * 1000,
+  });
+
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!query.data) {
+      setUrl(null);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(query.data);
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [query.data]);
+
+  return { url, isLoading: query.isLoading, error: query.error };
+}
+
+/** Attach or replace a plan's chart screenshot. */
+export function useUploadPlanChart() {
+  const queryClient = useQueryClient();
+
+  return useMutation<TradePlan, Error, { planId: string; image: Blob; filename: string }>({
+    mutationFn: ({ planId, image, filename }) => uploadPlanChart(planId, image, filename),
+    onSuccess: (_plan, { planId }) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+      // The cached blob is now the previous screenshot.
+      queryClient.invalidateQueries({ queryKey: queryKeys.planChart(planId) });
+      // The ledger renders the chart beside the post-mortem of an attached
+      // plan, so its copy of the plan is stale too.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+    },
+  });
+}
+
+/** Remove a plan's chart, keeping the plan. */
+export function useDeletePlanChart() {
+  const queryClient = useQueryClient();
+
+  return useMutation<TradePlan, Error, string>({
+    mutationFn: deletePlanChart,
+    onSuccess: (_plan, planId) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.plansRoot });
+      queryClient.removeQueries({ queryKey: queryKeys.planChart(planId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
     },
   });
 }

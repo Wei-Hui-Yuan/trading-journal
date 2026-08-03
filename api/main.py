@@ -12,7 +12,16 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -384,6 +393,15 @@ class PlannedTrade(Base):
     thesis = Column(Text, nullable=True)
 
     status = Column(String(20), nullable=False, default=PLAN_OPEN)
+
+    # The chart you were looking at when you wrote this (migration 025). The
+    # bytes are in Supabase Storage; `chart_path` is the key. Size is kept
+    # here so "does this plan have a chart, and how much is it costing" is
+    # answerable without an API call to Storage per plan.
+    chart_path = Column(Text, nullable=True)
+    chart_mime = Column(String(32), nullable=True)
+    chart_bytes = Column(Integer, nullable=True)
+    chart_uploaded_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -1877,6 +1895,13 @@ class PlanOut(BaseModel):
     # not represent it, and a second copy of the link would be free to
     # disagree with trades.plan_id.
     attached_trade_ids: list[uuid.UUID] = []
+    # Whether a chart screenshot is attached, and what it costs. The path
+    # itself is deliberately NOT sent: it is a private-bucket key, useless to
+    # a browser, and the image is served from this API instead
+    # (GET /api/plans/{id}/chart).
+    has_chart: bool = False
+    chart_bytes: Optional[int] = None
+    chart_uploaded_at: Optional[datetime] = None
 
 
 def _plan_out(plan: PlannedTrade, attached_ids: Sequence[uuid.UUID] = ()) -> PlanOut:
@@ -1901,6 +1926,9 @@ def _plan_out(plan: PlannedTrade, attached_ids: Sequence[uuid.UUID] = ()) -> Pla
         created_at=plan.created_at,
         updated_at=plan.updated_at,
         attached_trade_ids=list(attached_ids),
+        has_chart=plan.chart_path is not None,
+        chart_bytes=plan.chart_bytes,
+        chart_uploaded_at=plan.chart_uploaded_at,
     )
 
 
@@ -2147,6 +2175,215 @@ async def cancel_plan(
     await session.commit()
     await session.refresh(plan)
     return _plan_out(plan)
+
+
+# ---------------------------------------------------------------------------
+# The chart behind the plan
+# ---------------------------------------------------------------------------
+#
+# A plan records the levels and the thesis -- what you intended. For a
+# discretionary setup that is only half the decision: "reclaiming the 50 EMA
+# after basing three days" is a sentence, and whether the base was actually
+# there is a picture. Reviewing the trade later without it grades the
+# sentence rather than the decision.
+#
+# Bytes live in Supabase Storage, keyed by plan id; `planned_trades` keeps the
+# key (migration 025). See services/storage.py for why not Postgres.
+
+# What the browser compressor produces. WebP is the normal output -- lossless,
+# and measurably the smallest encoding for flat-background chart UI -- with
+# PNG as the fallback where WebP encoding is unavailable. Anything else means
+# the client skipped the compressor, which is worth refusing rather than
+# storing: an unbounded original is exactly what the compressor exists to
+# prevent reaching the bucket.
+CHART_MIME_EXTENSIONS = {"image/webp": "webp", "image/png": "png"}
+
+# A generous ceiling, not a target. A losslessly-encoded chart screenshot
+# measures in the hundreds of kilobytes; anything approaching this means the
+# client sent an original rather than a compressed copy. Bounded so one
+# request cannot take a worker's memory with it.
+CHART_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _chart_etag(plan: PlannedTrade) -> str:
+    """Identity of the CURRENT image for this plan.
+
+    Both parts are needed. The path alone is stable across re-uploads -- it is
+    derived from the plan id -- so a corrected screenshot would keep serving
+    from cache as the old one. Upload time plus size changes whenever the
+    bytes do.
+    """
+    stamp = plan.chart_uploaded_at.isoformat() if plan.chart_uploaded_at else "0"
+    return f'"{plan.id}-{stamp}-{plan.chart_bytes}"'
+
+
+@app.post(
+    "/api/plans/{plan_id}/chart",
+    response_model=PlanOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def upload_plan_chart(
+    plan_id: uuid.UUID,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    """Attach (or replace) the chart screenshot for a plan."""
+    from services import storage  # noqa: PLC0415 - deferred, keeps import graph flat
+
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if content_type not in CHART_MIME_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Charts are stored as WebP or PNG, not {content_type or 'an unnamed type'}. "
+                "The browser converts your screenshot before uploading."
+            ),
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="That file was empty.")
+    if len(data) > CHART_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"That image is {len(data) / 1024 / 1024:.1f} MB, over the "
+                f"{CHART_MAX_BYTES // 1024 // 1024} MB limit. It should have been "
+                "compressed in the browser first."
+            ),
+        )
+
+    # Keyed by plan id, so re-uploading overwrites in place rather than
+    # accumulating a new object per correction. The extension tracks the mime
+    # so the object is self-describing in the dashboard.
+    path = f"{plan_id}.{CHART_MIME_EXTENSIONS[content_type]}"
+
+    # Storage first, database second. The reverse order can commit a plan that
+    # claims a chart whose bytes never arrived -- a broken image with no way to
+    # tell it from a slow one. This order's failure mode is an object with no
+    # row pointing at it, which the next upload overwrites, because the key is
+    # deterministic.
+    try:
+        await storage.upload(path, data, content_type)
+    except storage.StorageError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
+    previous = plan.chart_path
+    plan.chart_path = path
+    plan.chart_mime = content_type
+    plan.chart_bytes = len(data)
+    plan.chart_uploaded_at = datetime.now(timezone.utc)
+    plan.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(plan)
+
+    # Replacing a PNG with a WebP (or the reverse) changes the extension, so
+    # the old object is a different key and would otherwise linger unreferenced.
+    if previous and previous != path:
+        try:
+            await storage.delete(previous)
+        except storage.StorageError as exc:
+            # Not fatal: the new chart is stored and recorded. Logged because
+            # the leftover consumes bucket quota with nothing pointing at it.
+            logger.warning(
+                "Replaced chart for plan %s but could not remove the previous "
+                "object %s: %s", plan_id, previous, exc,
+            )
+
+    attached = await _attached_ids_by_plan(session, [plan.id])
+    return _plan_out(plan, attached.get(plan.id, []))
+
+
+@app.get(
+    "/api/plans/{plan_id}/chart",
+    dependencies=[Depends(verify_clerk_token)],
+    responses={200: {"content": {"image/webp": {}, "image/png": {}}}},
+)
+async def get_plan_chart(
+    plan_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve the plan's chart.
+
+    Proxied through this API rather than handed out as a signed Storage URL.
+    The bucket stays private with no policies to maintain, the image inherits
+    the same Clerk auth as every other endpoint, and there is no expiry to
+    outlive a page that is already open.
+    """
+    from services import storage  # noqa: PLC0415
+
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+    if not plan.chart_path:
+        raise HTTPException(status_code=404, detail="This plan has no chart attached.")
+
+    # Revalidation rather than a fixed lifetime: charts are immutable in
+    # practice but replaceable in principle, so the browser asks and usually
+    # gets a bodiless 304 instead of re-downloading. That is what keeps
+    # repeated ledger views off the egress allowance.
+    etag = _chart_etag(plan)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+
+    try:
+        stored = await storage.download(plan.chart_path)
+    except storage.StorageError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
+    return Response(
+        content=stored.data,
+        media_type=plan.chart_mime or stored.content_type,
+        headers={
+            "ETag": etag,
+            # private: this is one person's trading journal, and any shared
+            # cache between them and the internet has no business holding it.
+            "Cache-Control": "private, max-age=300, must-revalidate",
+        },
+    )
+
+
+@app.delete(
+    "/api/plans/{plan_id}/chart",
+    response_model=PlanOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_plan_chart(
+    plan_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Remove the chart, keeping the plan."""
+    from services import storage  # noqa: PLC0415
+
+    plan = await session.get(PlannedTrade, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found.")
+
+    if plan.chart_path:
+        # Storage first again, and for the same reason as the upload: this
+        # order can leave a row pointing at nothing only if the commit below
+        # fails, which the GET reports honestly. The reverse order leaves an
+        # object nothing references -- quota consumed by something the user
+        # can no longer see or delete.
+        try:
+            await storage.delete(plan.chart_path)
+        except storage.StorageError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc))
+
+        plan.chart_path = None
+        plan.chart_mime = None
+        plan.chart_bytes = None
+        plan.chart_uploaded_at = None
+        plan.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        await session.refresh(plan)
+
+    attached = await _attached_ids_by_plan(session, [plan.id])
+    return _plan_out(plan, attached.get(plan.id, []))
 
 
 class PlanAttachResult(BaseModel):
@@ -4218,6 +4455,9 @@ class RoundTripOut(BaseModel):
     # differently for that reason.
     plan_id: Optional[uuid.UUID] = None
     plan_created_at: Optional[datetime] = None
+    # Whether that plan has a chart screenshot, so the ledger renders the
+    # image slot only where there is one to put in it.
+    plan_has_chart: bool = False
     # Per-share, and signed so positive always means better than planned --
     # which is the opposite arithmetic on a short. See _entry_slippage.
     entry_slippage: Optional[float] = None
@@ -4361,18 +4601,23 @@ async def list_round_trips(
     # it is the evidence that a plan predates its fill, which is the only
     # thing separating a plan from a post-hoc annotation.
     plan_created_at: dict[uuid.UUID, datetime] = {}
+    # Which of them carry a chart. Sent so the ledger can decide whether to
+    # render the image slot at all -- without it every plan without a
+    # screenshot would still fire a request for one and take a 404 to find out.
+    plan_has_chart: dict[uuid.UUID, bool] = {}
     plan_ids = {t.plan_id for t in trades if t.plan_id is not None}
     if plan_ids:
-        plan_created_at = {
-            row[0]: row[1]
-            for row in (
-                await session.execute(
-                    select(PlannedTrade.id, PlannedTrade.created_at).where(
-                        PlannedTrade.id.in_(plan_ids)
-                    )
-                )
-            ).all()
-        }
+        plan_rows = (
+            await session.execute(
+                select(
+                    PlannedTrade.id,
+                    PlannedTrade.created_at,
+                    PlannedTrade.chart_path,
+                ).where(PlannedTrade.id.in_(plan_ids))
+            )
+        ).all()
+        plan_has_chart = {row[0]: row[2] is not None for row in plan_rows}
+        plan_created_at = {row[0]: row[1] for row in plan_rows}
     disciplines_by_position = await _disciplines_by_position(
         session, [p.id for p in positions]
     )
@@ -4436,6 +4681,7 @@ async def list_round_trips(
                 quantity=float(position.quantity or 0),
                 entry_price=float(entry or 0),
                 plan_created_at=plan_created_at.get(plan.get("plan_id")),
+                plan_has_chart=plan_has_chart.get(plan.get("plan_id"), False),
                 entry_slippage=slippage,
                 has_hand_added_fills=hand_added,
                 exit_price=float(position.exit_price) if position.exit_price is not None else None,
@@ -4540,6 +4786,7 @@ async def list_round_trips(
                 entry_time=opening.entry_date,
                 execution_count=len(group),
                 plan_created_at=plan_created_at.get(plan.get("plan_id")),
+                plan_has_chart=plan_has_chart.get(plan.get("plan_id"), False),
                 # Against the replayed cost basis, for the same reason the
                 # closed branch uses the position's entry: what you are still
                 # holding is what the plan should be judged against.

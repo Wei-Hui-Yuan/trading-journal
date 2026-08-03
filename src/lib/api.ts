@@ -365,6 +365,53 @@ export async function updatePlan(
 }
 
 /**
+ * POST /api/plans/{id}/chart - attach or replace the chart screenshot.
+ *
+ * The image is compressed in the browser first (see lib/chartImage.ts); this
+ * only carries the result. Re-uploading replaces in place rather than
+ * accumulating a new object per correction.
+ */
+export async function uploadPlanChart(
+  planId: string,
+  image: Blob,
+  filename: string
+): Promise<TradePlan> {
+  const form = new FormData();
+  form.append('file', image, filename);
+  const { data } = await apiClient.post<TradePlan>(`/plans/${planId}/chart`, form, {
+    // Explicitly unset, so the browser writes its own value WITH the multipart
+    // boundary token. Axios's instance default of application/json would
+    // otherwise ride along and the server would fail to parse the body.
+    headers: { 'Content-Type': undefined },
+    // A screenshot is orders of magnitude larger than any JSON this client
+    // sends, and it makes two network hops (here, then on to Storage).
+    timeout: 60_000,
+  });
+  return data;
+}
+
+/**
+ * GET /api/plans/{id}/chart - the screenshot itself.
+ *
+ * Fetched as a blob through the authenticated client rather than pointed at
+ * with a bare <img src>, because the endpoint requires the Clerk bearer token
+ * and an <img> tag cannot carry one. The caller turns this into an object URL.
+ */
+export async function getPlanChart(planId: string): Promise<Blob> {
+  const { data } = await apiClient.get<Blob>(`/plans/${planId}/chart`, {
+    responseType: 'blob',
+    timeout: 60_000,
+  });
+  return data;
+}
+
+/** DELETE /api/plans/{id}/chart - detach the screenshot, keeping the plan. */
+export async function deletePlanChart(planId: string): Promise<TradePlan> {
+  const { data } = await apiClient.delete<TradePlan>(`/plans/${planId}/chart`);
+  return data;
+}
+
+/**
  * DELETE /api/plans/{id} - cancel a plan you did not take.
  *
  * Marked CANCELLED rather than removed: the setups you talked yourself out of

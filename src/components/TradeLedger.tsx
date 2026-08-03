@@ -34,6 +34,7 @@ import type {
   TradeSide,
 } from '@/types/api';
 import { RepairFillModal } from './RepairFillModal';
+import { PlanChartView } from './PlanChart';
 import { ConfirmDialog } from './ConfirmDialog';
 import { usePendingActions } from './PendingActionProvider';
 
@@ -566,6 +567,20 @@ const PlanVsExecution: React.FC<{
           </div>
         </div>
       </div>
+
+      {/* What you were looking at when you decided. The numbers above say
+          whether you followed the plan; this is the only thing that says
+          whether the plan was reasonable — and it is why it sits inside the
+          "planned before entry" block rather than beside the review, which
+          was written afterwards. */}
+      {rt.plan_has_chart && rt.plan_id && (
+        <div className="mt-3 border-t border-amber-500/15 pt-3">
+          <p className="mb-1.5 text-[10px] uppercase tracking-wide text-obsidian-muted">
+            Chart at entry
+          </p>
+          <PlanChartView planId={rt.plan_id} />
+        </div>
+      )}
     </section>
   );
 };

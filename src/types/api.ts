@@ -485,6 +485,15 @@ export interface TradePlan {
    * position rather than one slice of it.
    */
   attached_trade_ids: string[];
+  /**
+   * Whether a chart screenshot is attached. The storage key itself is never
+   * sent — the bucket is private, so it would be useless here; the image is
+   * fetched from GET /api/plans/{id}/chart instead.
+   */
+  has_chart: boolean;
+  /** Stored size of that image, so the UI can report what charts cost. */
+  chart_bytes: number | null;
+  chart_uploaded_at: string | null; // ISO 8601
 }
 
 /** POST /api/plans. Every price is optional — a ticker and a bias is enough. */
@@ -842,6 +851,12 @@ export interface RoundTrip {
   plan_id: string | null;
   /** When the plan was written — the proof that it predates the fill. */
   plan_created_at: string | null;
+  /**
+   * Whether the attached plan carries a chart screenshot. Sent so the ledger
+   * renders the image only where there is one, rather than requesting it for
+   * every planned trade and taking a 404 to find out.
+   */
+  plan_has_chart: boolean;
   /**
    * Per-share difference between the fill and the plan, signed so positive
    * always means BETTER than planned. That requires knowing the side: a short

@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 
 import { useCancelPlan, usePlans, useUpdatePlan } from '@/hooks/useTradeInbox';
+import { PlanChartView } from '@/components/PlanChart';
 import type { TradePlan } from '@/types/api';
 
 const when = new Intl.DateTimeFormat('en-US', {
@@ -295,10 +296,20 @@ export const OpenPlansDock: React.FC = () => {
                 </div>
               )}
 
-              {plan.thesis && !isEditing && (
-                <p className="mt-2 line-clamp-2 text-[11px] leading-relaxed text-obsidian-muted">
-                  {plan.thesis}
-                </p>
+              {/* The thesis and the chart it was written from, side by side.
+                  A thumbnail rather than the full capture: the dock is a
+                  scannable list, and clicking opens it full size. */}
+              {(plan.thesis || plan.has_chart) && !isEditing && (
+                <div className="mt-2 flex items-start gap-3">
+                  {plan.has_chart && (
+                    <PlanChartView planId={plan.id} thumbnail />
+                  )}
+                  {plan.thesis && (
+                    <p className="line-clamp-3 text-[11px] leading-relaxed text-obsidian-muted">
+                      {plan.thesis}
+                    </p>
+                  )}
+                </div>
               )}
 
               <div className="mt-2.5 flex items-center gap-2">

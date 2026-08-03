@@ -5,8 +5,15 @@ import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucide-react';
 
-import { useCreatePlan, useSettings, useStrategies } from '@/hooks/useTradeInbox';
+import {
+  useCreatePlan,
+  useSettings,
+  useStrategies,
+  useUploadPlanChart,
+} from '@/hooks/useTradeInbox';
+import { ChartDropzone } from '@/components/PlanChart';
 import { computeSizing, scoreTakeProfit, sizingHint } from '@/lib/positionSizing';
+import type { CompressedChart } from '@/lib/chartImage';
 import type { TradeSide } from '@/types/api';
 
 interface CreatePlanModalProps {
@@ -105,6 +112,11 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
+  // Held rather than uploaded on selection: the upload is keyed by plan id,
+  // and there is no id until the plan itself is saved. Compressed already
+  // though, so the size shown is the size that will be stored.
+  const [chart, setChart] = useState<CompressedChart | null>(null);
+  const uploadChart = useUploadPlanChart();
   const symbolRef = useRef<HTMLInputElement>(null);
 
   const mutation = useCreatePlan();
@@ -122,6 +134,8 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
       setForm(blankForm());
       setError(null);
       setSavedSummary(null);
+      // Or the previous plan's screenshot would be attached to the next one.
+      setChart(null);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
     }
@@ -254,12 +268,33 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
         ...optional,
       },
       {
-        onSuccess: (plan) => {
-          setSavedSummary(
+        onSuccess: async (plan) => {
+          const saved =
             `Plan saved for ${plan.ticker}. It will attach itself to the fill ` +
-              'when your next broker sync brings it in — nothing has been ' +
-              'added to the ledger.'
-          );
+            'when your next broker sync brings it in — nothing has been ' +
+            'added to the ledger.';
+
+          // The plan is already saved at this point, so a failed chart upload
+          // must not read as a failed save. It is reported as what it is --
+          // the plan kept, the screenshot not attached -- and the modal stays
+          // open so the image can be retried rather than silently lost.
+          if (chart) {
+            try {
+              await uploadChart.mutateAsync({
+                planId: plan.id,
+                image: chart.blob,
+                filename: `${plan.ticker}-chart.${chart.mime === 'image/webp' ? 'webp' : 'png'}`,
+              });
+            } catch (err) {
+              setError(
+                `${saved} The chart could not be attached: ` +
+                  `${err instanceof Error ? err.message : 'upload failed'}`
+              );
+              return;
+            }
+          }
+
+          setSavedSummary(saved);
           // Held open a moment so the outcome is readable.
           window.setTimeout(onClose, 2200);
         },
@@ -759,6 +794,19 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
               Written before entry. The post-trade review comes later, in the
               Journal.
             </p>
+
+            {/* The other half of the thesis. "Reclaiming the 50 EMA after
+                basing three days" is a sentence; whether the base was
+                actually there is a picture, and reviewing the trade later
+                without it grades the sentence rather than the decision. */}
+            <div className="mt-3">
+              <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                Chart at entry
+              </span>
+              <div className="mt-1">
+                <ChartDropzone value={chart} onChange={setChart} disabled={isSaving} />
+              </div>
+            </div>
           </fieldset>
 
           {error && (

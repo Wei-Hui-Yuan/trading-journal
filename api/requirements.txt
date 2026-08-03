@@ -6,6 +6,11 @@ httpx>=0.27
 python-dotenv>=1.0
 pydantic>=2.6
 
+# Multipart form parsing, which FastAPI needs for UploadFile. The chart
+# screenshot attached to a plan (POST /api/plans/{id}/chart) is the only
+# file upload in the app; without this FastAPI raises at import time.
+python-multipart>=0.0.9
+
 # Clerk JWT verification (api/auth.py). The [crypto] extra pulls in
 # `cryptography`, which PyJWT needs to check RS256 signatures.
 pyjwt[crypto]>=2.8
