@@ -7,6 +7,7 @@ import {
   ArrowUpRight,
   ChevronRight,
   ClipboardList,
+  Link2,
   Loader2,
   NotebookPen,
   Pencil,
@@ -20,8 +21,10 @@ import {
 
 import {
   useAnnotateTrade,
+  useAttachPlan,
   useDeleteTrade,
   useDetachPlan,
+  usePlans,
   useReviewPosition,
   useRoundTrips,
   useStrategies,
@@ -31,6 +34,7 @@ import type {
   PositionFill,
   RoundTrip,
   TradeDeleteResult,
+  TradePlan,
   TradeSide,
 } from '@/types/api';
 import { RepairFillModal } from './RepairFillModal';
@@ -585,6 +589,97 @@ const PlanVsExecution: React.FC<{
   );
 };
 
+const planCandidateTimeFormatter = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+  timeZone: 'America/New_York',
+});
+
+/**
+ * The escape hatch for the normal plan-then-fill-then-sync order.
+ *
+ * Auto-attach on sync requires the plan to predate the fill -- a plan written
+ * even a minute after the broker filled the order describes a trade that
+ * already happened, and is correctly refused. This is for exactly that case:
+ * the order went in first, the plan got written on the way to syncing, and
+ * the two need linking by hand. The backend enforces ticker and direction;
+ * candidates are pre-filtered to those here so a mismatched pick fails as
+ * "nothing to choose from" rather than a 422 after the fact.
+ */
+const AttachPlanPanel: React.FC<{
+  rt: RoundTrip;
+  plans: TradePlan[] | undefined;
+  attachingPlanId: string | null;
+  onAttach: (planId: string) => void;
+}> = ({ rt, plans, attachingPlanId, onAttach }) => {
+  if (!rt.plan_trade_id) return null;
+
+  const candidates = (plans ?? []).filter(
+    (p) => p.ticker === rt.symbol && p.direction === rt.direction
+  );
+  const price = (n: number | null) => (n === null ? '—' : n < 1 ? n.toFixed(4) : n.toFixed(2));
+
+  return (
+    <section className="rounded-lg border border-dashed border-obsidian-border p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <Link2 className="h-3.5 w-3.5 text-obsidian-muted" />
+        <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          No plan attached
+        </h4>
+      </div>
+
+      {candidates.length === 0 ? (
+        <p className="text-[11px] text-obsidian-muted">
+          No open plan for {rt.symbol} {rt.direction}
+          {plans && plans.length > 0
+            ? ` (${plans.length} open plan${plans.length === 1 ? '' : 's'} exist for other tickers or directions).`
+            : '.'}
+        </p>
+      ) : (
+        <ul className="space-y-1.5">
+          {candidates.map((plan) => (
+            <li
+              key={plan.id}
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded border border-obsidian-border bg-obsidian-bg px-2.5 py-1.5 text-[11px]"
+            >
+              <span className="font-mono text-slate-300">
+                entry {price(plan.planned_entry)}
+              </span>
+              <span className="font-mono text-obsidian-muted">
+                stop {price(plan.stop_loss)}
+              </span>
+              <span className="font-mono text-obsidian-muted">
+                target {price(plan.take_profit)}
+              </span>
+              {plan.created_at && (
+                <span className="font-mono text-[10px] text-obsidian-muted">
+                  written {planCandidateTimeFormatter.format(new Date(plan.created_at))} ET
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => onAttach(plan.id)}
+                disabled={attachingPlanId === plan.id}
+                className="ml-auto inline-flex items-center gap-1 rounded border border-amber-500/30 px-2 py-0.5 text-[10px] text-amber-300 transition-colors hover:border-amber-500/60 hover:bg-amber-500/10 disabled:opacity-50"
+              >
+                {attachingPlanId === plan.id ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Link2 className="h-3 w-3" />
+                )}
+                Attach
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+};
+
 /**
  * The journal, grouped by trade idea rather than by execution.
  *
@@ -619,6 +714,11 @@ export const TradeLedger: React.FC = () => {
 
   const [expanded, setExpanded] = useState<string | null>(null);
   const detachMutation = useDetachPlan();
+  const attachMutation = useAttachPlan();
+  // Only fetched to populate the "attach a plan" picker on unplanned rows --
+  // never gated on whether one is expanded, since that would mean an extra
+  // round trip every time a row opens rather than one shared list.
+  const { data: openPlans } = usePlans('OPEN');
   const [planError, setPlanError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -829,8 +929,8 @@ export const TradeLedger: React.FC = () => {
                         because it explains a number the user has already read. */}
                     <PnlBreakdown rt={rt} />
 
-                    {/* ------- PLAN vs EXECUTION (only when linked) ------- */}
-                    {rt.plan_id && (
+                    {/* ------- PLAN vs EXECUTION, or a way to link one ------- */}
+                    {rt.plan_id ? (
                       <PlanVsExecution
                         rt={rt}
                         unlinking={
@@ -843,6 +943,25 @@ export const TradeLedger: React.FC = () => {
                           detachMutation.mutate(rt.plan_trade_id, {
                             onError: (err) => setPlanError(err.message),
                           });
+                        }}
+                      />
+                    ) : (
+                      <AttachPlanPanel
+                        rt={rt}
+                        plans={openPlans}
+                        attachingPlanId={
+                          attachMutation.isPending &&
+                          attachMutation.variables?.tradeId === rt.plan_trade_id
+                            ? attachMutation.variables.planId
+                            : null
+                        }
+                        onAttach={(planId) => {
+                          if (!rt.plan_trade_id) return;
+                          setPlanError(null);
+                          attachMutation.mutate(
+                            { tradeId: rt.plan_trade_id, planId },
+                            { onError: (err) => setPlanError(err.message) }
+                          );
                         }}
                       />
                     )}
