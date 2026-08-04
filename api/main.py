@@ -4988,3 +4988,1148 @@ async def analytics_advanced(session: AsyncSession = Depends(get_session)):
 
     return await build_advanced_analytics(session)
 
+
+# ===========================================================================
+# THE INVESTMENT BOOK
+# ===========================================================================
+#
+# Everything below this line concerns the long-term portfolio and NOTHING
+# above it. That is deliberate and structural, not stylistic:
+#
+#   * No model, endpoint or helper here is referenced by anything earlier in
+#     this file. The trading journal cannot call into this section, so a
+#     failure here cannot reach it.
+#   * The tables are the three created by migration 026, none of which has a
+#     foreign key into `trades`, `positions`, `position_fills`,
+#     `realized_legs` or `planned_trades`.
+#   * The IBKR ingest is untouched. When a broker sync for this book arrives
+#     it gets its own endpoint rather than a branch inside `ingest_ibkr`,
+#     which is heavily tested and has been repaired more than once.
+#
+# WHAT IS DERIVED RATHER THAN STORED. Quantity, average cost and every figure
+# built on them come from the transaction ledger on read. The same choice the
+# trading side makes with fills, for the same reason: a stored aggregate is
+# free to drift from the rows beneath it, and this codebase has already paid
+# for that once. Intrinsic values are likewise computed on read -- the monthly
+# cadence governs FETCHING inputs, not doing the arithmetic, which costs
+# microseconds.
+
+from services import valuation as valuation_engine  # noqa: E402
+
+# `market_data` and `growth` reach the network, so they are imported inside
+# the two refresh endpoints rather than here -- nothing else in this file
+# should be able to fail at import time because a provider changed.
+
+
+class InvestmentTransaction(Base):
+    """One thing that happened: a purchase, a sale, a dividend, a transfer.
+
+    The immutable ledger the whole book is derived from. See migration 026.
+    """
+
+    __tablename__ = "investment_transactions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticker = Column(String(20), nullable=False)
+    transaction_type = Column(String(12), nullable=False)
+    quantity = Column(Numeric(18, 8), nullable=True)
+    price = Column(Numeric(18, 4), nullable=True)
+    # Signed from the account's point of view: negative when money left to buy
+    # something, positive when it arrived. Fees are INCLUDED here -- this is
+    # the cash movement, and `fees` below is the same money broken out for
+    # cost analysis, not a second charge.
+    total_amount = Column(Numeric(18, 4), nullable=False)
+    fees = Column(Numeric(18, 4), nullable=False, default=0)
+    transaction_date = Column(DateTime(timezone=True), nullable=False)
+    listed_currency = Column(String(3), nullable=False, default="USD")
+    exchange_rate = Column(Numeric(18, 8), nullable=False, default=1)
+    source = Column(String(12), nullable=False, default="MANUAL")
+    external_id = Column(Text, nullable=True, unique=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class InvestmentHolding(Base):
+    """A ticker in the book: how it is classified, and its last quote."""
+
+    __tablename__ = "investment_holdings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticker = Column(String(20), nullable=False, unique=True)
+    name = Column(Text, nullable=True)
+    sector = Column(Text, nullable=True)
+    category = Column(String(20), nullable=True)
+    holding_type = Column(String(24), nullable=True)
+    country = Column(String(32), nullable=True)
+    listed_currency = Column(String(3), nullable=False, default="USD")
+    exchange_rate = Column(Numeric(18, 8), nullable=False, default=1)
+    planned_allocation = Column(Numeric(18, 4), nullable=True)
+    # Whether a discounted cash flow means anything here. False for an ETF,
+    # which has no cash flows of its own.
+    is_valuable = Column(Boolean, nullable=False, default=True)
+    current_price = Column(Numeric(18, 4), nullable=True)
+    price_updated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class InvestmentValuationInput(Base):
+    """What the DCF was fed, in two variants that never merge in storage.
+
+    'auto' is replaced wholesale by each refresh; 'override' is whatever the
+    user typed and is never touched by one. They are combined only on read.
+    """
+
+    __tablename__ = "investment_valuation_inputs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticker = Column(String(20), nullable=False)
+    variant = Column(String(10), nullable=False)
+    base_flow = Column(Numeric(20, 4), nullable=True)
+    metric = Column(String(24), nullable=True)
+    shares_outstanding = Column(Numeric(20, 4), nullable=True)
+    total_debt = Column(Numeric(20, 4), nullable=True)
+    cash_and_st = Column(Numeric(20, 4), nullable=True)
+    beta = Column(Numeric(10, 4), nullable=True)
+    growth_1_5 = Column(Numeric(10, 6), nullable=True)
+    discount_rate = Column(Numeric(10, 6), nullable=True)
+    region = Column(String(4), nullable=False, default="US")
+    source = Column(String(24), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+VARIANT_AUTO = "auto"
+VARIANT_OVERRIDE = "override"
+
+TX_BUY = "BUY"
+TX_SELL = "SELL"
+TX_DIVIDEND = "DIVIDEND"
+TX_TRANSFER = "TRANSFER"
+TX_TYPES = (TX_BUY, TX_SELL, TX_DIVIDEND, TX_TRANSFER)
+
+# Transactions that add shares at a cost. TRANSFER is here because a holding
+# arriving from another broker keeps its basis -- it is a purchase whose cash
+# left the account somewhere this book cannot see.
+TX_ADDS_SHARES = (TX_BUY, TX_TRANSFER)
+
+# The columns a valuation input row actually carries, in one place so the
+# merge, the upsert and the override endpoint cannot drift apart.
+VALUATION_FIELDS = (
+    "base_flow", "metric", "shares_outstanding", "total_debt",
+    "cash_and_st", "beta", "growth_1_5", "discount_rate", "region",
+)
+
+# How stale an 'auto' row may be before a refresh will replace it. Twenty-five
+# rather than thirty so a monthly job cannot drift into skipping a month: run
+# on the 1st, a 30-day guard makes the next run on the 1st a no-op.
+REFRESH_MAX_AGE = timedelta(days=25)
+
+
+def _f(value) -> Optional[float]:
+    """Decimal -> float at the boundary. NULL stays None, never 0.0."""
+    return float(value) if value is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Deriving a position from the ledger
+# ---------------------------------------------------------------------------
+
+
+class DerivedPosition(BaseModel):
+    """Quantity and cost, reconstructed from transactions.
+
+    AVERAGE COST, not FIFO. The trading side is FIFO because a round trip is
+    the unit there and the broker reports it that way. Here the unit is a
+    holding accumulated over years, often with a monthly purchase; average
+    cost is what the portfolio sheet this replaces uses, and it is the figure
+    that answers "what did my position cost me" without inventing lots.
+    """
+
+    ticker: str
+    quantity: float = 0.0
+    average_cost: Optional[float] = None
+    cost_basis: float = 0.0
+    realized_pnl: float = 0.0
+    dividends: float = 0.0
+    transaction_count: int = 0
+    first_acquired: Optional[datetime] = None
+    last_activity: Optional[datetime] = None
+
+
+def _derive_position(ticker: str, rows: Sequence[InvestmentTransaction]) -> DerivedPosition:
+    """Walk one ticker's transactions in time order into a position.
+
+    A SELL relieves cost at the CURRENT average, which is what makes this
+    average-cost rather than FIFO: the remaining basis per share is unchanged
+    by a partial sale, so selling half a position does not silently reprice
+    the half still held.
+    """
+    quantity = 0.0
+    cost = 0.0
+    realized = 0.0
+    dividends = 0.0
+    first_acquired: Optional[datetime] = None
+    last_activity: Optional[datetime] = None
+
+    for tx in sorted(rows, key=lambda r: (r.transaction_date, r.created_at or r.transaction_date)):
+        kind = tx.transaction_type
+        amount = _f(tx.total_amount) or 0.0
+        qty = _f(tx.quantity) or 0.0
+        last_activity = tx.transaction_date
+
+        if kind in TX_ADDS_SHARES:
+            quantity += qty
+            # abs(): total_amount is negative for money leaving, and cost is
+            # a magnitude. Taking it as-signed would make every purchase
+            # reduce the basis.
+            cost += abs(amount)
+            if first_acquired is None:
+                first_acquired = tx.transaction_date
+        elif kind == TX_SELL:
+            average = cost / quantity if quantity > 0 else 0.0
+            relieved = average * qty
+            realized += amount - relieved
+            cost = max(0.0, cost - relieved)
+            quantity -= qty
+            # A rounding residue on a full exit would otherwise leave a
+            # basis attached to nothing.
+            if quantity <= 1e-9:
+                quantity = 0.0
+                cost = 0.0
+        elif kind == TX_DIVIDEND:
+            dividends += amount
+
+    return DerivedPosition(
+        ticker=ticker,
+        quantity=quantity,
+        average_cost=(cost / quantity) if quantity > 0 else None,
+        cost_basis=cost,
+        realized_pnl=realized,
+        dividends=dividends,
+        transaction_count=len(rows),
+        first_acquired=first_acquired,
+        last_activity=last_activity,
+    )
+
+
+async def _derive_all_positions(
+    session: AsyncSession, tickers: Optional[Sequence[str]] = None
+) -> dict[str, DerivedPosition]:
+    """Every ticker's position in one query rather than one query per ticker.
+
+    This API container sits far from its database, so cost here is paid per
+    ROUND TRIP; fourteen queries would cost fourteen times as much as one,
+    entirely in waiting.
+    """
+    stmt = select(InvestmentTransaction)
+    if tickers is not None:
+        if not tickers:
+            return {}
+        stmt = stmt.where(InvestmentTransaction.ticker.in_(list(tickers)))
+
+    rows = (await session.execute(stmt)).scalars().all()
+
+    grouped: dict[str, list[InvestmentTransaction]] = {}
+    for row in rows:
+        grouped.setdefault(row.ticker, []).append(row)
+
+    return {t: _derive_position(t, rs) for t, rs in grouped.items()}
+
+
+# ---------------------------------------------------------------------------
+# Holdings
+# ---------------------------------------------------------------------------
+
+
+class HoldingCreate(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=20)
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    category: Optional[str] = Field(None, description="Growth, Predictable or ETF")
+    holding_type: Optional[str] = None
+    country: Optional[str] = None
+    listed_currency: str = Field("USD", min_length=3, max_length=3)
+    exchange_rate: float = Field(1.0, gt=0)
+    planned_allocation: Optional[float] = Field(None, ge=0)
+    # Defaults to True, and is set False for a fund. Explicit rather than
+    # inferred from `category` so a miscategorised ETF does not quietly
+    # acquire an intrinsic value.
+    is_valuable: bool = True
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("listed_currency")
+    @classmethod
+    def _upper_currency(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("category")
+    @classmethod
+    def _valid_category(cls, value: Optional[str]) -> Optional[str]:
+        """Mirrors the CHECK in migration 026 so a typo is a 422 naming the
+        allowed values rather than a 500 from the driver."""
+        if value is None or not value.strip():
+            return None
+        allowed = {"Growth", "Predictable", "ETF"}
+        if value.strip() not in allowed:
+            raise ValueError(f"category must be one of {', '.join(sorted(allowed))}")
+        return value.strip()
+
+
+class HoldingUpdate(BaseModel):
+    """Partial edit. Only keys present in the body are applied."""
+
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    category: Optional[str] = None
+    holding_type: Optional[str] = None
+    country: Optional[str] = None
+    listed_currency: Optional[str] = Field(None, min_length=3, max_length=3)
+    exchange_rate: Optional[float] = Field(None, gt=0)
+    planned_allocation: Optional[float] = Field(None, ge=0)
+    is_valuable: Optional[bool] = None
+
+    _valid_category = field_validator("category")(HoldingCreate._valid_category.__func__)
+
+    @field_validator("listed_currency")
+    @classmethod
+    def _upper_currency(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() if value else value
+
+
+async def _get_holding(session: AsyncSession, ticker: str) -> InvestmentHolding:
+    holding = (
+        await session.execute(
+            select(InvestmentHolding).where(InvestmentHolding.ticker == ticker)
+        )
+    ).scalar_one_or_none()
+    if holding is None:
+        raise HTTPException(status_code=404, detail=f"No holding for {ticker}.")
+    return holding
+
+
+@app.post(
+    "/api/investments/holdings",
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_holding(
+    params: HoldingCreate, session: AsyncSession = Depends(get_session)
+):
+    holding = InvestmentHolding(**params.model_dump())
+    session.add(holding)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail=f"{params.ticker} is already in the book."
+        )
+    await session.refresh(holding)
+    return _holding_row(holding)
+
+
+@app.patch(
+    "/api/investments/holdings/{ticker}",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_holding(
+    ticker: str, params: HoldingUpdate, session: AsyncSession = Depends(get_session)
+):
+    holding = await _get_holding(session, ticker.strip().upper())
+    for field, value in params.model_dump(exclude_unset=True).items():
+        setattr(holding, field, value)
+    holding.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(holding)
+    return _holding_row(holding)
+
+
+@app.delete(
+    "/api/investments/holdings/{ticker}",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_holding(ticker: str, session: AsyncSession = Depends(get_session)):
+    """Remove a ticker from the book.
+
+    Refused while transactions remain. The ledger is history, and deleting
+    the holding would leave rows describing purchases of something the book
+    no longer admits owning -- recoverable, but only by reading raw tables.
+    Delete the transactions first if that is genuinely the intent.
+    """
+    ticker = ticker.strip().upper()
+    holding = await _get_holding(session, ticker)
+
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(InvestmentTransaction)
+            .where(InvestmentTransaction.ticker == ticker)
+        )
+    ).scalar() or 0
+    if count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{ticker} still has {count} transaction(s). Delete those first "
+                "if you really mean to remove it."
+            ),
+        )
+
+    await session.execute(
+        delete(InvestmentValuationInput).where(InvestmentValuationInput.ticker == ticker)
+    )
+    await session.delete(holding)
+    await session.commit()
+    return {"ticker": ticker, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Transactions
+# ---------------------------------------------------------------------------
+
+
+class TransactionCreate(BaseModel):
+    """One entry in the ledger.
+
+    `total_amount` may be omitted and is then derived from quantity, price and
+    fees -- which is the common case for hand entry, and removes the question
+    of whether fees belong inside it. Supply it explicitly when importing from
+    a broker, where the cash movement is authoritative and the arithmetic may
+    not reproduce it to the cent.
+    """
+
+    ticker: str = Field(..., min_length=1, max_length=20)
+    transaction_type: str
+    quantity: Optional[float] = Field(None, gt=0)
+    price: Optional[float] = Field(None, ge=0)
+    total_amount: Optional[float] = None
+    fees: float = Field(0.0, ge=0)
+    transaction_date: datetime
+    listed_currency: str = Field("USD", min_length=3, max_length=3)
+    exchange_rate: float = Field(1.0, gt=0)
+    note: Optional[str] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("transaction_type")
+    @classmethod
+    def _valid_type(cls, value: str) -> str:
+        kind = value.strip().upper()
+        if kind not in TX_TYPES:
+            raise ValueError(f"transaction_type must be one of {', '.join(TX_TYPES)}")
+        return kind
+
+    @model_validator(mode="after")
+    def _shape_matches_type(self):
+        """Mirrors migration 026's CHECK, so a bad shape is a 422 that names
+        the problem rather than an IntegrityError the client cannot read."""
+        if self.transaction_type == TX_DIVIDEND:
+            if self.quantity is not None:
+                raise ValueError(
+                    "a DIVIDEND carries no quantity (a share dividend is not "
+                    "modelled yet, and counting it as a purchase would be wrong)"
+                )
+            if self.total_amount is None:
+                raise ValueError("a DIVIDEND needs total_amount -- what was received")
+        else:
+            if self.quantity is None:
+                raise ValueError(f"a {self.transaction_type} needs a quantity")
+            if self.price is None and self.total_amount is None:
+                raise ValueError(
+                    f"a {self.transaction_type} needs a price, or a total_amount"
+                )
+        return self
+
+    def resolved_total(self) -> float:
+        """The signed cash movement, derived when the client did not send one.
+
+        Negative when money left the account. Fees increase what a purchase
+        cost and decrease what a sale returned, which is the same sign
+        convention on both sides once the direction is applied.
+        """
+        if self.total_amount is not None:
+            return self.total_amount
+        gross = (self.quantity or 0.0) * (self.price or 0.0)
+        if self.transaction_type == TX_SELL:
+            return gross - self.fees
+        return -(gross + self.fees)
+
+
+class TransactionUpdate(BaseModel):
+    """Partial edit of a ledger row. Type and ticker are not editable --
+    changing either makes it a different transaction, which is a delete and a
+    create, and doing it in place would silently rewrite a derived position."""
+
+    quantity: Optional[float] = Field(None, gt=0)
+    price: Optional[float] = Field(None, ge=0)
+    total_amount: Optional[float] = None
+    fees: Optional[float] = Field(None, ge=0)
+    transaction_date: Optional[datetime] = None
+    note: Optional[str] = None
+
+
+def _transaction_row(tx: InvestmentTransaction) -> dict:
+    return {
+        "id": tx.id,
+        "ticker": tx.ticker,
+        "transaction_type": tx.transaction_type,
+        "quantity": _f(tx.quantity),
+        "price": _f(tx.price),
+        "total_amount": _f(tx.total_amount),
+        "fees": _f(tx.fees),
+        "transaction_date": tx.transaction_date,
+        "listed_currency": tx.listed_currency,
+        "exchange_rate": _f(tx.exchange_rate),
+        "source": tx.source,
+        "note": tx.note,
+        "created_at": tx.created_at,
+    }
+
+
+@app.get(
+    "/api/investments/transactions",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_transactions(
+    ticker: Optional[str] = None,
+    limit: int = 500,
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(InvestmentTransaction).order_by(
+        InvestmentTransaction.transaction_date.desc()
+    )
+    if ticker:
+        stmt = stmt.where(InvestmentTransaction.ticker == ticker.strip().upper())
+    rows = (await session.execute(stmt.limit(min(limit, 2000)))).scalars().all()
+    return [_transaction_row(r) for r in rows]
+
+
+@app.post(
+    "/api/investments/transactions",
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_transaction(
+    params: TransactionCreate, session: AsyncSession = Depends(get_session)
+):
+    """Record a purchase, sale, dividend or transfer.
+
+    Creates the holding row too if this is the first the book has heard of the
+    ticker. A transaction implies a holding, and refusing here would mean
+    every new position took two calls in a fixed order -- with the ledger left
+    holding orphans if the second one failed.
+    """
+    ticker = params.ticker
+
+    existing = (
+        await session.execute(
+            select(InvestmentHolding).where(InvestmentHolding.ticker == ticker)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            InvestmentHolding(
+                ticker=ticker,
+                listed_currency=params.listed_currency,
+                exchange_rate=params.exchange_rate,
+            )
+        )
+
+    tx = InvestmentTransaction(
+        ticker=ticker,
+        transaction_type=params.transaction_type,
+        quantity=params.quantity,
+        price=params.price,
+        total_amount=params.resolved_total(),
+        fees=params.fees,
+        transaction_date=params.transaction_date,
+        listed_currency=params.listed_currency,
+        exchange_rate=params.exchange_rate,
+        source="MANUAL",
+        note=params.note,
+    )
+    session.add(tx)
+    await session.commit()
+    await session.refresh(tx)
+    return _transaction_row(tx)
+
+
+@app.patch(
+    "/api/investments/transactions/{transaction_id}",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_transaction(
+    transaction_id: uuid.UUID,
+    params: TransactionUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    tx = await session.get(InvestmentTransaction, transaction_id)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+
+    patch = params.model_dump(exclude_unset=True)
+    for field, value in patch.items():
+        setattr(tx, field, value)
+
+    # Recomputed when the parts moved but the total was not itself restated,
+    # so editing a price cannot leave a cash figure describing the old one.
+    if "total_amount" not in patch and {"quantity", "price", "fees"} & set(patch):
+        gross = (_f(tx.quantity) or 0.0) * (_f(tx.price) or 0.0)
+        fees = _f(tx.fees) or 0.0
+        tx.total_amount = (
+            gross - fees if tx.transaction_type == TX_SELL else -(gross + fees)
+        )
+
+    await session.commit()
+    await session.refresh(tx)
+    return _transaction_row(tx)
+
+
+@app.delete(
+    "/api/investments/transactions/{transaction_id}",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_transaction(
+    transaction_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    tx = await session.get(InvestmentTransaction, transaction_id)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+    ticker = tx.ticker
+    await session.delete(tx)
+    await session.commit()
+    return {"id": transaction_id, "ticker": ticker, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Valuation inputs: what the model was fed, and what the user changed
+# ---------------------------------------------------------------------------
+
+
+class ValuationOverride(BaseModel):
+    """A deliberate correction to one or more fetched inputs.
+
+    Every field is optional and NULL means "fall back to auto for this one" --
+    an override sets the figures you disagree with, not all of them. Sending
+    null explicitly clears that single field back to the fetched value.
+    """
+
+    base_flow: Optional[float] = None
+    metric: Optional[str] = Field(None, max_length=24)
+    shares_outstanding: Optional[float] = Field(None, gt=0)
+    total_debt: Optional[float] = Field(None, ge=0)
+    cash_and_st: Optional[float] = Field(None, ge=0)
+    beta: Optional[float] = Field(None, ge=0)
+    growth_1_5: Optional[float] = None
+    discount_rate: Optional[float] = Field(None, gt=0)
+    region: Optional[str] = None
+
+    @field_validator("region")
+    @classmethod
+    def _valid_region(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        region = value.strip().upper()
+        if region not in {"US", "HK"}:
+            raise ValueError("region must be US or HK")
+        return region
+
+
+def _input_row(row: Optional[InvestmentValuationInput]) -> Optional[dict]:
+    if row is None:
+        return None
+    return {
+        "variant": row.variant,
+        "base_flow": _f(row.base_flow),
+        "metric": row.metric,
+        "shares_outstanding": _f(row.shares_outstanding),
+        "total_debt": _f(row.total_debt),
+        "cash_and_st": _f(row.cash_and_st),
+        "beta": _f(row.beta),
+        "growth_1_5": _f(row.growth_1_5),
+        "discount_rate": _f(row.discount_rate),
+        "region": row.region,
+        "source": row.source,
+        "updated_at": row.updated_at,
+    }
+
+
+def _merge_inputs(
+    auto: Optional[InvestmentValuationInput],
+    override: Optional[InvestmentValuationInput],
+) -> tuple[dict, list[str]]:
+    """Override's non-NULL fields win; everything else falls through to auto.
+
+    Returns the merged values and the names of the fields the override
+    actually supplied, so the UI can mark them rather than leaving a reader to
+    diff two columns by eye.
+    """
+    merged: dict = {}
+    overridden: list[str] = []
+
+    for field in VALUATION_FIELDS:
+        auto_value = getattr(auto, field, None) if auto else None
+        over_value = getattr(override, field, None) if override else None
+        if over_value is not None:
+            merged[field] = over_value
+            overridden.append(field)
+        else:
+            merged[field] = auto_value
+
+    # `region` is NOT NULL in the table, so an override row always carries one
+    # and would otherwise look overridden on every ticker.
+    if override is not None and auto is not None and "region" in overridden:
+        if override.region == auto.region:
+            overridden.remove("region")
+
+    return merged, overridden
+
+
+@app.put(
+    "/api/investments/holdings/{ticker}/valuation-override",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def set_valuation_override(
+    ticker: str,
+    params: ValuationOverride,
+    session: AsyncSession = Depends(get_session),
+):
+    """Create or replace the override row for one ticker.
+
+    A PUT rather than a PATCH: the modal edits the whole set of inputs at
+    once, and a partial merge would make "I cleared this field" and "I did not
+    touch this field" the same request.
+    """
+    ticker = ticker.strip().upper()
+    await _get_holding(session, ticker)
+
+    values = params.model_dump()
+    values["region"] = values.get("region") or "US"
+
+    await session.execute(
+        pg_insert(InvestmentValuationInput)
+        .values(ticker=ticker, variant=VARIANT_OVERRIDE, source="manual",
+                updated_at=datetime.now(timezone.utc), **values)
+        .on_conflict_do_update(
+            index_elements=["ticker", "variant"],
+            set_={**values, "source": "manual",
+                  "updated_at": datetime.now(timezone.utc)},
+        )
+    )
+    await session.commit()
+
+    row = (
+        await session.execute(
+            select(InvestmentValuationInput).where(
+                InvestmentValuationInput.ticker == ticker,
+                InvestmentValuationInput.variant == VARIANT_OVERRIDE,
+            )
+        )
+    ).scalar_one_or_none()
+    return _input_row(row)
+
+
+@app.delete(
+    "/api/investments/holdings/{ticker}/valuation-override",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def clear_valuation_override(
+    ticker: str, session: AsyncSession = Depends(get_session)
+):
+    """Discard every override for a ticker, returning it to fetched inputs.
+
+    The 'auto' row is untouched, which is the point of storing the two
+    separately: reverting a judgement cannot cost you the baseline.
+    """
+    ticker = ticker.strip().upper()
+    result = await session.execute(
+        delete(InvestmentValuationInput).where(
+            InvestmentValuationInput.ticker == ticker,
+            InvestmentValuationInput.variant == VARIANT_OVERRIDE,
+        )
+    )
+    await session.commit()
+    return {"ticker": ticker, "cleared": result.rowcount or 0}
+
+
+# ---------------------------------------------------------------------------
+# Refreshing what the model is fed
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/investments/refresh-prices",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def refresh_prices(session: AsyncSession = Depends(get_session)):
+    """Latest quote for every holding. One FMP call each -- the daily path.
+
+    Separate from the fundamentals refresh because the two go stale at
+    completely different rates, and folding them together would spend four
+    calls per holding to learn a price.
+    """
+    from services import market_data  # noqa: PLC0415 - network at request time
+
+    holdings = (
+        await session.execute(select(InvestmentHolding).order_by(InvestmentHolding.ticker))
+    ).scalars().all()
+    if not holdings:
+        return {"updated": 0, "failed": 0, "failures": []}
+
+    updated = 0
+    failures: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    import httpx  # noqa: PLC0415
+
+    async with httpx.AsyncClient(timeout=market_data.TIMEOUT) as client:
+        for holding in holdings:
+            try:
+                quote = await market_data.fetch_quote(holding.ticker, client=client)
+            except market_data.MarketDataError as exc:
+                # One dead symbol must not cost the other thirteen their
+                # prices, so this is collected rather than raised.
+                failures.append({"ticker": holding.ticker, "detail": str(exc)})
+                if exc.status == 429:
+                    break
+                continue
+            holding.current_price = quote.price
+            holding.price_updated_at = now
+            updated += 1
+
+    await session.commit()
+    return {"updated": updated, "failed": len(failures), "failures": failures}
+
+
+@app.post(
+    "/api/investments/refresh",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def refresh_valuation_inputs(
+    force: bool = False,
+    ticker: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-fetch fundamentals and growth, and upsert the 'auto' rows.
+
+    THE MONTHLY PATH, and it is slow on purpose: roughly three FMP calls per
+    holding plus one throttled Finviz request every five seconds, so a
+    thirteen-name book takes about ninety seconds. Both budgets are the
+    reason -- FMP allows 250 calls a day, and Finviz has no API at all and
+    starts refusing after about three rapid requests.
+
+    Rows refreshed within REFRESH_MAX_AGE are skipped unless `force`, which
+    makes an accidental second press cost nothing. Override rows are never
+    touched by any of this.
+    """
+    from services import growth as growth_service  # noqa: PLC0415
+    from services import market_data  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    stmt = select(InvestmentHolding).order_by(InvestmentHolding.ticker)
+    if ticker:
+        stmt = stmt.where(InvestmentHolding.ticker == ticker.strip().upper())
+    holdings = (await session.execute(stmt)).scalars().all()
+
+    # An ETF has no cash flows of its own, so there is nothing here to fetch
+    # and a throttled request spent on one buys nothing.
+    valuable = [h for h in holdings if h.is_valuable]
+
+    existing = {
+        row.ticker: row
+        for row in (
+            await session.execute(
+                select(InvestmentValuationInput).where(
+                    InvestmentValuationInput.variant == VARIANT_AUTO
+                )
+            )
+        ).scalars().all()
+    }
+
+    now = datetime.now(timezone.utc)
+    outcomes: list[dict] = []
+    due: list[InvestmentHolding] = []
+
+    for holding in valuable:
+        row = existing.get(holding.ticker)
+        fresh_enough = (
+            row is not None
+            and row.updated_at is not None
+            and now - row.updated_at < REFRESH_MAX_AGE
+        )
+        if fresh_enough and not force:
+            outcomes.append({
+                "ticker": holding.ticker, "status": "skipped",
+                "detail": f"refreshed {(now - row.updated_at).days}d ago",
+            })
+        else:
+            due.append(holding)
+
+    if not due:
+        return {"refreshed": 0, "skipped": len(outcomes), "failed": 0,
+                "outcomes": outcomes}
+
+    # One throttled pass for the whole batch rather than a call per ticker:
+    # the pacing and the give-up-once-blocked behaviour both live in there.
+    growth_by_ticker = await growth_service.fetch_growth_many(
+        [h.ticker for h in due]
+    )
+
+    refreshed = failed = 0
+    async with httpx.AsyncClient(timeout=market_data.TIMEOUT) as client:
+        for holding in due:
+            try:
+                fundamentals = await market_data.fetch_fundamentals(
+                    holding.ticker, client=client
+                )
+            except market_data.MarketDataError as exc:
+                failed += 1
+                outcomes.append({"ticker": holding.ticker, "status": "failed",
+                                 "detail": str(exc)})
+                if exc.status == 429:
+                    # The daily allowance is spent; every remaining fetch
+                    # would fail the same way.
+                    break
+                continue
+
+            estimate = growth_by_ticker.get(holding.ticker)
+            region = market_data.region_for(
+                fundamentals.country or holding.country, fundamentals.currency
+            )
+
+            values = {
+                # The workbook's definition, not FMP's headline: its input is
+                # labelled "Total Debt (excl. Lease Obligations)" and FMP's
+                # totalDebt includes them.
+                "base_flow": fundamentals.free_cash_flow_m,
+                "metric": "free_cash_flow",
+                "shares_outstanding": fundamentals.shares_outstanding_m,
+                "total_debt": fundamentals.total_debt_ex_leases_m,
+                "cash_and_st": fundamentals.cash_and_st_m,
+                "beta": fundamentals.beta,
+                "growth_1_5": estimate.growth_1_5 if estimate else None,
+                "region": region,
+                # Left NULL so the engine derives it from beta and region.
+                # Only a user pinning a rate by hand fills this in.
+                "discount_rate": None,
+                "source": (estimate.source if estimate else "fmp")[:24],
+                "updated_at": now,
+            }
+
+            await session.execute(
+                pg_insert(InvestmentValuationInput)
+                .values(ticker=holding.ticker, variant=VARIANT_AUTO, **values)
+                .on_conflict_do_update(
+                    index_elements=["ticker", "variant"], set_=values
+                )
+            )
+
+            # Classification the user has not set by hand, filled in from the
+            # same response rather than spending another call later.
+            holding.name = holding.name or fundamentals.name
+            holding.sector = holding.sector or fundamentals.sector
+            holding.country = holding.country or fundamentals.country
+            if fundamentals.price is not None:
+                holding.current_price = fundamentals.price
+                holding.price_updated_at = now
+
+            refreshed += 1
+            outcomes.append({
+                "ticker": holding.ticker,
+                "status": "refreshed",
+                "growth_source": estimate.source if estimate else None,
+                "growth_is_forward": estimate.is_forward if estimate else None,
+                "growth_clamped": estimate.clamped if estimate else None,
+                "detail": None if estimate else "no growth estimate; set one by hand",
+            })
+
+    await session.commit()
+    return {
+        "refreshed": refreshed,
+        "skipped": sum(1 for o in outcomes if o["status"] == "skipped"),
+        "failed": failed,
+        "outcomes": outcomes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The portfolio, valued
+# ---------------------------------------------------------------------------
+
+
+def _holding_row(holding: InvestmentHolding) -> dict:
+    return {
+        "ticker": holding.ticker,
+        "name": holding.name,
+        "sector": holding.sector,
+        "category": holding.category,
+        "holding_type": holding.holding_type,
+        "country": holding.country,
+        "listed_currency": holding.listed_currency,
+        "exchange_rate": _f(holding.exchange_rate),
+        "planned_allocation": _f(holding.planned_allocation),
+        "is_valuable": holding.is_valuable,
+        "current_price": _f(holding.current_price),
+        "price_updated_at": holding.price_updated_at,
+    }
+
+
+def _value_holding(
+    holding: InvestmentHolding, merged: dict, overridden: Sequence[str]
+) -> Optional[dict]:
+    """Run the DCF for one holding, or return None when it cannot be run.
+
+    None rather than a zero: a missing input means the model has nothing to
+    say, and a zero intrinsic value would render as "worth nothing" -- an
+    assertion, where silence is the truth.
+    """
+    base_flow = merged.get("base_flow")
+    shares = merged.get("shares_outstanding")
+    growth = merged.get("growth_1_5")
+    if base_flow is None or not shares or growth is None:
+        missing = [
+            name for name, value in (
+                ("base_flow", base_flow),
+                ("shares_outstanding", shares),
+                ("growth_1_5", growth),
+            ) if value is None or value == 0
+        ]
+        return {"available": False, "missing": missing}
+
+    inputs = valuation_engine.ValuationInputs(
+        ticker=holding.ticker,
+        base_flow=float(base_flow),
+        shares_outstanding=float(shares),
+        growth_1_5=float(growth),
+        beta=_f(merged.get("beta")),
+        total_debt=float(merged.get("total_debt") or 0.0),
+        cash_and_st_investments=float(merged.get("cash_and_st") or 0.0),
+        region=merged.get("region") or "US",
+        exchange_rate=_f(holding.exchange_rate) or 1.0,
+        discount_rate_override=_f(merged.get("discount_rate")),
+    )
+    result = valuation_engine.value(inputs)
+    price = _f(holding.current_price)
+
+    def scenario(s) -> dict:
+        return {
+            "scenario": s.scenario,
+            "intrinsic_value": s.intrinsic_value,
+            "growth_1_5": s.growth_1_5,
+            "growth_6_10": s.growth_6_10,
+            "growth_11_20": s.growth_11_20,
+        }
+
+    return {
+        "available": True,
+        "discount_rate": result.discount_rate,
+        "base": scenario(result.base),
+        "conservative": scenario(result.conservative),
+        "average_intrinsic_value": result.average_intrinsic_value,
+        # Positive means the market is asking more than the model says it is
+        # worth. None when there is no price to compare against, rather than
+        # a 0% that would read as "fairly priced".
+        "premium_pct": result.premium_pct(price) if price else None,
+        "overridden_fields": list(overridden),
+    }
+
+
+@app.get(
+    "/api/investments/portfolio",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def get_portfolio(session: AsyncSession = Depends(get_session)):
+    """The whole book: position, price, valuation and weight, per holding.
+
+    One endpoint rather than several because portfolio weight is the reason:
+    it cannot be computed for a row without the total across every other row,
+    and returning rows that each needed a second call to become meaningful
+    would just move the join into the browser.
+    """
+    holdings = (
+        await session.execute(select(InvestmentHolding).order_by(InvestmentHolding.ticker))
+    ).scalars().all()
+    if not holdings:
+        return {
+            "holdings": [], "total_market_value": 0.0, "total_cost_basis": 0.0,
+            "total_unrealized_pnl": 0.0, "total_realized_pnl": 0.0,
+            "total_dividends": 0.0, "as_of": datetime.now(timezone.utc),
+        }
+
+    positions = await _derive_all_positions(session, [h.ticker for h in holdings])
+
+    inputs_by_ticker: dict[str, dict[str, InvestmentValuationInput]] = {}
+    for row in (
+        await session.execute(select(InvestmentValuationInput))
+    ).scalars().all():
+        inputs_by_ticker.setdefault(row.ticker, {})[row.variant] = row
+
+    rows: list[dict] = []
+    total_market_value = 0.0
+
+    for holding in holdings:
+        position = positions.get(holding.ticker) or DerivedPosition(ticker=holding.ticker)
+        price = _f(holding.current_price)
+        market_value = (price * position.quantity) if price else None
+        if market_value:
+            total_market_value += market_value
+
+        variants = inputs_by_ticker.get(holding.ticker, {})
+        merged, overridden = _merge_inputs(
+            variants.get(VARIANT_AUTO), variants.get(VARIANT_OVERRIDE)
+        )
+
+        rows.append({
+            **_holding_row(holding),
+            "quantity": position.quantity,
+            "average_cost": position.average_cost,
+            "cost_basis": position.cost_basis,
+            "market_value": market_value,
+            "unrealized_pnl": (
+                market_value - position.cost_basis if market_value is not None else None
+            ),
+            "unrealized_pnl_pct": (
+                (market_value / position.cost_basis - 1.0) * 100.0
+                if market_value is not None and position.cost_basis > 0 else None
+            ),
+            "realized_pnl": position.realized_pnl,
+            "dividends": position.dividends,
+            "transaction_count": position.transaction_count,
+            "first_acquired": position.first_acquired,
+            "valuation": (
+                _value_holding(holding, merged, overridden)
+                if holding.is_valuable else None
+            ),
+            "inputs": {
+                "auto": _input_row(variants.get(VARIANT_AUTO)),
+                "override": _input_row(variants.get(VARIANT_OVERRIDE)),
+                "merged": {k: _f(v) if isinstance(v, Decimal) else v
+                           for k, v in merged.items()},
+            },
+            # Filled in below, once the total it divides by is known.
+            "portfolio_weight_pct": None,
+        })
+
+    for row in rows:
+        if row["market_value"] and total_market_value > 0:
+            row["portfolio_weight_pct"] = row["market_value"] / total_market_value * 100.0
+
+    return {
+        "holdings": rows,
+        "total_market_value": total_market_value,
+        "total_cost_basis": sum(r["cost_basis"] for r in rows),
+        "total_unrealized_pnl": sum(
+            r["unrealized_pnl"] for r in rows if r["unrealized_pnl"] is not None
+        ),
+        "total_realized_pnl": sum(r["realized_pnl"] for r in rows),
+        "total_dividends": sum(r["dividends"] for r in rows),
+        "as_of": datetime.now(timezone.utc),
+    }
