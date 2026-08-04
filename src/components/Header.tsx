@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BarChart3, BookOpen, BookText, ClipboardList, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { CreatePlanModal } from './CreatePlanModal';
 import { SyncResultToast } from './SyncResultToast';
@@ -113,6 +113,17 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
           >
             <BookText className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Journal</span>
+          </Link>
+
+          {/* The long-term book. A separate destination rather than a filter on
+              the journal: it answers "what is this worth" where the journal
+              answers "did I follow the plan", and the two share no schema. */}
+          <Link
+            href="/investments"
+            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
+          >
+            <Landmark className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Portfolio</span>
           </Link>
 
           <Link

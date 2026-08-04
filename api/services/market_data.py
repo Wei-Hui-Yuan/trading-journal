@@ -289,15 +289,25 @@ def _millions(row: dict, *names: str) -> Optional[float]:
 
 
 async def fetch_quote(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Quote:
-    """Latest price. One call -- this is the daily path."""
+    """Latest price. One call -- this is the daily path.
+
+    Reads `profile` rather than `quote`, which looks like the wrong endpoint
+    and is not. FMP's free tier gates `quote` by the same narrow symbol list
+    as the statements -- it answered 402 for nine of fourteen holdings here,
+    so the daily refresh updated six prices and failed the rest. `profile` is
+    not gated, carries the same `price` field, and costs the same one call.
+
+    Nothing else `quote` returns is used, so there is no trade-off: this is
+    strictly the endpoint that works for every symbol in the book.
+    """
     owned = client is None
     client = client or httpx.AsyncClient(timeout=TIMEOUT)
     try:
-        row = _first(await _get(client, "quote", symbol=symbol))
+        row = _first(await _get(client, "profile", symbol=symbol))
         price = _num(row, "price")
         if price is None:
             raise MarketDataError(f"FMP returned no price for {symbol}.", status=404)
-        return Quote(symbol=symbol, price=price)
+        return Quote(symbol=symbol, price=price, currency=row.get("currency") or "USD")
     finally:
         if owned:
             await client.aclose()

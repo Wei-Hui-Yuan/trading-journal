@@ -6078,7 +6078,12 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
     for holding in holdings:
         position = positions.get(holding.ticker) or DerivedPosition(ticker=holding.ticker)
         price = _f(holding.current_price)
-        market_value = (price * position.quantity) if price else None
+        # Nothing held is not the same as held and worth zero. A watchlist
+        # entry, or a position fully exited, has no market value and no
+        # unrealised P&L -- and rendering those as 0.00 and +0.00 would put a
+        # green gain of nothing against every ticker being tracked but not
+        # owned.
+        market_value = (price * position.quantity) if price and position.quantity else None
         if market_value:
             total_market_value += market_value
 

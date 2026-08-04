@@ -401,8 +401,34 @@ def test_a_quote_without_a_price_is_a_404_not_a_zero():
     """A zero price would render as a real quote and produce a portfolio
     worth nothing, silently."""
     with pytest.raises(md.MarketDataError) as caught:
-        quote({"quote": [{"symbol": "GOOGL"}]})
+        quote({"profile": [{"symbol": "GOOGL"}]})
     assert caught.value.status == 404
+
+
+def test_the_daily_price_comes_from_the_endpoint_that_is_not_gated():
+    """`quote` is gated by the same narrow symbol list as the statements --
+    it refused nine of fourteen holdings, so the daily refresh updated six
+    prices and failed the rest. `profile` is not gated, carries the same
+    price, and costs the same one call."""
+    result = quote({"profile": [{"symbol": "GOOGL", "price": 373.51,
+                                 "currency": "USD"}]})
+    assert result.price == pytest.approx(373.51)
+
+
+def test_a_gated_symbol_still_gets_a_price():
+    """The regression this replaced: with `quote`, every symbol FMP gates
+    returned 402 and kept its stale price with nothing on screen to say so."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "quote":
+            return httpx.Response(402, text="Premium Query Parameter")
+        return httpx.Response(200, json=[{"symbol": "CPRT", "price": 29.28}])
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await md.fetch_quote("CPRT", client=c)
+
+    assert asyncio.run(scenario()).price == pytest.approx(29.28)
 
 
 # ---------------------------------------------------------------------------
