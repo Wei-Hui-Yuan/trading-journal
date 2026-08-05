@@ -5651,6 +5651,9 @@ async def sync_investment_transactions(session: AsyncSession = Depends(get_sessi
         )
 
     try:
+        # token is left unset on purpose -- fetch_statements resolves it from
+        # IBKR_TOKEN independently of query_ids, so the shared Flex token is
+        # used with THIS query id rather than the trading queries.
         statements, query_failures = await ibkr_client.fetch_statements(
             query_ids=[query_id]
         )

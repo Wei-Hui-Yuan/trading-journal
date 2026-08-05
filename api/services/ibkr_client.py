@@ -253,8 +253,25 @@ async def fetch_statements(
     render a partial run, and a timeout the server names is worth far more than
     one the browser discovers.
     """
-    if token is None or query_ids is None:
-        token, query_ids = get_credentials()
+    # Resolved INDEPENDENTLY, not as an all-or-nothing pair. A caller wanting
+    # the shared token but its OWN query ids -- the investment sync, reading a
+    # different account's query while still using the one Flex token -- must
+    # not have that query_ids silently discarded just because it left token
+    # unset. `token is None or query_ids is None: both from env` was exactly
+    # that bug: it fetched the TRADING account's queries for a caller that had
+    # explicitly asked for a different one, caught before it ever ran for
+    # real because a query id came back that nothing had requested.
+    if token is None:
+        token = os.environ.get("IBKR_FLEX_TOKEN") or os.environ.get("IBKR_TOKEN")
+        if not token:
+            raise IBKRError(
+                "IBKR_FLEX_TOKEN (or IBKR_TOKEN) must be set in the environment"
+            )
+    if query_ids is None:
+        raw_ids = os.environ.get("IBKR_QUERY_ID", "")
+        query_ids = [qid.strip() for qid in raw_ids.split(",") if qid.strip()]
+        if not query_ids:
+            raise IBKRError("IBKR_QUERY_ID must be set in the environment")
 
     statements: list[tuple[str, ET.Element]] = []
     failures: list[str] = []

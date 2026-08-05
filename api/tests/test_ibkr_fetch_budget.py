@@ -49,6 +49,93 @@ def test_the_budget_is_below_the_client_timeout():
     assert ibkr_client.TOTAL_BUDGET_SECONDS >= 120, "must not undercut a legitimate compile"
 
 
+class TestCredentialResolution:
+    """token and query_ids resolve from the environment INDEPENDENTLY.
+
+    The regression: a caller supplying its own query_ids while leaving token
+    unset -- the investment sync, reading a different account's query with
+    the one shared Flex token -- used to have query_ids silently discarded.
+    `if token is None or query_ids is None: both from get_credentials()` ran
+    on ANY partial call, which resolved BOTH from IBKR_QUERY_ID and quietly
+    substituted the trading account's queries for the one actually requested.
+    Caught live: a probe asking for query 1594048 tried to fetch 1578306
+    instead, with no exception and no hint anything had gone wrong -- the
+    swap was silent by construction, exactly the failure mode a parallel
+    pipeline exists to prevent.
+    """
+
+    def test_explicit_query_ids_survive_an_unset_token(self, monkeypatch):
+        monkeypatch.setenv("IBKR_TOKEN", "env-token")
+        monkeypatch.setenv("IBKR_QUERY_ID", "1111,2222")
+
+        captured: list[str] = []
+
+        async def spy(token, query_id):
+            captured.append(query_id)
+            return statement(query_id)
+
+        monkeypatch.setattr(ibkr_client, "fetch_statement", spy)
+
+        run(ibkr_client.fetch_statements(query_ids=["9999"]))
+
+        assert captured == ["9999"], (
+            "an explicitly supplied query_ids must be used as-is, not "
+            "replaced by IBKR_QUERY_ID just because token was omitted"
+        )
+
+    def test_the_token_still_resolves_from_the_environment(self, monkeypatch):
+        """The other half of the same call: an unset token must still reach
+        the env var, not be left None and fail the request."""
+        monkeypatch.setenv("IBKR_TOKEN", "env-token")
+        monkeypatch.setenv("IBKR_QUERY_ID", "1111")
+
+        captured: list[str] = []
+
+        async def spy(token, query_id):
+            captured.append(token)
+            return statement(query_id)
+
+        monkeypatch.setattr(ibkr_client, "fetch_statement", spy)
+
+        run(ibkr_client.fetch_statements(query_ids=["9999"]))
+
+        assert captured == ["env-token"]
+
+    def test_both_omitted_still_resolves_both_from_the_environment(self, monkeypatch):
+        """The trading ingest's actual call shape --
+        `ibkr_client.fetch_statements()`, no arguments -- must be unchanged."""
+        monkeypatch.setenv("IBKR_TOKEN", "env-token")
+        monkeypatch.setenv("IBKR_QUERY_ID", "1111,2222")
+
+        captured: list[tuple[str, str]] = []
+
+        async def spy(token, query_id):
+            captured.append((token, query_id))
+            return statement(query_id)
+
+        monkeypatch.setattr(ibkr_client, "fetch_statement", spy)
+
+        run(ibkr_client.fetch_statements())
+
+        assert captured == [("env-token", "1111"), ("env-token", "2222")]
+
+    def test_an_unset_token_with_no_env_fallback_names_the_variable(self, monkeypatch):
+        monkeypatch.delenv("IBKR_TOKEN", raising=False)
+        monkeypatch.delenv("IBKR_FLEX_TOKEN", raising=False)
+
+        with pytest.raises(ibkr_client.IBKRError) as caught:
+            run(ibkr_client.fetch_statements(query_ids=["9999"]))
+        assert "IBKR_FLEX_TOKEN" in str(caught.value) or "IBKR_TOKEN" in str(caught.value)
+
+    def test_an_unset_query_ids_with_no_env_fallback_names_the_variable(self, monkeypatch):
+        monkeypatch.setenv("IBKR_TOKEN", "env-token")
+        monkeypatch.delenv("IBKR_QUERY_ID", raising=False)
+
+        with pytest.raises(ibkr_client.IBKRError) as caught:
+            run(ibkr_client.fetch_statements(token="explicit-token"))
+        assert "IBKR_QUERY_ID" in str(caught.value)
+
+
 def test_a_query_that_never_returns_is_reported_not_waited_on(monkeypatch):
     """The regression. A hung query used to run to its own ~266s ceiling with
     nothing bounding the total; now it is cut off and named."""
