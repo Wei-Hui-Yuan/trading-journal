@@ -54,7 +54,7 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from auth import verify_clerk_token
+from auth import verify_clerk_or_cron_token, verify_clerk_token
 
 load_dotenv()
 
@@ -5810,7 +5810,7 @@ async def refresh_prices(session: AsyncSession = Depends(get_session)):
 
 @app.post(
     "/api/investments/refresh",
-    dependencies=[Depends(verify_clerk_token)],
+    dependencies=[Depends(verify_clerk_or_cron_token)],
 )
 async def refresh_valuation_inputs(
     force: bool = False,
@@ -5818,6 +5818,12 @@ async def refresh_valuation_inputs(
     session: AsyncSession = Depends(get_session),
 ):
     """Re-fetch fundamentals and growth, and upsert the 'auto' rows.
+
+    Runs on a Northflank Cron Job now rather than a button -- see
+    verify_clerk_or_cron_token for how it authenticates without a browser.
+    REFRESH_MAX_AGE (25 days) is what makes a monthly schedule idempotent
+    without `force`: a run on the 1st always finds everything from the
+    previous 1st older than the guard, and a re-run the same day is a no-op.
 
     THE MONTHLY PATH, and it is slow on purpose: roughly three FMP calls per
     holding plus one throttled Finviz request every five seconds, so a

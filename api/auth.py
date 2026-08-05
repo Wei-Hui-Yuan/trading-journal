@@ -17,6 +17,7 @@ permission to skip the check.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -230,3 +231,32 @@ async def verify_clerk_token(
     except PyJWTError as exc:
         logger.info("Rejected token: %s", exc)
         raise _unauthorized() from exc
+
+
+async def verify_clerk_or_cron_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> dict[str, Any]:
+    """A Clerk session token, OR the scheduler's shared secret.
+
+    For endpoints nothing in the browser calls anymore once a manual button
+    is removed -- the monthly valuation refresh -- but that still needs a way
+    in for an automated caller (Northflank's Cron Job) that cannot complete
+    an interactive Clerk login.
+
+    The bearer token is checked against CRON_SECRET first, in constant time
+    so a wrong guess cannot be timed into a right one. Anything that is not
+    an exact match falls through to an ordinary Clerk verification, which is
+    what keeps the endpoint reachable from an authenticated browser too --
+    a one-off manual re-run, or a future admin trigger, is not locked out by
+    building the scheduled path.
+
+    CRON_SECRET is optional. Unset, this behaves exactly like
+    `verify_clerk_token` -- a deployment that never configures the secret
+    gets no new way in, rather than an endpoint that fails open.
+    """
+    secret = (os.environ.get("CRON_SECRET") or "").strip()
+    if secret and credentials is not None and credentials.credentials:
+        if hmac.compare_digest(credentials.credentials, secret):
+            return {"sub": "cron", "cron": True}
+
+    return await verify_clerk_token(credentials)

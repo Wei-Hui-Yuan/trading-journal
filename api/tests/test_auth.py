@@ -237,3 +237,74 @@ class TestJwksUrlNormalization:
         """End to end: the misconfiguration should no longer reject users."""
         monkeypatch.setenv("CLERK_JWKS_URL", ISSUER)
         assert _verify(_sign(signing_key, _claims()))["sub"]
+
+
+# ---------------------------------------------------------------------------
+# verify_clerk_or_cron_token: a shared secret, alongside Clerk
+# ---------------------------------------------------------------------------
+
+
+def _verify_cron(token_or_creds):
+    creds = token_or_creds
+    if isinstance(token_or_creds, str):
+        creds = _creds(token_or_creds)
+    return asyncio.run(auth.verify_clerk_or_cron_token(creds))
+
+
+class TestClerkOrCronToken:
+    """The endpoint nothing in the browser calls once its button is removed --
+    the monthly valuation refresh -- but that still needs a way in for an
+    automated caller that cannot complete an interactive Clerk login."""
+
+    def test_the_correct_secret_is_accepted_without_a_clerk_token(self, monkeypatch):
+        monkeypatch.setenv("CRON_SECRET", "the-real-secret")
+        result = _verify_cron("the-real-secret")
+        assert result == {"sub": "cron", "cron": True}
+
+    def test_a_valid_clerk_token_still_works_alongside_the_secret(
+        self, monkeypatch, signing_key
+    ):
+        """Removing the button must not lock out a human -- a one-off manual
+        re-run, or a future admin trigger, still has a path in."""
+        monkeypatch.setenv("CRON_SECRET", "the-real-secret")
+        claims = _claims()
+        result = _verify_cron(_sign(signing_key, claims))
+        assert result["sub"] == claims["sub"]
+
+    def test_a_wrong_secret_falls_through_to_clerk_and_is_rejected(self, monkeypatch):
+        """Not a partial match against two schemes -- a wrong guess at the
+        secret is just an invalid Clerk token, and gets the same 401."""
+        monkeypatch.setenv("CRON_SECRET", "the-real-secret")
+        with pytest.raises(HTTPException) as exc:
+            _verify_cron("guessed-wrong")
+        assert exc.value.status_code == 401
+
+    def test_an_unconfigured_secret_does_not_open_the_endpoint(self, monkeypatch):
+        """No CRON_SECRET set must not mean 'any bearer token works' -- a
+        deployment that forgot to configure it gets no new way in, rather
+        than an endpoint that fails open."""
+        monkeypatch.delenv("CRON_SECRET", raising=False)
+        with pytest.raises(HTTPException) as exc:
+            _verify_cron("anything-at-all")
+        assert exc.value.status_code == 401
+
+    def test_an_empty_secret_env_var_does_not_open_the_endpoint(self, monkeypatch):
+        monkeypatch.setenv("CRON_SECRET", "")
+        with pytest.raises(HTTPException) as exc:
+            _verify_cron("")
+        assert exc.value.status_code == 401
+
+    def test_the_comparison_is_exact_not_a_prefix_match(self, monkeypatch):
+        monkeypatch.setenv("CRON_SECRET", "the-real-secret")
+        with pytest.raises(HTTPException):
+            _verify_cron("the-real-secret-extra")
+        with pytest.raises(HTTPException):
+            _verify_cron("the-real-secre")
+
+    def test_missing_credentials_falls_through_to_the_ordinary_clerk_rejection(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CRON_SECRET", "the-real-secret")
+        with pytest.raises(HTTPException) as exc:
+            _verify_cron(None)
+        assert exc.value.status_code == 401
