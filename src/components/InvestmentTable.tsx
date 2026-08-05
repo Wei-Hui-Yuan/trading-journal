@@ -6,6 +6,7 @@ import {
   CalendarClock,
   Loader2,
   Plus,
+  Receipt,
   RefreshCw,
 } from 'lucide-react';
 
@@ -18,6 +19,7 @@ import type { Holding } from '@/types/investments';
 import { ValuationModal } from './ValuationModal';
 import { AddInvestmentModal } from './AddInvestmentModal';
 import { AddHoldingModal } from './AddHoldingModal';
+import { TransactionLedgerModal } from './TransactionLedgerModal';
 
 /**
  * Money, in the listed currency and without pretending to more precision than
@@ -204,6 +206,7 @@ export const InvestmentTable: React.FC = () => {
   const [selected, setSelected] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [addingStock, setAddingStock] = useState(false);
+  const [ledgerTicker, setLedgerTicker] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   // Largest position first, which is how a portfolio is actually read -- the
@@ -363,7 +366,23 @@ export const InvestmentTable: React.FC = () => {
                     title="Open the valuation inputs"
                   >
                     <td className={CELL}>
-                      <div className="font-semibold text-slate-100">{holding.ticker}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-semibold text-slate-100">{holding.ticker}</span>
+                        {/* stopPropagation -- the row's own onClick opens the
+                            valuation modal, and this needs to open a
+                            different one instead of both firing. */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setLedgerTicker(holding.ticker);
+                          }}
+                          title={`${holding.transaction_count} transaction(s) — view, edit or delete`}
+                          className="text-obsidian-muted transition-colors hover:text-slate-200"
+                        >
+                          <Receipt className="h-3 w-3" />
+                        </button>
+                      </div>
                       {holding.name && (
                         <div className="max-w-[150px] truncate text-[10px] text-obsidian-muted">
                           {holding.name}
@@ -499,6 +518,12 @@ export const InvestmentTable: React.FC = () => {
 
       <AddInvestmentModal open={adding} onClose={() => setAdding(false)} />
       <AddHoldingModal open={addingStock} onClose={() => setAddingStock(false)} />
+      {ledgerTicker && (
+        <TransactionLedgerModal
+          ticker={ledgerTicker}
+          onClose={() => setLedgerTicker(null)}
+        />
+      )}
     </div>
   );
 };

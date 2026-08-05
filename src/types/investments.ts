@@ -159,6 +159,24 @@ export interface TransactionPayload {
   note?: string | null;
 }
 
+/**
+ * A correction to one ledger row. Type and ticker are deliberately absent --
+ * changing either makes it a different transaction, which is a delete and a
+ * create, not an edit; doing it in place would silently rewrite a derived
+ * position rather than replacing the row that produced it.
+ *
+ * Only send the fields actually changing -- the backend applies `exclude_unset`,
+ * so an omitted key leaves that column untouched.
+ */
+export interface TransactionUpdatePayload {
+  quantity?: number | null;
+  price?: number | null;
+  total_amount?: number | null;
+  fees?: number;
+  transaction_date?: string;
+  note?: string | null;
+}
+
 export interface HoldingPayload {
   ticker: string;
   name?: string | null;

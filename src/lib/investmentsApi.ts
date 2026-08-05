@@ -16,6 +16,7 @@ import type {
   PriceRefreshResult,
   RefreshResult,
   TransactionPayload,
+  TransactionUpdatePayload,
   ValuationInputRow,
   ValuationOverridePayload,
 } from '@/types/investments';
@@ -42,6 +43,18 @@ export async function createInvestmentTransaction(
 ): Promise<InvestmentTransaction> {
   const { data } = await apiClient.post<InvestmentTransaction>(
     '/investments/transactions',
+    payload
+  );
+  return data;
+}
+
+/** PATCH — only the fields present in `payload` are changed. */
+export async function updateInvestmentTransaction(
+  id: string,
+  payload: TransactionUpdatePayload
+): Promise<InvestmentTransaction> {
+  const { data } = await apiClient.patch<InvestmentTransaction>(
+    `/investments/transactions/${id}`,
     payload
   );
   return data;

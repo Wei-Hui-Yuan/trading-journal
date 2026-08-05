@@ -14,6 +14,7 @@ import {
   refreshValuations,
   setValuationOverride,
   updateHolding,
+  updateInvestmentTransaction,
 } from '@/lib/investmentsApi';
 import type {
   Holding,
@@ -23,6 +24,7 @@ import type {
   PriceRefreshResult,
   RefreshResult,
   TransactionPayload,
+  TransactionUpdatePayload,
   ValuationInputRow,
   ValuationOverridePayload,
 } from '@/types/investments';
@@ -68,6 +70,25 @@ export function useCreateInvestmentTransaction() {
   const queryClient = useQueryClient();
   return useMutation<InvestmentTransaction, Error, TransactionPayload>({
     mutationFn: createInvestmentTransaction,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: investmentKeys.root });
+    },
+  });
+}
+
+/**
+ * A correction, not a new fact -- editing a transaction changes the derived
+ * quantity and average cost of everything after it in the ledger, so the
+ * whole portfolio root is invalidated rather than just the transaction list.
+ */
+export function useUpdateInvestmentTransaction() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    InvestmentTransaction,
+    Error,
+    { id: string; payload: TransactionUpdatePayload }
+  >({
+    mutationFn: ({ id, payload }) => updateInvestmentTransaction(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: investmentKeys.root });
     },
