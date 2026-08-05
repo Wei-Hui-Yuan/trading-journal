@@ -181,6 +181,130 @@ def test_capital_expenditure_is_a_magnitude_not_a_negative():
 
 
 # ---------------------------------------------------------------------------
+# Smoothing a lumpy capex year
+# ---------------------------------------------------------------------------
+#
+# Amazon's real 2023-2025 free cash flow, as FMP would return with limit=3,
+# most recent first. 2025's collapse to $7.7B on a $131.8B AI/AWS capex year
+# is the live case CAPEX_CYCLE_DROP_THRESHOLD exists to catch -- valuing a
+# twenty-year DCF off that one depressed year alone overweights a single
+# capital cycle the model has no way to know is temporary.
+CASH_FLOW_AMZN_3YR = [
+    {"date": "2025-12-31", "operatingCashFlow": 139_500_000_000,
+     "capitalExpenditure": -131_800_000_000, "freeCashFlow": 7_700_000_000},
+    {"date": "2024-12-31", "operatingCashFlow": 115_900_000_000,
+     "capitalExpenditure": -83_000_000_000, "freeCashFlow": 32_900_000_000},
+    {"date": "2023-12-31", "operatingCashFlow": 84_900_000_000,
+     "capitalExpenditure": -52_700_000_000, "freeCashFlow": 32_200_000_000},
+]
+
+# UnitedHealth's real 2023-2025 -- a genuine multi-year decline (0.69x its own
+# trailing average) that must NOT be smoothed away. The closest real figure to
+# the threshold found while calibrating it, which is why it is the regression
+# case rather than an invented one.
+CASH_FLOW_UNH_3YR = [
+    {"date": "2025-12-31", "operatingCashFlow": 18_000_000_000,
+     "capitalExpenditure": -1_900_000_000, "freeCashFlow": 16_100_000_000},
+    {"date": "2024-12-31", "operatingCashFlow": 22_500_000_000,
+     "capitalExpenditure": -1_800_000_000, "freeCashFlow": 20_700_000_000},
+    {"date": "2023-12-31", "operatingCashFlow": 27_500_000_000,
+     "capitalExpenditure": -1_800_000_000, "freeCashFlow": 25_700_000_000},
+]
+
+
+def _bodies(cash_flow_years: list[dict]) -> dict:
+    return {"profile": [PROFILE], "cash-flow-statement": cash_flow_years,
+            "balance-sheet-statement": [BALANCE],
+            "quote": [{"symbol": "GOOGL", "price": 373.51}]}
+
+
+class TestSmoothedFreeCashFlow:
+    """The pure function directly -- the calibration itself, isolated from
+    either provider's parsing."""
+
+    def test_a_collapse_is_averaged_across_every_fetched_year(self):
+        value, smoothed = md._smoothed_free_cash_flow([7_700.0, 32_900.0, 32_200.0])
+        assert smoothed is True
+        assert value == pytest.approx((7_700.0 + 32_900.0 + 32_200.0) / 3)
+
+    def test_a_genuine_decline_short_of_the_threshold_is_not_smoothed(self):
+        """UnitedHealth's real ratio, 0.694, sits just above the 0.40 line --
+        confirming the threshold has real margin, not just the AMZN case."""
+        value, smoothed = md._smoothed_free_cash_flow([16_100.0, 20_700.0, 25_700.0])
+        assert smoothed is False
+        assert value == pytest.approx(16_100.0)
+
+    def test_ordinary_variation_is_untouched(self):
+        """Alphabet's real three years -- nowhere near the line."""
+        value, smoothed = md._smoothed_free_cash_flow([73_300.0, 72_800.0, 69_500.0])
+        assert smoothed is False
+        assert value == pytest.approx(73_300.0)
+
+    def test_a_ramp_up_is_not_treated_as_a_drop(self):
+        """Nvidia-shaped: the latest year is far ABOVE the trend. The rule is
+        drop-only, so a spike must pass through unmodified."""
+        value, smoothed = md._smoothed_free_cash_flow([96_700.0, 60_900.0, 27_000.0])
+        assert smoothed is False
+        assert value == pytest.approx(96_700.0)
+
+    def test_one_year_of_history_has_nothing_to_compare_against(self):
+        """A recent IPO, or a symbol a provider covers for the first time --
+        expected, not a failure, and the single figure stands as-is."""
+        value, smoothed = md._smoothed_free_cash_flow([500.0])
+        assert smoothed is False
+        assert value == pytest.approx(500.0)
+
+    def test_no_data_at_all_is_none_not_zero(self):
+        assert md._smoothed_free_cash_flow([]) == (None, False)
+        assert md._smoothed_free_cash_flow([None, None]) == (None, False)
+
+    def test_missing_years_within_the_window_are_skipped_not_treated_as_zero(self):
+        """A provider that returns fewer than three years pads with nothing,
+        not zero -- a zero-flow prior year would look like a near-total
+        collapse and trigger smoothing for the wrong reason."""
+        value, smoothed = md._smoothed_free_cash_flow([73_300.0, None, 69_500.0])
+        assert smoothed is False
+        assert value == pytest.approx(73_300.0)
+
+    def test_a_prior_average_at_or_below_zero_is_not_divided_into(self):
+        """No meaningful ratio when the trend itself was already unprofitable
+        on a cash basis -- must not raise, and smoothing would not make the
+        comparison any more honest."""
+        value, smoothed = md._smoothed_free_cash_flow([100.0, -50.0, -30.0])
+        assert smoothed is False
+        assert value == pytest.approx(100.0)
+
+
+class TestFmpThreeYearSmoothing:
+    """Through fetch_fundamentals, against the FMP path."""
+
+    def test_amazons_real_collapse_is_smoothed_end_to_end(self):
+        f = fundamentals(bodies=_bodies(CASH_FLOW_AMZN_3YR))
+        assert f.base_flow_smoothed is True
+        assert f.free_cash_flow_m == pytest.approx((7_700 + 32_900 + 32_200) / 3)
+
+    def test_unitedhealths_real_decline_is_not_smoothed_end_to_end(self):
+        f = fundamentals(bodies=_bodies(CASH_FLOW_UNH_3YR))
+        assert f.base_flow_smoothed is False
+        assert f.free_cash_flow_m == pytest.approx(16_100.0)
+
+    def test_operating_cash_flow_and_capex_stay_latest_year_only(self):
+        """Smoothing concerns the one figure that feeds the DCF, not the
+        components a reader would want broken out unmodified."""
+        f = fundamentals(bodies=_bodies(CASH_FLOW_AMZN_3YR))
+        assert f.operating_cash_flow_m == pytest.approx(139_500.0)
+        assert f.capital_expenditure_m == pytest.approx(131_800.0)
+
+    def test_a_single_year_of_history_is_not_smoothed(self):
+        """Same shape as the existing single-row fixture -- confirms the
+        limit=3 change did not alter behaviour for a name with no history to
+        average against."""
+        f = fundamentals()
+        assert f.base_flow_smoothed is False
+        assert f.free_cash_flow_m == pytest.approx(73_266.0)
+
+
+# ---------------------------------------------------------------------------
 # Debt, and the lease definition
 # ---------------------------------------------------------------------------
 
@@ -330,6 +454,71 @@ def test_lease_liabilities_are_not_counted_as_debt():
 def test_current_and_noncurrent_debt_are_added():
     result = fundamentals(statement_status=402, finnhub=FINNHUB_TMO)
     assert result.total_debt_ex_leases_m == pytest.approx(39_385.0)
+
+
+# A synthetic three-filing series, shaped like Copart's real single-filing
+# fixture above but with a collapse in the latest year -- exercises the same
+# smoothing rule through the Finnhub path, which parses filed OCF/capex
+# rather than reading a normalised freeCashFlow field the way FMP does.
+# Debt and cash come from `filings[0]` only regardless, so prior years carry
+# an empty "bs" -- the code never reads it, and a fixture that claimed
+# otherwise would be testing something that cannot happen.
+FINNHUB_MULTI_YEAR_COLLAPSE = {
+    "data": [
+        {"year": 2025, "form": "10-K", "endDate": "2025-07-31 00:00:00",
+         "report": {
+             "cf": [{"concept": "us-gaap_NetCashProvidedByUsedInOperatingActivities",
+                     "value": 1_800_000_000},
+                    {"concept": "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
+                     "value": 1_700_000_000}],
+             "bs": [{"concept": "us-gaap_CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                     "value": 2_780_531_000.0}],
+         }},
+        {"year": 2024, "form": "10-K", "endDate": "2024-07-31 00:00:00",
+         "report": {
+             "cf": [{"concept": "us-gaap_NetCashProvidedByUsedInOperatingActivities",
+                     "value": 1_700_000_000},
+                    {"concept": "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
+                     "value": 500_000_000}],
+             "bs": [],
+         }},
+        {"year": 2023, "form": "10-K", "endDate": "2023-07-31 00:00:00",
+         "report": {
+             "cf": [{"concept": "us-gaap_NetCashProvidedByUsedInOperatingActivities",
+                     "value": 1_600_000_000},
+                    {"concept": "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
+                     "value": 400_000_000}],
+             "bs": [],
+         }},
+    ]
+}
+
+
+def test_a_finnhub_filer_with_a_collapsed_year_is_smoothed_too():
+    """The same rule the FMP path applies, but here computed from filed
+    OCF/capex rather than a normalised freeCashFlow field: latest FCF is
+    100M against a 1,200M trailing average, a 0.083 ratio -- smoothed to the
+    three-filing mean of 833.33M."""
+    result = fundamentals(statement_status=402, finnhub=FINNHUB_MULTI_YEAR_COLLAPSE)
+    assert result.base_flow_smoothed is True
+    assert result.free_cash_flow_m == pytest.approx((100 + 1_200 + 1_200) / 3)
+
+
+def test_a_finnhub_filers_latest_ocf_and_capex_stay_unsmoothed():
+    """Display figures are latest-year-only even when the DCF input behind
+    them was averaged across three."""
+    result = fundamentals(statement_status=402, finnhub=FINNHUB_MULTI_YEAR_COLLAPSE)
+    assert result.operating_cash_flow_m == pytest.approx(1_800.0)
+    assert result.capital_expenditure_m == pytest.approx(1_700.0)
+
+
+def test_a_finnhub_filer_with_one_filing_is_not_smoothed():
+    """Copart's original single-filing fixture -- confirms the multi-year
+    change did not alter behaviour for a filer this feed has only one year
+    of history for."""
+    result = fundamentals(statement_status=402, finnhub=FINNHUB_CPRT)
+    assert result.base_flow_smoothed is False
+    assert result.free_cash_flow_m == pytest.approx(1_230.76)
 
 
 def test_a_combined_debt_and_lease_line_is_flagged_rather_than_guessed():

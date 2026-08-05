@@ -139,6 +139,15 @@ class Fundamentals:
     # leaves the valuation conservative, and flagged rather than hidden.
     debt_includes_leases: bool = False
 
+    # True when a single-year free cash flow figure was replaced by a
+    # trailing multi-year average because the latest year had collapsed
+    # relative to the recent trend -- see _smoothed_free_cash_flow. Amazon's
+    # 2025 FCF at 24% of its own two-year average, on a $131.8B AI/AWS capex
+    # year, is the case this exists for: valuing a twenty-year DCF off that
+    # one depressed year alone overweights a single capital cycle the model
+    # has no way to know is temporary.
+    base_flow_smoothed: bool = False
+
 
 MILLION = 1_000_000
 
@@ -288,6 +297,55 @@ def _millions(row: dict, *names: str) -> Optional[float]:
     return None if raw is None else raw / MILLION
 
 
+# How far below its own recent trend a single year's free cash flow has to
+# fall before that year is smoothed rather than trusted outright. Calibrated
+# against real filings, not guessed: in the same six-symbol sample, Amazon's
+# 2025 FCF sat at 0.24x its trailing two-year average (a $131.8B capex year
+# for AI/AWS) and clearly needs smoothing, while UnitedHealth's worst
+# genuine multi-year decline in that sample sat at 0.69x and clearly should
+# not be smoothed away. 0.40 sits with wide margin on both sides of that
+# real gap -- GOOGL, MSFT and META all cluster at 0.9-1.0x and are nowhere
+# near the line.
+CAPEX_CYCLE_DROP_THRESHOLD = 0.40
+
+
+def _smoothed_free_cash_flow(
+    years_latest_first: Sequence[Optional[float]],
+) -> tuple[Optional[float], bool]:
+    """The base flow the DCF should use, and whether it was smoothed.
+
+    `years_latest_first` holds up to three years of free cash flow, most
+    recent first, wherever the provider makes that many available.
+
+    With fewer than two usable years there is nothing to compare the latest
+    figure against, so it stands unmodified -- the ordinary case for a name
+    with a short filing history, not a failure.
+
+    A collapse (see CAPEX_CYCLE_DROP_THRESHOLD) is smoothed by averaging
+    EVERY fetched year, including the depressed one -- not by discarding it.
+    That is the conventional way to absorb one lumpy capex year in a
+    trailing multi-year figure; averaging only the two flattering years
+    would be cherry-picking the input to get a preferred answer.
+    """
+    values = [v for v in years_latest_first if v is not None]
+    if not values:
+        return None, False
+    if len(values) < 2:
+        return values[0], False
+
+    latest, prior = values[0], values[1:]
+    prior_avg = sum(prior) / len(prior)
+    if prior_avg <= 0:
+        # No meaningful ratio to test when the recent trend was already at or
+        # below zero -- smoothing would not make that comparison more honest.
+        return latest, False
+
+    if latest / prior_avg < CAPEX_CYCLE_DROP_THRESHOLD:
+        return sum(values) / len(values), True
+
+    return latest, False
+
+
 async def fetch_quote(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Quote:
     """Latest price. One call -- this is the daily path.
 
@@ -347,12 +405,33 @@ async def _finnhub_statements(
         return None
 
     latest = filings[0]
-    report = latest.get("report") or {}
-    cash_flow = report.get("cf") or []
-    balance = report.get("bs") or []
+    balance = (latest.get("report") or {}).get("bs") or []
 
-    operating, _ = _pick(cash_flow, _OCF_TAGS)
-    capex, _ = _pick(cash_flow, _CAPEX_TAGS)
+    # Free cash flow, up to three filings, most recent first -- the same
+    # smoothing rule the FMP path applies (_smoothed_free_cash_flow), computed
+    # here from OCF minus capex per filing since Finnhub reports the filed
+    # statements rather than a normalised freeCashFlow field. The latest
+    # filing's own OCF/capex are captured in the same pass, kept for display:
+    # the smoothing concerns only the single figure that feeds the DCF, not
+    # the components a reader would want broken out.
+    fcf_years: list[Optional[float]] = []
+    latest_operating: Optional[float] = None
+    latest_capex: Optional[float] = None
+    for index, filing in enumerate(filings[:3]):
+        cash_flow = (filing.get("report") or {}).get("cf") or []
+        operating, _ = _pick(cash_flow, _OCF_TAGS)
+        capex, _ = _pick(cash_flow, _CAPEX_TAGS)
+        if index == 0:
+            latest_operating, latest_capex = operating, capex
+        # Capex is filed as a positive "payment"; abs() either way so this
+        # cannot accidentally add it back.
+        fcf_years.append(
+            operating - abs(capex) if operating is not None and capex is not None
+            else None
+        )
+
+    free_cash_flow, smoothed = _smoothed_free_cash_flow(fcf_years)
+
     cash, _ = _pick(balance, _CASH_TAGS)
     investments, _ = _pick(balance, _SHORT_TERM_INVESTMENT_TAGS)
 
@@ -367,17 +446,11 @@ async def _finnhub_statements(
         for tag in (current_tag, noncurrent_tag)
     )
 
-    # Capex is filed as a positive "payment". Made a magnitude either way so
-    # the subtraction below cannot accidentally add it back.
-    free_cash_flow = (
-        operating - abs(capex) if operating is not None and capex is not None
-        else None
-    )
-
     return {
-        "operating_cash_flow": operating,
-        "capital_expenditure": abs(capex) if capex is not None else None,
+        "operating_cash_flow": latest_operating,
+        "capital_expenditure": abs(latest_capex) if latest_capex is not None else None,
         "free_cash_flow": free_cash_flow,
+        "free_cash_flow_smoothed": smoothed,
         "total_debt": total_debt,
         "debt_includes_leases": includes_leases,
         "cash_and_st": (cash or 0.0) + (investments or 0.0) if cash is not None else None,
@@ -412,10 +485,17 @@ async def fetch_fundamentals(
 
         statements: Optional[str] = None
         cash_flow: dict = {}
+        cash_flow_years: list[dict] = []
         balance: dict = {}
         try:
-            cash_flow = _first(await _get(client, "cash-flow-statement",
-                                          symbol=symbol, limit=1))
+            # limit=3, not 1 -- the extra two years cost nothing beyond this
+            # one call and are what let a lumpy capex year be smoothed rather
+            # than valued on its own.
+            cash_flow_years = await _get(client, "cash-flow-statement",
+                                         symbol=symbol, limit=3)
+            if not isinstance(cash_flow_years, list):
+                cash_flow_years = [cash_flow_years] if cash_flow_years else []
+            cash_flow = _first(cash_flow_years)
             balance = _first(await _get(client, "balance-sheet-statement",
                                         symbol=symbol, limit=1))
             statements = "fmp" if (cash_flow or balance) else None
@@ -431,6 +511,9 @@ async def fetch_fundamentals(
         if statements == "fmp":
             total_debt_m = _millions(balance, "totalDebt")
             leases_m = _millions(balance, "capitalLeaseObligations")
+            fcf_years_m = [_num(row, "freeCashFlow") for row in cash_flow_years]
+            fcf_years_m = [None if v is None else v / MILLION for v in fcf_years_m]
+            base_flow_m, smoothed = _smoothed_free_cash_flow(fcf_years_m)
             return Fundamentals(
                 symbol=symbol,
                 name=profile.get("companyName"),
@@ -441,7 +524,13 @@ async def fetch_fundamentals(
                 price=price,
                 beta=_num(profile, "beta"),
                 shares_outstanding_m=shares_m,
-                free_cash_flow_m=_millions(cash_flow, "freeCashFlow"),
+                # Possibly a trailing multi-year average, see
+                # _smoothed_free_cash_flow. operating_cash_flow_m and
+                # capital_expenditure_m below stay latest-year-only -- the
+                # smoothing concerns only the single figure that feeds the
+                # DCF, not the components a reader would want broken out.
+                free_cash_flow_m=base_flow_m,
+                base_flow_smoothed=smoothed,
                 operating_cash_flow_m=_millions(cash_flow, "operatingCashFlow"),
                 # FMP reports capex negative (a cash outflow). Stored as a
                 # magnitude so callers subtract it rather than having to know.
@@ -499,6 +588,7 @@ async def fetch_fundamentals(
             beta=_num(profile, "beta"),
             shares_outstanding_m=shares_m,
             free_cash_flow_m=to_m(filed["free_cash_flow"]),
+            base_flow_smoothed=filed["free_cash_flow_smoothed"],
             operating_cash_flow_m=to_m(filed["operating_cash_flow"]),
             capital_expenditure_m=to_m(filed["capital_expenditure"]),
             total_debt_m=to_m(filed["total_debt"]),
