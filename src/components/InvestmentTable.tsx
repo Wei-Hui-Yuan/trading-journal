@@ -3,10 +3,10 @@
 import React, { useMemo, useState } from 'react';
 import {
   AlertCircle,
+  CalendarClock,
   Loader2,
   Plus,
   RefreshCw,
-  TrendingUp,
 } from 'lucide-react';
 
 import {
@@ -94,6 +94,88 @@ const DiscountPremium: React.FC<{ holding: Holding }> = ({ holding }) => {
       {discounted ? '−' : '+'}
       {Math.abs(premium).toFixed(1)}%
     </span>
+  );
+};
+
+const dateFmt = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  dateStyle: 'medium',
+  timeStyle: 'short',
+});
+
+/**
+ * Freshness of the fetched inputs, not of the page load.
+ *
+ * The toolbar used to print "as of {portfolio.as_of}" -- the time the ROW WAS
+ * READ, which is always approximately now and told you nothing about whether
+ * the numbers behind it were a month old. This reads `inputs.auto.updated_at`
+ * instead, which is when the refresh actually last touched each ticker.
+ *
+ * Counted against VALUABLE holdings only: an ETF is never fetched and
+ * counting it as "missing" would make the coverage figure worse than the
+ * refresh actually is.
+ */
+const ValuationStatusCard: React.FC<{
+  holdings: Holding[];
+  onRunNow: () => void;
+  running: boolean;
+}> = ({ holdings, onRunNow, running }) => {
+  const valuable = holdings.filter((h) => h.is_valuable);
+  const valued = valuable.filter((h) => h.valuation?.available).length;
+  // NOT "no auto row at all" -- ASML and Novo Nordisk both HAVE one; Finviz
+  // supplied their growth rate, only the FMP/Finnhub fundamentals came back
+  // empty (foreign filers, see market_data.py). available === false is the
+  // one signal that is actually true regardless of which input is missing.
+  const needsInput = valuable.length - valued;
+
+  const timestamps = valuable
+    .map((h) => h.inputs.auto?.updated_at)
+    .filter((t): t is string => !!t)
+    .map((t) => new Date(t).getTime());
+  const newest = timestamps.length ? Math.max(...timestamps) : null;
+  const oldest = timestamps.length ? Math.min(...timestamps) : null;
+
+  return (
+    <div className="flex max-w-xs items-start gap-3 rounded-xl border border-obsidian-border bg-obsidian-card p-3">
+      <div className="rounded-lg bg-sky-500/10 p-1.5 text-sky-400">
+        <CalendarClock className="h-4 w-4" />
+      </div>
+      <div className="min-w-0">
+        <div className="text-[10px] font-medium uppercase tracking-wider text-obsidian-muted">
+          Valuation data
+        </div>
+        <div className="mt-0.5 font-mono text-lg font-bold text-slate-100">
+          {valued}/{valuable.length}
+          <span className="ml-1 text-xs font-normal text-obsidian-muted">valued</span>
+        </div>
+        <div className="mt-0.5 text-[10px] text-obsidian-muted">
+          {newest === null
+            ? 'never refreshed'
+            : newest === oldest
+              ? `refreshed ${dateFmt.format(newest)} ET`
+              : `refreshed ${dateFmt.format(oldest as number)}–${dateFmt.format(newest)} ET`}
+        </div>
+        {needsInput > 0 && (
+          <div className="mt-0.5 text-[10px] text-amber-400">
+            {needsInput} need{needsInput === 1 ? 's' : ''} manual input
+          </div>
+        )}
+
+        {/* Deliberately a text link, not a button matching the toolbar --
+            the scheduled job is the primary path now, and this is the
+            escape hatch for what it cannot yet cover, not an alternative to
+            it. Loud styling here would put the two on equal footing. */}
+        <button
+          type="button"
+          disabled={running}
+          onClick={onRunNow}
+          title="Re-fetches fundamentals and growth for the whole book right now, ahead of the scheduled run. Takes about ninety seconds."
+          className="mt-1.5 text-[10px] text-slate-500 underline decoration-dotted transition-colors hover:text-slate-300 disabled:opacity-50"
+        >
+          {running ? 'Refreshing (~90s)…' : 'Run now'}
+        </button>
+      </div>
+    </div>
   );
 };
 
@@ -194,11 +276,18 @@ export const InvestmentTable: React.FC = () => {
           Refresh prices
         </button>
 
-        <button
-          type="button"
-          disabled={refreshValuations.isPending}
-          title="Re-fetches fundamentals and growth. Takes about ninety seconds — the growth source has no API and must be requested slowly."
-          onClick={() => {
+      </div>
+
+      {/* No "Refresh valuations" button here on purpose -- a Northflank Cron
+          Job runs this monthly against /api/investments/refresh now (see
+          verify_clerk_or_cron_token in auth.py). The status card is the
+          record of that; the text link inside it is the deliberately quiet
+          escape hatch for the case the schedule cannot cover -- a ticker
+          added five minutes ago, valued next month otherwise. */}
+      {portfolio && (
+        <ValuationStatusCard
+          holdings={holdings}
+          onRunNow={() => {
             setNotice(null);
             refreshValuations.mutate(false, {
               onSuccess: (r) =>
@@ -209,28 +298,9 @@ export const InvestmentTable: React.FC = () => {
               onError: (e) => setNotice(e.message),
             });
           }}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200 disabled:opacity-50"
-        >
-          {refreshValuations.isPending ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <TrendingUp className="h-3.5 w-3.5" />
-          )}
-          {refreshValuations.isPending ? 'Fetching (~90s)…' : 'Refresh valuations'}
-        </button>
-
-        {portfolio && (
-          <span className="ml-auto font-mono text-[10px] text-obsidian-muted">
-            {holdings.length} holdings · as of{' '}
-            {new Date(portfolio.as_of).toLocaleString('en-US', {
-              timeZone: 'America/New_York',
-              dateStyle: 'medium',
-              timeStyle: 'short',
-            })}{' '}
-            ET
-          </span>
-        )}
-      </div>
+          running={refreshValuations.isPending}
+        />
+      )}
 
       {notice && (
         <div className="rounded-lg border border-obsidian-border bg-obsidian-card px-3 py-2 text-xs text-slate-300">
