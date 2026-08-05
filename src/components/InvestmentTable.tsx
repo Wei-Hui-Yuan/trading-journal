@@ -5,6 +5,7 @@ import {
   AlertCircle,
   CalendarClock,
   Loader2,
+  Pencil,
   Plus,
   Receipt,
   RefreshCw,
@@ -20,6 +21,7 @@ import { ValuationModal } from './ValuationModal';
 import { AddInvestmentModal } from './AddInvestmentModal';
 import { AddHoldingModal } from './AddHoldingModal';
 import { TransactionLedgerModal } from './TransactionLedgerModal';
+import { EditHoldingModal } from './EditHoldingModal';
 
 /**
  * Money, in the listed currency and without pretending to more precision than
@@ -207,6 +209,7 @@ export const InvestmentTable: React.FC = () => {
   const [adding, setAdding] = useState(false);
   const [addingStock, setAddingStock] = useState(false);
   const [ledgerTicker, setLedgerTicker] = useState<string | null>(null);
+  const [editingTicker, setEditingTicker] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   // Largest position first, which is how a portfolio is actually read -- the
@@ -224,6 +227,7 @@ export const InvestmentTable: React.FC = () => {
     return rows;
   }, [portfolio]);
   const selectedHolding = holdings.find((h) => h.ticker === selected) ?? null;
+  const editingHolding = holdings.find((h) => h.ticker === editingTicker) ?? null;
 
   if (isLoading) {
     return (
@@ -382,6 +386,17 @@ export const InvestmentTable: React.FC = () => {
                         >
                           <Receipt className="h-3 w-3" />
                         </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingTicker(holding.ticker);
+                          }}
+                          title="Edit classification, or delete this holding"
+                          className="text-obsidian-muted transition-colors hover:text-slate-200"
+                        >
+                          <Pencil className="h-3 w-3" />
+                        </button>
                       </div>
                       {holding.name && (
                         <div className="max-w-[150px] truncate text-[10px] text-obsidian-muted">
@@ -522,6 +537,12 @@ export const InvestmentTable: React.FC = () => {
         <TransactionLedgerModal
           ticker={ledgerTicker}
           onClose={() => setLedgerTicker(null)}
+        />
+      )}
+      {editingHolding && (
+        <EditHoldingModal
+          holding={editingHolding}
+          onClose={() => setEditingTicker(null)}
         />
       )}
     </div>
