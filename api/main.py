@@ -5608,6 +5608,115 @@ async def delete_transaction(
     return {"id": transaction_id, "ticker": ticker, "deleted": True}
 
 
+@app.post(
+    "/api/investments/sync",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def sync_investment_transactions(session: AsyncSession = Depends(get_session)):
+    """Import fills from the long-term book's own IBKR account.
+
+    A SEPARATE endpoint from /api/ingest/ibkr, and deliberately so. That
+    function carries every repair the trading ledger has needed -- resumable
+    staging, suppressed fills, undated and unpriced fills, FIFO rematching --
+    and none of it applies to a holding bought monthly and kept for a decade.
+    Forking inside it would put a working ledger of 337 rows at risk to serve
+    a book that wants none of that machinery.
+
+    Reads IBKR_INVESTMENT_QUERY_ID, which must point at a Flex query scoped to
+    the ACCOUNT the long-term book is held in. That separation is not a
+    convenience: seven of fourteen holdings here are also swing-traded in the
+    journal, so a fill's ticker cannot say which book it belongs to. The
+    broker has to answer that question, and it answers it by account.
+
+    Idempotent through `external_id`, which is UNIQUE -- re-running imports
+    nothing twice, and a hand-entered row (external_id NULL) is never touched,
+    since Postgres treats NULLs as distinct.
+
+    Trades only. Dividends stay manual: the Flex queries emit no cash
+    transaction nodes and the parser reads none.
+    """
+    from services import ibkr_client, ibkr_parser  # noqa: PLC0415 - import cycle
+    from services import investment_sync  # noqa: PLC0415
+
+    query_id = (os.environ.get("IBKR_INVESTMENT_QUERY_ID") or "").strip()
+    if not query_id:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "IBKR_INVESTMENT_QUERY_ID is not set. It must be a Flex query "
+                "scoped to the account the long-term book is held in -- "
+                "pointing it at the trading account would import swing trades "
+                "as long-term holdings."
+            ),
+        )
+
+    try:
+        statements, query_failures = await ibkr_client.fetch_statements(
+            query_ids=[query_id]
+        )
+    except ibkr_client.IBKRError as exc:
+        raise HTTPException(status_code=503 if exc.retryable else 502, detail=str(exc))
+
+    executions = []
+    for _query_id, root in statements:
+        executions.extend(ibkr_parser.parse_statement(root))
+
+    rows = investment_sync.to_investment_transactions(executions)
+    skipped = len(executions) - len(rows)
+
+    if not rows:
+        return {
+            "fills_parsed": len(executions),
+            "imported": 0,
+            "duplicates": 0,
+            "skipped": skipped,
+            "holdings_created": [],
+            "queries_failed": query_failures,
+        }
+
+    # Holdings first: a transaction references a ticker the book may not carry
+    # yet, and the manual path (create_transaction) creates one alongside the
+    # first fill for exactly this reason. Same behaviour here so a synced
+    # position does not arrive as an orphan.
+    tickers = {row["ticker"] for row in rows}
+    existing = {
+        t for (t,) in (
+            await session.execute(
+                select(InvestmentHolding.ticker).where(
+                    InvestmentHolding.ticker.in_(tickers)
+                )
+            )
+        ).all()
+    }
+    created = sorted(tickers - existing)
+    for ticker in created:
+        session.add(InvestmentHolding(ticker=ticker))
+
+    # ON CONFLICT on external_id is the whole dedup story -- no staging table,
+    # unlike the trading side. `ibkr_executions` exists there because a partial
+    # ingest has to be resumable across a FIFO rebuild; nothing here rebuilds
+    # anything, so a second copy of the broker's rows would be a table that can
+    # only drift from the one beneath it.
+    result = await session.execute(
+        pg_insert(InvestmentTransaction)
+        .values(rows)
+        .on_conflict_do_nothing(index_elements=["external_id"])
+        .returning(InvestmentTransaction.external_id)
+    )
+    imported = len(result.fetchall())
+
+    await session.commit()
+
+    return {
+        "fills_parsed": len(executions),
+        "imported": imported,
+        "duplicates": len(rows) - imported,
+        "skipped": skipped,
+        "holdings_created": created,
+        "queries_failed": query_failures,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Valuation inputs: what the model was fed, and what the user changed
 # ---------------------------------------------------------------------------
