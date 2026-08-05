@@ -8,12 +8,10 @@ import type { Holding, HoldingCategory } from '@/types/investments';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Combobox } from './Combobox';
 
-const CATEGORIES: { value: HoldingCategory | ''; label: string }[] = [
-  { value: '', label: '— None —' },
-  { value: 'Growth', label: 'Growth' },
-  { value: 'Predictable', label: 'Predictable' },
-  { value: 'ETF', label: 'ETF' },
-];
+/** Mirrors the CHECK in migration 026 -- a closed set, so the combobox below
+ * is given `allowCustom={false}` rather than letting the trader type a
+ * category the backend will refuse to save. */
+const CATEGORY_VALUES: HoldingCategory[] = ['Growth', 'Predictable', 'ETF'];
 
 const INPUT =
   'w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs ' +
@@ -36,7 +34,18 @@ export const EditHoldingModal: React.FC<{
   typeOptions: string[];
   countryOptions: string[];
   currencyOptions: string[];
-}> = ({ holding, onClose, sectorOptions, typeOptions, countryOptions, currencyOptions }) => {
+  /** Sum of cost basis across every holding, for the allocation weight
+   * preview below. */
+  totalCostBasis: number;
+}> = ({
+  holding,
+  onClose,
+  sectorOptions,
+  typeOptions,
+  countryOptions,
+  currencyOptions,
+  totalCostBasis,
+}) => {
   const update = useUpdateHolding();
   const del = useDeleteHolding();
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +62,17 @@ export const EditHoldingModal: React.FC<{
     holding.planned_allocation === null ? '' : String(holding.planned_allocation)
   );
   const [isValuable, setIsValuable] = useState(holding.is_valuable);
+
+  // Preview only -- what this target WOULD weigh once funded, against the
+  // rest of the book. This holding's own current cost basis is subtracted out
+  // of the base first so it is not counted twice: once as what it costs
+  // today, and again inside the target being previewed.
+  const allocationNum = Number(allocation);
+  const restOfBook = Math.max(0, totalCostBasis - holding.cost_basis);
+  const projectedWeightPct =
+    allocation.trim() && Number.isFinite(allocationNum) && allocationNum > 0
+      ? (allocationNum / (restOfBook + allocationNum)) * 100
+      : null;
 
   const save = () => {
     setError(null);
@@ -128,17 +148,14 @@ export const EditHoldingModal: React.FC<{
               </label>
               <label className="block">
                 <span className={LABEL}>Category</span>
-                <select
+                <Combobox
                   value={category}
-                  onChange={(e) => setCategory(e.target.value as HoldingCategory | '')}
+                  onChange={(v) => setCategory(v as HoldingCategory | '')}
+                  options={CATEGORY_VALUES}
+                  allowCustom={false}
+                  placeholder="— None —"
                   className={`mt-1 ${INPUT}`}
-                >
-                  {CATEGORIES.map((c) => (
-                    <option key={c.value} value={c.value}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
+                />
               </label>
             </div>
 
@@ -193,6 +210,11 @@ export const EditHoldingModal: React.FC<{
                   onChange={(e) => setAllocation(e.target.value)}
                   className={`mt-1 ${INPUT} font-mono`}
                 />
+                {projectedWeightPct !== null && (
+                  <span className="mt-1 block text-[10px] text-slate-600">
+                    {projectedWeightPct.toFixed(1)}% of the book once funded
+                  </span>
+                )}
               </label>
             </div>
 

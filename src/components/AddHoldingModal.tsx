@@ -7,12 +7,10 @@ import { useCreateHolding } from '@/hooks/useInvestments';
 import type { HoldingCategory } from '@/types/investments';
 import { Combobox } from './Combobox';
 
-const CATEGORIES: { value: HoldingCategory | ''; label: string }[] = [
-  { value: '', label: '— None —' },
-  { value: 'Growth', label: 'Growth' },
-  { value: 'Predictable', label: 'Predictable' },
-  { value: 'ETF', label: 'ETF' },
-];
+/** Mirrors the CHECK in migration 026 -- a closed set, so the combobox below
+ * is given `allowCustom={false}` rather than letting the trader type a
+ * category the backend will refuse to save. */
+const CATEGORY_VALUES: HoldingCategory[] = ['Growth', 'Predictable', 'ETF'];
 
 const INPUT =
   'w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs ' +
@@ -39,7 +37,18 @@ export const AddHoldingModal: React.FC<{
   typeOptions: string[];
   countryOptions: string[];
   currencyOptions: string[];
-}> = ({ open, onClose, sectorOptions, typeOptions, countryOptions, currencyOptions }) => {
+  /** Sum of cost basis across every existing holding, for the allocation
+   * weight preview below. */
+  totalCostBasis: number;
+}> = ({
+  open,
+  onClose,
+  sectorOptions,
+  typeOptions,
+  countryOptions,
+  currencyOptions,
+  totalCostBasis,
+}) => {
   const create = useCreateHolding();
   const [error, setError] = useState<string | null>(null);
 
@@ -55,6 +64,15 @@ export const AddHoldingModal: React.FC<{
   const [isValuable, setIsValuable] = useState(true);
 
   if (!open) return null;
+
+  // Preview only -- what this target WOULD weigh once funded, against the
+  // book as it stands today. A brand new holding has no cost basis of its
+  // own yet, so the whole allocation is simply added to the existing total.
+  const allocationNum = Number(allocation);
+  const projectedWeightPct =
+    allocation.trim() && Number.isFinite(allocationNum) && allocationNum > 0
+      ? (allocationNum / (totalCostBasis + allocationNum)) * 100
+      : null;
 
   const reset = () => {
     setTicker('');
@@ -170,17 +188,14 @@ export const AddHoldingModal: React.FC<{
             </label>
             <label className="block">
               <span className={LABEL}>Category</span>
-              <select
+              <Combobox
                 value={category}
-                onChange={(e) => setCategory(e.target.value as HoldingCategory | '')}
+                onChange={(v) => setCategory(v as HoldingCategory | '')}
+                options={CATEGORY_VALUES}
+                allowCustom={false}
+                placeholder="— None —"
                 className={`mt-1 ${INPUT}`}
-              >
-                {CATEGORIES.map((c) => (
-                  <option key={c.value} value={c.value}>
-                    {c.label}
-                  </option>
-                ))}
-              </select>
+              />
             </label>
           </div>
 
@@ -239,6 +254,11 @@ export const AddHoldingModal: React.FC<{
                 placeholder="1000"
                 className={`mt-1 ${INPUT} font-mono`}
               />
+              {projectedWeightPct !== null && (
+                <span className="mt-1 block text-[10px] text-slate-600">
+                  {projectedWeightPct.toFixed(1)}% of the book once funded
+                </span>
+              )}
             </label>
           </div>
 

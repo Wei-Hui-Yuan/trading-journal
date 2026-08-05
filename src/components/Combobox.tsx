@@ -15,8 +15,15 @@ export const Combobox: React.FC<
     value: string;
     onChange: (value: string) => void;
     options: string[];
+    /**
+     * False for a closed set backed by a DB constraint (e.g. category) --
+     * suppresses the "+Add" affordance so the dropdown reads as a searchable
+     * select rather than an invitation to invent a new value the backend
+     * will reject.
+     */
+    allowCustom?: boolean;
   } & Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange'>
-> = ({ value, onChange, options, className, ...inputProps }) => {
+> = ({ value, onChange, options, allowCustom = true, className, ...inputProps }) => {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
 
@@ -36,7 +43,7 @@ export const Combobox: React.FC<
     ? options.filter((o) => o.toLowerCase().includes(query))
     : options;
   const exactMatch = options.some((o) => o.toLowerCase() === query);
-  const showAddNew = query.length > 0 && !exactMatch;
+  const showAddNew = allowCustom && query.length > 0 && !exactMatch;
 
   return (
     <div ref={wrapperRef} className="relative">
