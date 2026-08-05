@@ -6,6 +6,7 @@ import { AlertCircle, Loader2, Trash2, X } from 'lucide-react';
 import { useDeleteHolding, useUpdateHolding } from '@/hooks/useInvestments';
 import type { Holding, HoldingCategory } from '@/types/investments';
 import { ConfirmDialog } from './ConfirmDialog';
+import { Combobox } from './Combobox';
 
 const CATEGORIES: { value: HoldingCategory | ''; label: string }[] = [
   { value: '', label: '— None —' },
@@ -30,7 +31,12 @@ const LABEL = 'text-[10px] uppercase tracking-wide text-obsidian-muted';
 export const EditHoldingModal: React.FC<{
   holding: Holding;
   onClose: () => void;
-}> = ({ holding, onClose }) => {
+  /** Distinct values already used elsewhere in the book, for each combobox. */
+  sectorOptions: string[];
+  typeOptions: string[];
+  countryOptions: string[];
+  currencyOptions: string[];
+}> = ({ holding, onClose, sectorOptions, typeOptions, countryOptions, currencyOptions }) => {
   const update = useUpdateHolding();
   const del = useDeleteHolding();
   const [error, setError] = useState<string | null>(null);
@@ -113,9 +119,10 @@ export const EditHoldingModal: React.FC<{
             <div className="grid grid-cols-2 gap-3">
               <label className="block">
                 <span className={LABEL}>Sector</span>
-                <input
+                <Combobox
                   value={sector}
-                  onChange={(e) => setSector(e.target.value)}
+                  onChange={setSector}
+                  options={sectorOptions}
                   className={`mt-1 ${INPUT}`}
                 />
               </label>
@@ -138,17 +145,19 @@ export const EditHoldingModal: React.FC<{
             <div className="grid grid-cols-2 gap-3">
               <label className="block">
                 <span className={LABEL}>Type</span>
-                <input
+                <Combobox
                   value={holdingType}
-                  onChange={(e) => setHoldingType(e.target.value)}
+                  onChange={setHoldingType}
+                  options={typeOptions}
                   className={`mt-1 ${INPUT}`}
                 />
               </label>
               <label className="block">
                 <span className={LABEL}>Country</span>
-                <input
+                <Combobox
                   value={country}
-                  onChange={(e) => setCountry(e.target.value)}
+                  onChange={setCountry}
+                  options={countryOptions}
                   className={`mt-1 ${INPUT}`}
                 />
               </label>
@@ -157,9 +166,10 @@ export const EditHoldingModal: React.FC<{
             <div className="grid grid-cols-3 gap-3">
               <label className="block">
                 <span className={LABEL}>Currency</span>
-                <input
+                <Combobox
                   value={currency}
-                  onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+                  onChange={(v) => setCurrency(v.toUpperCase())}
+                  options={currencyOptions}
                   maxLength={3}
                   className={`mt-1 ${INPUT} font-mono`}
                 />

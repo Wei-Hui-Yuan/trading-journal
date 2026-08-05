@@ -340,6 +340,12 @@ export const InvestmentTable: React.FC = () => {
   const [ledgerTicker, setLedgerTicker] = useState<string | null>(null);
   const [editingTicker, setEditingTicker] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Off by default: a fully exited position (spun off, sold in full) is not
+  // something you are managing day to day, and it crowded out the active
+  // book. Not removed from `holdings` itself -- AllocationPanel and the KPI
+  // header already scope themselves correctly regardless, and hiding it only
+  // here keeps the ledger/edit controls one click away instead of gone.
+  const [showClosed, setShowClosed] = useState(false);
 
   // Largest position first, which is how a portfolio is actually read -- the
   // question is nearly always "what am I most exposed to". Holdings with no
@@ -357,6 +363,25 @@ export const InvestmentTable: React.FC = () => {
   }, [portfolio]);
   const selectedHolding = holdings.find((h) => h.ticker === selected) ?? null;
   const editingHolding = holdings.find((h) => h.ticker === editingTicker) ?? null;
+
+  // What the Sector/Type/Country/Currency comboboxes offer -- distinct
+  // values already used anywhere in the book, closed positions included:
+  // a fully-exited holding's classification is still real data worth
+  // reoffering, not something a display-only filter should hide from here.
+  const fieldOptions = useMemo(() => {
+    const distinct = (values: (string | null)[]) =>
+      Array.from(new Set(values.filter((v): v is string => !!v && v.trim() !== '')))
+        .sort((a, b) => a.localeCompare(b));
+    return {
+      sectors: distinct(holdings.map((h) => h.sector)),
+      types: distinct(holdings.map((h) => h.holding_type)),
+      countries: distinct(holdings.map((h) => h.country)),
+      currencies: distinct(holdings.map((h) => h.listed_currency)),
+    };
+  }, [holdings]);
+
+  const closedHoldings = holdings.filter((h) => h.quantity === 0);
+  const visibleHoldings = showClosed ? holdings : holdings.filter((h) => h.quantity > 0);
 
   if (isLoading) {
     return (
@@ -523,11 +548,38 @@ export const InvestmentTable: React.FC = () => {
       )}
 
       {/* ---------------- the table ---------------- */}
+      {closedHoldings.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setShowClosed((prev) => !prev)}
+          className="text-[11px] text-obsidian-muted underline decoration-dotted transition-colors hover:text-slate-300"
+        >
+          {showClosed
+            ? 'Hide closed positions'
+            : `${closedHoldings.length} closed position${closedHoldings.length === 1 ? '' : 's'} hidden — show`}
+        </button>
+      )}
+
       {holdings.length === 0 ? (
         <div className="rounded-xl border border-dashed border-obsidian-border px-6 py-16 text-center">
           <p className="text-sm text-slate-300">Nothing in the book yet.</p>
           <p className="mt-1 text-xs text-obsidian-muted">
             Record a transaction and the holding is created with it.
+          </p>
+        </div>
+      ) : visibleHoldings.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-obsidian-border px-6 py-16 text-center">
+          <p className="text-sm text-slate-300">No active positions.</p>
+          <p className="mt-1 text-xs text-obsidian-muted">
+            Every holding here has been fully exited.{' '}
+            <button
+              type="button"
+              onClick={() => setShowClosed(true)}
+              className="text-slate-300 underline decoration-dotted hover:text-slate-100"
+            >
+              Show closed positions
+            </button>
+            .
           </p>
         </div>
       ) : (
@@ -551,7 +603,7 @@ export const InvestmentTable: React.FC = () => {
             </thead>
 
             <tbody>
-              {holdings.map((holding, index) => {
+              {visibleHoldings.map((holding, index) => {
                 const pnl = holding.unrealized_pnl;
                 return (
                   <tr
@@ -725,7 +777,14 @@ export const InvestmentTable: React.FC = () => {
       )}
 
       <AddInvestmentModal open={adding} onClose={() => setAdding(false)} />
-      <AddHoldingModal open={addingStock} onClose={() => setAddingStock(false)} />
+      <AddHoldingModal
+        open={addingStock}
+        onClose={() => setAddingStock(false)}
+        sectorOptions={fieldOptions.sectors}
+        typeOptions={fieldOptions.types}
+        countryOptions={fieldOptions.countries}
+        currencyOptions={fieldOptions.currencies}
+      />
       {ledgerTicker && (
         <TransactionLedgerModal
           ticker={ledgerTicker}
@@ -736,6 +795,10 @@ export const InvestmentTable: React.FC = () => {
         <EditHoldingModal
           holding={editingHolding}
           onClose={() => setEditingTicker(null)}
+          sectorOptions={fieldOptions.sectors}
+          typeOptions={fieldOptions.types}
+          countryOptions={fieldOptions.countries}
+          currencyOptions={fieldOptions.currencies}
         />
       )}
     </div>
