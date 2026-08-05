@@ -415,10 +415,21 @@ export const InvestmentTable: React.FC = () => {
           onClick={() => {
             setNotice(null);
             refreshPrices.mutate(undefined, {
-              onSuccess: (r) =>
-                setNotice(
-                  `Prices: ${r.updated} updated${r.failed ? `, ${r.failed} failed` : ''}.`
-                ),
+              onSuccess: (r) => {
+                const head = `Prices: ${r.updated} updated${
+                  r.failed ? `, ${r.failed} failed` : ''
+                }.`;
+                // The endpoint reports WHY each ticker failed; printing only
+                // the count turned a configuration error ("FMP_KEY is not
+                // set" on the server, 20 times over) into what looked like a
+                // dead button. Distinct reasons only -- one bad key produces
+                // the same sentence per holding, and twenty copies of it is
+                // not twenty pieces of information.
+                const reasons = Array.from(
+                  new Set(r.failures.map((f) => f.detail))
+                );
+                setNotice(reasons.length ? `${head} ${reasons.join(' ')}` : head);
+              },
               onError: (e) => setNotice(e.message),
             });
           }}
