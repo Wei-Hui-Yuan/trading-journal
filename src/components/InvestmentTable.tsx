@@ -17,6 +17,7 @@ import {
 import type { Holding } from '@/types/investments';
 import { ValuationModal } from './ValuationModal';
 import { AddInvestmentModal } from './AddInvestmentModal';
+import { AddHoldingModal } from './AddHoldingModal';
 
 /**
  * Money, in the listed currency and without pretending to more precision than
@@ -202,6 +203,7 @@ export const InvestmentTable: React.FC = () => {
 
   const [selected, setSelected] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [addingStock, setAddingStock] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   // Largest position first, which is how a portfolio is actually read -- the
@@ -251,6 +253,18 @@ export const InvestmentTable: React.FC = () => {
         >
           <Plus className="h-3.5 w-3.5" />
           Record transaction
+        </button>
+
+        {/* Separate from "Record transaction" -- that path creates a holding
+            implicitly alongside its first fill. This is for the opposite
+            order: classify and value a ticker before owning any of it. */}
+        <button
+          type="button"
+          onClick={() => setAddingStock(true)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Add stock
         </button>
 
         <button
@@ -484,6 +498,7 @@ export const InvestmentTable: React.FC = () => {
       )}
 
       <AddInvestmentModal open={adding} onClose={() => setAdding(false)} />
+      <AddHoldingModal open={addingStock} onClose={() => setAddingStock(false)} />
     </div>
   );
 };
