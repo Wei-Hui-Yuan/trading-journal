@@ -15,6 +15,7 @@ import type {
   Portfolio,
   PriceRefreshResult,
   RefreshResult,
+  SyncResult,
   TransactionPayload,
   TransactionUpdatePayload,
   ValuationInputRow,
@@ -124,6 +125,20 @@ export async function refreshValuations(force = false): Promise<RefreshResult> {
     '/investments/refresh',
     null,
     { params: { force }, timeout: 300_000 }
+  );
+  return data;
+}
+
+/**
+ * Pull fills from the long-term book's own IBKR account. Same Flex
+ * compile-then-poll machinery as the trading journal's ingest, hence the
+ * same generous timeout -- see ingestIBKR in ./api.
+ */
+export async function syncTransactions(): Promise<SyncResult> {
+  const { data } = await apiClient.post<SyncResult>(
+    '/investments/sync',
+    null,
+    { timeout: 300_000 }
   );
   return data;
 }

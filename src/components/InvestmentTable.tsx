@@ -4,24 +4,31 @@ import React, { useMemo, useState } from 'react';
 import {
   AlertCircle,
   CalendarClock,
+  Coins,
+  DownloadCloud,
+  Landmark,
   Loader2,
   Pencil,
   Plus,
   Receipt,
   RefreshCw,
+  TrendingUp,
+  Wallet,
 } from 'lucide-react';
 
 import {
   usePortfolio,
   useRefreshPrices,
   useRefreshValuations,
+  useSyncTransactions,
 } from '@/hooks/useInvestments';
-import type { Holding } from '@/types/investments';
+import type { Holding, Portfolio } from '@/types/investments';
 import { ValuationModal } from './ValuationModal';
 import { AddInvestmentModal } from './AddInvestmentModal';
 import { AddHoldingModal } from './AddHoldingModal';
 import { TransactionLedgerModal } from './TransactionLedgerModal';
 import { EditHoldingModal } from './EditHoldingModal';
+import { AllocationPanel } from './AllocationPanel';
 
 /**
  * Money, in the listed currency and without pretending to more precision than
@@ -99,6 +106,127 @@ const DiscountPremium: React.FC<{ holding: Holding }> = ({ holding }) => {
       {discounted ? '−' : '+'}
       {Math.abs(premium).toFixed(1)}%
     </span>
+  );
+};
+
+const KPI_CARD =
+  'rounded-xl border border-obsidian-border bg-obsidian-card p-3';
+const KPI_LABEL =
+  'flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-obsidian-muted';
+const KPI_FIGURE = 'mt-1 font-mono text-xl font-bold';
+const KPI_SUBTITLE = 'mt-0.5 text-[10px] text-obsidian-muted';
+
+/**
+ * The four numbers the table's footer row already sums, surfaced above it so
+ * they don't require scrolling to the bottom of a fourteen-row table to find.
+ *
+ * Realized P&L and dividends are shown as two distinct figures rather than
+ * summed into one -- a closed trade's gain and a dividend received are both
+ * "money that came back", but conflating them under one number would hide
+ * which of the two actually produced it.
+ */
+const PortfolioKpiHeader: React.FC<{ portfolio: Portfolio }> = ({ portfolio }) => {
+  const {
+    holdings,
+    total_market_value,
+    total_cost_basis,
+    total_unrealized_pnl,
+    total_realized_pnl,
+    total_dividends,
+  } = portfolio;
+
+  const openPositions = holdings.filter((h) => h.quantity > 0).length;
+  const transactionCount = holdings.reduce((sum, h) => sum + h.transaction_count, 0);
+
+  // total_market_value and total_unrealized_pnl both skip a holding with no
+  // current_price entirely (see the backend: "nothing held is not the same as
+  // held and worth zero"), but total_cost_basis does not -- it counts every
+  // holding regardless of whether it has ever been priced. Dividing the two
+  // portfolio totals directly would mix a priced-only numerator with an
+  // every-holding denominator, which can even get the SIGN wrong when enough
+  // capital sits in unpriced positions. Scoping both sides of the ratio to the
+  // same priced subset is what a holding's own unrealized_pnl_pct already
+  // does; this is that identity applied to the total instead of one row.
+  const pricedHoldings = holdings.filter((h) => h.market_value !== null);
+  const pricedCostBasis = pricedHoldings.reduce((sum, h) => sum + h.cost_basis, 0);
+  const unrealizedPct =
+    pricedCostBasis > 0 ? (total_unrealized_pnl / pricedCostBasis) * 100 : null;
+
+  // Real capital, sitting in a real position, that current_market_value and
+  // unrealized P&L above are silently not accounting for -- not because it is
+  // worthless, but because no price has ever been fetched for it. Worth
+  // saying out loud rather than letting "Capital invested" and "Total
+  // portfolio value" quietly disagree by exactly this amount.
+  const unpriced = holdings.filter((h) => h.quantity > 0 && h.market_value === null);
+  const unpricedCostBasis = unpriced.reduce((sum, h) => sum + h.cost_basis, 0);
+
+  return (
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className={KPI_CARD}>
+        <div className={KPI_LABEL}>
+          <Wallet className="h-3.5 w-3.5 text-sky-400" />
+          Total portfolio value
+        </div>
+        <div className={`${KPI_FIGURE} text-slate-100`}>{money(total_market_value)}</div>
+        <div className={KPI_SUBTITLE}>
+          {openPositions} open position{openPositions === 1 ? '' : 's'}
+        </div>
+        {unpriced.length > 0 && (
+          <div
+            className="mt-0.5 text-[10px] text-amber-400"
+            title={`Never priced: ${unpriced.map((h) => h.ticker).join(', ')}`}
+          >
+            +{unpriced.length} unpriced ({money(unpricedCostBasis)} not counted)
+          </div>
+        )}
+      </div>
+
+      <div className={KPI_CARD}>
+        <div className={KPI_LABEL}>
+          <Landmark className="h-3.5 w-3.5 text-slate-400" />
+          Capital invested
+        </div>
+        <div className={`${KPI_FIGURE} text-slate-100`}>{money(total_cost_basis)}</div>
+        <div className={KPI_SUBTITLE}>
+          {transactionCount} transaction{transactionCount === 1 ? '' : 's'}
+        </div>
+      </div>
+
+      <div className={KPI_CARD}>
+        <div className={KPI_LABEL}>
+          <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
+          Unrealized P&amp;L
+        </div>
+        <div
+          className={`${KPI_FIGURE} ${total_unrealized_pnl >= 0 ? 'text-win' : 'text-loss'}`}
+        >
+          {signedMoney(total_unrealized_pnl)}
+        </div>
+        <div className={KPI_SUBTITLE}>
+          {unrealizedPct === null ? (
+            'vs cost basis'
+          ) : (
+            <>
+              {unrealizedPct >= 0 ? '+' : '−'}
+              {Math.abs(unrealizedPct).toFixed(1)}% vs cost basis
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className={KPI_CARD}>
+        <div className={KPI_LABEL}>
+          <Coins className="h-3.5 w-3.5 text-slate-400" />
+          Realized P&amp;L
+        </div>
+        <div
+          className={`${KPI_FIGURE} ${total_realized_pnl >= 0 ? 'text-win' : 'text-loss'}`}
+        >
+          {signedMoney(total_realized_pnl)}
+        </div>
+        <div className={KPI_SUBTITLE}>{money(total_dividends)} in dividends</div>
+      </div>
+    </div>
   );
 };
 
@@ -204,6 +332,7 @@ export const InvestmentTable: React.FC = () => {
   const { data: portfolio, isLoading, error } = usePortfolio();
   const refreshPrices = useRefreshPrices();
   const refreshValuations = useRefreshValuations();
+  const syncTransactions = useSyncTransactions();
 
   const [selected, setSelected] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -251,6 +380,12 @@ export const InvestmentTable: React.FC = () => {
 
   return (
     <div className="space-y-4">
+      {totals && <PortfolioKpiHeader portfolio={totals} />}
+
+      {holdings.length > 0 && (
+        <AllocationPanel holdings={holdings} onSetTarget={setEditingTicker} />
+      )}
+
       {/* ---------------- toolbar ---------------- */}
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -295,6 +430,53 @@ export const InvestmentTable: React.FC = () => {
             <RefreshCw className="h-3.5 w-3.5" />
           )}
           Refresh prices
+        </button>
+
+        {/* Pulls from the account's OWN Flex query -- a separate pipeline
+            from the trading journal's broker sync, and can take a while for
+            the same reason that one does: IBKR compiles the report on
+            request rather than serving one on hand. */}
+        <button
+          type="button"
+          disabled={syncTransactions.isPending}
+          onClick={() => {
+            setNotice(null);
+            syncTransactions.mutate(undefined, {
+              onSuccess: (r) => {
+                const clauses = [`${r.imported} imported`];
+                if (r.duplicates > 0) {
+                  clauses.push(`${r.duplicates} duplicate${r.duplicates === 1 ? '' : 's'}`);
+                }
+                if (r.holdings_created.length > 0) {
+                  clauses.push(
+                    `${r.holdings_created.length} new holding${
+                      r.holdings_created.length === 1 ? '' : 's'
+                    } (${r.holdings_created.join(', ')})`
+                  );
+                }
+                if (r.skipped > 0) {
+                  clauses.push(`${r.skipped} skipped`);
+                }
+                if (r.queries_failed.length > 0) {
+                  clauses.push(
+                    `${r.queries_failed.length} quer${
+                      r.queries_failed.length === 1 ? 'y' : 'ies'
+                    } unavailable`
+                  );
+                }
+                setNotice(`Sync IBKR: ${clauses.join(', ')}.`);
+              },
+              onError: (e) => setNotice(e.message),
+            });
+          }}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-2 text-xs text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200 disabled:opacity-50"
+        >
+          {syncTransactions.isPending ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <DownloadCloud className="h-3.5 w-3.5" />
+          )}
+          Sync IBKR
         </button>
 
       </div>

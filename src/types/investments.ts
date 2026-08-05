@@ -229,3 +229,18 @@ export interface PriceRefreshResult {
   failed: number;
   failures: { ticker: string; detail: string }[];
 }
+
+/**
+ * Outcome of pulling fills from the long-term book's own IBKR account (a
+ * separate query from the trading journal's). `queries_failed` holds one
+ * message per Flex query that did not return -- typically IBKR rate-limiting
+ * report generation, which clears on its own.
+ */
+export interface SyncResult {
+  fills_parsed: number;
+  imported: number;
+  duplicates: number;
+  skipped: number;
+  holdings_created: string[];
+  queries_failed: string[];
+}

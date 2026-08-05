@@ -13,6 +13,7 @@ import {
   refreshPrices,
   refreshValuations,
   setValuationOverride,
+  syncTransactions,
   updateHolding,
   updateInvestmentTransaction,
 } from '@/lib/investmentsApi';
@@ -23,6 +24,7 @@ import type {
   Portfolio,
   PriceRefreshResult,
   RefreshResult,
+  SyncResult,
   TransactionPayload,
   TransactionUpdatePayload,
   ValuationInputRow,
@@ -185,6 +187,22 @@ export function useRefreshValuations() {
   const queryClient = useQueryClient();
   return useMutation<RefreshResult, Error, boolean | undefined>({
     mutationFn: (force) => refreshValuations(force ?? false),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: investmentKeys.root });
+    },
+  });
+}
+
+/**
+ * Pull fills from the long-term book's own IBKR account -- a separate query
+ * from the trading journal's ingest (see sync_investment_transactions in
+ * main.py). Invalidates the whole root: a new fill changes quantity and
+ * average cost, and can introduce a holding the book has not seen before.
+ */
+export function useSyncTransactions() {
+  const queryClient = useQueryClient();
+  return useMutation<SyncResult, Error, void>({
+    mutationFn: syncTransactions,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: investmentKeys.root });
     },
