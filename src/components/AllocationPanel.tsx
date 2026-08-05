@@ -273,22 +273,29 @@ export const AllocationPanel: React.FC<{
   if (groups.length === 0) return null;
 
   return (
-    <div className="grid grid-cols-1 items-start gap-4 rounded-xl border border-obsidian-border bg-obsidian-card p-4 lg:grid-cols-2">
+    <div className="grid grid-cols-1 gap-4 rounded-xl border border-obsidian-border bg-obsidian-card p-4 lg:grid-cols-2">
       {/* ---------------- sector treemap ---------------- */}
-      <div>
+      {/* No fixed height, and no `items-start` on the grid above: the two
+          columns stretch to match each other (CSS Grid's default), and this
+          one is a flex column with the canvas as the only `flex-1` -- so it
+          fills whatever the progress table's real height turns out to be
+          instead of leaving dead space, in either direction, if the table
+          grows or shrinks. */}
+      <div className="flex h-full flex-col">
         <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-300">
           Sector treemap
         </div>
         <div className="text-[10px] text-obsidian-muted">Sized by cost basis, not market value</div>
 
         {/* Squarified: tiles are positioned by percentage against the fixed
-            CANVAS above, so the layout is correct at any real render width
-            without measuring the DOM. Each tile is two nested divs -- an
-            outer one at the exact percentage bounds (pure layout, no gap
+            CANVAS above, so the layout is correct at any real render height
+            without measuring the DOM -- it only needs SOME height from the
+            flex parent, not a specific one. Each tile is two nested divs --
+            an outer one at the exact percentage bounds (pure layout, no gap
             between tiles) and an inner one inset by a couple of pixels,
             which is what actually creates the seam: the card's own
             background shows through the inset rather than a drawn border. */}
-        <div className="relative mt-2 h-[320px] overflow-hidden rounded-lg">
+        <div className="relative mt-2 min-h-[240px] flex-1 overflow-hidden rounded-lg">
           {tiles.map((t) => {
             const showLine1 = t.rect.w > 55 && t.rect.h > 30;
             const showLine2 = showLine1 && t.rect.h > 55;
