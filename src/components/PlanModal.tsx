@@ -7,18 +7,23 @@ import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucid
 
 import {
   useCreatePlan,
+  useDeletePlanChart,
   useSettings,
   useStrategies,
+  useUpdatePlan,
   useUploadPlanChart,
 } from '@/hooks/useTradeInbox';
-import { ChartDropzone } from '@/components/PlanChart';
+import { ChartDropzone, PlanChartView } from '@/components/PlanChart';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { computeSizing, scoreTakeProfit, sizingHint } from '@/lib/positionSizing';
 import type { CompressedChart } from '@/lib/chartImage';
-import type { TradeSide } from '@/types/api';
+import type { TradePlan, TradeSide } from '@/types/api';
 
-interface CreatePlanModalProps {
+interface PlanModalProps {
   open: boolean;
   onClose: () => void;
+  /** Absent or null = create mode. Present = edit an existing OPEN plan. */
+  plan?: TradePlan | null;
 }
 
 /**
@@ -76,6 +81,25 @@ const blankForm = (): FormState => ({
   riskPercent: '',
 });
 
+/**
+ * An existing plan's fields, back into the string-held form shape.
+ *
+ * `riskPercent` is left '' when the plan never had one -- the settings-seed
+ * effect below fills that in from the account default, same as a fresh plan,
+ * rather than this function guessing at a number the plan does not carry.
+ */
+const formFrom = (plan: TradePlan): FormState => ({
+  symbol: plan.ticker,
+  side: plan.direction,
+  quantity: plan.quantity === null ? '' : String(plan.quantity),
+  plannedEntry: plan.planned_entry === null ? '' : String(plan.planned_entry),
+  plannedStopLoss: plan.stop_loss === null ? '' : String(plan.stop_loss),
+  takeProfitPrice: plan.take_profit === null ? '' : String(plan.take_profit),
+  strategyId: plan.strategy_id ?? '',
+  thesis: plan.thesis ?? '',
+  riskPercent: plan.risk_percent === null ? '' : String(plan.risk_percent),
+});
+
 /** Money, to the cent. */
 const money = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
@@ -106,20 +130,44 @@ const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
  * or exposure, and the collision it used to cause is no longer expressible.
  * The sizing calculator is unchanged: working out what to risk is planning,
  * which is what this form was always really for.
+ *
+ * EDIT MODE: the same form, seeded from an existing OPEN plan and PATCHing it
+ * instead of POSTing a new one. Chart editing is not built yet -- an existing
+ * plan's chart (if any) is left exactly as it is, and the dropzone is hidden
+ * rather than offered and silently ignored.
  */
-export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
+export function PlanModal({ open, onClose, plan }: PlanModalProps) {
+  const isEdit = Boolean(plan);
+
   const [form, setForm] = useState<FormState>(blankForm);
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
   // Held rather than uploaded on selection: the upload is keyed by plan id,
   // and there is no id until the plan itself is saved. Compressed already
-  // though, so the size shown is the size that will be stored.
+  // though, so the size shown is the size that will be stored. Only ever
+  // populated in create mode -- see the module comment above.
   const [chart, setChart] = useState<CompressedChart | null>(null);
   const uploadChart = useUploadPlanChart();
+  // Edit mode only, below. The dropzone is reused as the "pick a
+  // replacement" picker, but the upload it produces is sent immediately on
+  // its own button rather than deferred to the form's Save Changes -- an
+  // existing plan already has an id, so there is no reason to hold it.
+  const [showChartPicker, setShowChartPicker] = useState(false);
+  const [chartError, setChartError] = useState<string | null>(null);
+  const [confirmingChartDelete, setConfirmingChartDelete] = useState(false);
+  // Tracked locally rather than read off `plan.has_chart` directly. `plan` is
+  // a snapshot the dock captured when Edit was clicked; a successful upload
+  // or delete inside this modal invalidates the dock's query, but that
+  // refetch does not reach back in and replace the prop this instance is
+  // still holding. Without this, the section would revert to "no chart" for
+  // the rest of the session even though the upload had already succeeded.
+  const [hasChart, setHasChart] = useState(false);
+  const deleteChart = useDeletePlanChart();
   const symbolRef = useRef<HTMLInputElement>(null);
 
-  const mutation = useCreatePlan();
+  const createMutation = useCreatePlan();
+  const updateMutation = useUpdatePlan();
   // Offered straight from the playbook, so the two cannot drift apart.
   const { data: strategies } = useStrategies();
   // Read-only here. Editing lives on /settings so account size is set
@@ -131,20 +179,26 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
 
   useEffect(() => {
     if (open) {
-      setForm(blankForm());
+      setForm(plan ? formFrom(plan) : blankForm());
       setError(null);
       setSavedSummary(null);
       // Or the previous plan's screenshot would be attached to the next one.
       setChart(null);
+      setShowChartPicker(false);
+      setChartError(null);
+      setConfirmingChartDelete(false);
+      setHasChart(plan?.has_chart ?? false);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
     }
-  }, [open]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, plan?.id]);
 
   // Seed the per-trade risk from the saved default once settings arrive.
   // Guarded on the field being untouched, because settings can resolve after
   // the user has started typing and overwriting mid-keystroke would be worse
-  // than not prefilling.
+  // than not prefilling. Runs in edit mode too: a plan saved before it had a
+  // risk % still deserves the account default rather than staying blank.
   useEffect(() => {
     if (!open || !settings) return;
     setForm((prev) =>
@@ -154,14 +208,16 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
     );
   }, [open, settings]);
 
+  const isSaving = createMutation.isPending || updateMutation.isPending;
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !mutation.isPending) onClose();
+      if (e.key === 'Escape' && !isSaving) onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose, mutation.isPending]);
+  }, [open, onClose, isSaving]);
 
   // The calculator reads the plan rather than duplicating it. Entry and stop
   // are the same two numbers the form already collects; a second copy of them
@@ -253,62 +309,110 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
         return setError(`${labels[typedKey]} must be greater than zero.`);
     }
 
-    mutation.mutate(
-      {
-        ticker: symbol,
-        direction: form.side,
-        quantity,
-        strategy_id: form.strategyId || null,
-        thesis: form.thesis.trim() || null,
-        // Only sent when a stop makes them meaningful. Without one there is no
-        // risk per share, so any figure here would be invented rather than
-        // measured — and a null is honest where a zero would not be.
-        risk_amount: plannedRisk,
-        risk_percent: plannedRiskPercent,
-        ...optional,
-      },
-      {
-        onSuccess: async (plan) => {
-          const saved =
-            `Plan saved for ${plan.ticker}. It will attach itself to the fill ` +
-            'when your next broker sync brings it in — nothing has been ' +
-            'added to the ledger.';
+    const payload = {
+      ticker: symbol,
+      direction: form.side,
+      quantity,
+      strategy_id: form.strategyId || null,
+      thesis: form.thesis.trim() || null,
+      // Only sent when a stop makes them meaningful. Without one there is no
+      // risk per share, so any figure here would be invented rather than
+      // measured — and a null is honest where a zero would not be.
+      risk_amount: plannedRisk,
+      risk_percent: plannedRiskPercent,
+      ...optional,
+    };
 
-          // The plan is already saved at this point, so a failed chart upload
-          // must not read as a failed save. It is reported as what it is --
-          // the plan kept, the screenshot not attached -- and the modal stays
-          // open so the image can be retried rather than silently lost.
-          if (chart) {
-            try {
-              await uploadChart.mutateAsync({
-                planId: plan.id,
-                image: chart.blob,
-                filename: `${plan.ticker}-chart.${chart.mime === 'image/webp' ? 'webp' : 'png'}`,
-              });
-            } catch (err) {
-              setError(
-                `${saved} The chart could not be attached: ` +
-                  `${err instanceof Error ? err.message : 'upload failed'}`
-              );
-              return;
-            }
+    if (isEdit && plan) {
+      updateMutation.mutate(
+        { planId: plan.id, payload },
+        {
+          onSuccess: () => {
+            setSavedSummary(`Plan updated for ${symbol}.`);
+            window.setTimeout(onClose, 1400);
+          },
+          onError: (err) => setError(err.message),
+        }
+      );
+      return;
+    }
+
+    createMutation.mutate(payload, {
+      onSuccess: async (created) => {
+        const saved =
+          `Plan saved for ${created.ticker}. It will attach itself to the fill ` +
+          'when your next broker sync brings it in — nothing has been ' +
+          'added to the ledger.';
+
+        // The plan is already saved at this point, so a failed chart upload
+        // must not read as a failed save. It is reported as what it is --
+        // the plan kept, the screenshot not attached -- and the modal stays
+        // open so the image can be retried rather than silently lost.
+        if (chart) {
+          try {
+            await uploadChart.mutateAsync({
+              planId: created.id,
+              image: chart.blob,
+              filename: `${created.ticker}-chart.${chart.mime === 'image/webp' ? 'webp' : 'png'}`,
+            });
+          } catch (err) {
+            setError(
+              `${saved} The chart could not be attached: ` +
+                `${err instanceof Error ? err.message : 'upload failed'}`
+            );
+            return;
           }
+        }
 
-          setSavedSummary(saved);
-          // Held open a moment so the outcome is readable.
-          window.setTimeout(onClose, 2200);
-        },
-        onError: (err) => setError(err.message),
-      }
-    );
+        setSavedSummary(saved);
+        // Held open a moment so the outcome is readable.
+        window.setTimeout(onClose, 2200);
+      },
+      onError: (err) => setError(err.message),
+    });
+  };
+
+  // Edit mode: attach or replace the chart on its own, independent of the
+  // form's Save Changes. `useUploadPlanChart` is keyed by plan id and
+  // upserts in place server-side, so this never leaves an orphaned object in
+  // storage behind a replacement -- see services/storage.py's upload().
+  const saveChart = async () => {
+    if (!plan || !chart) return;
+    setChartError(null);
+    try {
+      await uploadChart.mutateAsync({
+        planId: plan.id,
+        image: chart.blob,
+        filename: `${plan.ticker}-chart.${chart.mime === 'image/webp' ? 'webp' : 'png'}`,
+      });
+      setChart(null);
+      setShowChartPicker(false);
+      setHasChart(true);
+    } catch (err) {
+      setChartError(err instanceof Error ? err.message : 'Upload failed.');
+    }
+  };
+
+  // The DELETE endpoint removes the object from storage before clearing the
+  // plan's chart columns -- confirmed here because that is real and
+  // irreversible, unlike replacing it.
+  const confirmDeleteChart = async () => {
+    if (!plan) return;
+    setChartError(null);
+    try {
+      await deleteChart.mutateAsync(plan.id);
+      setHasChart(false);
+    } catch (err) {
+      setChartError(err instanceof Error ? err.message : 'Could not remove the chart.');
+    } finally {
+      setConfirmingChartDelete(false);
+    }
   };
 
   const fieldClass =
     'w-full rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-sm text-slate-200 ' +
     'placeholder:text-obsidian-muted focus:outline-none focus:border-slate-600 transition-colors ' +
     'disabled:opacity-50';
-
-  const isSaving = mutation.isPending;
 
   // Rendered through a portal on <body>. The header that mounts this button
   // uses backdrop-blur, which creates a containing block for fixed-position
@@ -319,7 +423,7 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
       className="fixed inset-0 z-[100] flex items-center justify-center p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Create a trade plan"
+      aria-label={isEdit ? 'Edit trade plan' : 'Create a trade plan'}
     >
       {/* Backdrop */}
       <div
@@ -336,10 +440,12 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
             <ClipboardList className="h-4 w-4 text-amber-400" />
             <div>
               <h2 className="text-sm font-semibold tracking-wide text-slate-100">
-                CREATE TRADE PLAN
+                {isEdit ? 'EDIT TRADE PLAN' : 'CREATE TRADE PLAN'}
               </h2>
               <p className="text-[10px] text-obsidian-muted">
-                Before you enter. No fill price — the broker supplies that.
+                {isEdit
+                  ? 'Still open — changes apply immediately.'
+                  : 'Before you enter. No fill price — the broker supplies that.'}
               </p>
             </div>
           </div>
@@ -798,15 +904,97 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
             {/* The other half of the thesis. "Reclaiming the 50 EMA after
                 basing three days" is a sentence; whether the base was
                 actually there is a picture, and reviewing the trade later
-                without it grades the sentence rather than the decision. */}
+                without it grades the sentence rather than the decision.
+
+                Managed independently of the rest of the form in edit mode --
+                replacing or removing the chart is its own action with its
+                own button, not something that waits on Save Changes. */}
             <div className="mt-3">
               <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
                 Chart at entry
               </span>
-              <div className="mt-1">
-                <ChartDropzone value={chart} onChange={setChart} disabled={isSaving} />
-              </div>
+
+              {isEdit && plan ? (
+                <div className="mt-1">
+                  {hasChart && !showChartPicker ? (
+                    <div className="flex items-start gap-3">
+                      <PlanChartView planId={plan.id} />
+                      <div className="flex shrink-0 flex-col gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setShowChartPicker(true)}
+                          disabled={uploadChart.isPending || deleteChart.isPending}
+                          className="rounded-lg border border-obsidian-border bg-obsidian-bg px-2.5 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200 disabled:opacity-50"
+                        >
+                          Replace
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingChartDelete(true)}
+                          disabled={uploadChart.isPending || deleteChart.isPending}
+                          className="rounded-lg border border-obsidian-border bg-obsidian-bg px-2.5 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:border-loss/40 hover:text-loss disabled:opacity-50"
+                        >
+                          {deleteChart.isPending ? 'Removing…' : 'Remove'}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <ChartDropzone value={chart} onChange={setChart} disabled={uploadChart.isPending} />
+                      <div className="mt-2 flex gap-2">
+                        {chart && (
+                          <button
+                            type="button"
+                            onClick={saveChart}
+                            disabled={uploadChart.isPending}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[10px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-60"
+                          >
+                            {uploadChart.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
+                            {uploadChart.isPending
+                              ? 'Uploading…'
+                              : hasChart
+                                ? 'Save replacement'
+                                : 'Attach chart'}
+                          </button>
+                        )}
+                        {hasChart && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowChartPicker(false);
+                              setChart(null);
+                              setChartError(null);
+                            }}
+                            disabled={uploadChart.isPending}
+                            className="rounded-lg border border-obsidian-border px-3 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:text-slate-200 disabled:opacity-50"
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
+                  {chartError && <p className="mt-1.5 text-[11px] text-loss">{chartError}</p>}
+                </div>
+              ) : (
+                <div className="mt-1">
+                  <ChartDropzone value={chart} onChange={setChart} disabled={isSaving} />
+                </div>
+              )}
             </div>
+
+            {isEdit && plan && (
+              <ConfirmDialog
+                open={confirmingChartDelete}
+                title="Remove this chart?"
+                confirmLabel={deleteChart.isPending ? 'Removing…' : 'Remove'}
+                confirmDisabled={deleteChart.isPending}
+                onConfirm={confirmDeleteChart}
+                onCancel={() => setConfirmingChartDelete(false)}
+              >
+                Deletes it from storage. This can&apos;t be undone.
+              </ConfirmDialog>
+            )}
           </fieldset>
 
           {error && (
@@ -845,7 +1033,7 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
               ) : (
                 <>
                   <ClipboardList className="h-3.5 w-3.5" />
-                  Save Plan
+                  {isEdit ? 'Save Changes' : 'Save Plan'}
                 </>
               )}
             </button>
@@ -857,4 +1045,4 @@ export function CreatePlanModal({ open, onClose }: CreatePlanModalProps) {
   );
 }
 
-export default CreatePlanModal;
+export default PlanModal;

@@ -4,7 +4,7 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { Activity, BarChart3, BookOpen, BookText, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
-import { CreatePlanModal } from './CreatePlanModal';
+import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
 import { useLastSync } from '@/hooks/useTradeInbox';
 
@@ -172,7 +172,7 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
 
       </div>
 
-      <CreatePlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
+      <PlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
 
       {/* Mounted here so the summary survives navigating between pages while a
           sync is still in flight — the request outlives any one route. */}
