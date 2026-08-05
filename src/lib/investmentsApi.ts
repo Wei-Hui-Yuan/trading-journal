@@ -15,6 +15,7 @@ import type {
   Portfolio,
   PriceRefreshResult,
   RefreshResult,
+  SectorColor,
   SyncResult,
   TransactionPayload,
   TransactionUpdatePayload,
@@ -141,4 +142,23 @@ export async function syncTransactions(): Promise<SyncResult> {
     { timeout: 300_000 }
   );
   return data;
+}
+
+/** Every sector manually recolored. Absent sectors use the built-in palette. */
+export async function getSectorColors(): Promise<SectorColor[]> {
+  const { data } = await apiClient.get<SectorColor[]>('/investments/sector-colors');
+  return data;
+}
+
+export async function setSectorColor(sector: string, color: string): Promise<SectorColor> {
+  const { data } = await apiClient.put<SectorColor>(
+    `/investments/sector-colors/${encodeURIComponent(sector)}`,
+    { color }
+  );
+  return data;
+}
+
+/** Returns the sector to the built-in palette. */
+export async function deleteSectorColor(sector: string): Promise<void> {
+  await apiClient.delete(`/investments/sector-colors/${encodeURIComponent(sector)}`);
 }

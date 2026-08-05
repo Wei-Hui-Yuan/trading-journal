@@ -5098,6 +5098,23 @@ class InvestmentValuationInput(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class InvestmentSectorColor(Base):
+    """A manual color pick for one sector's treemap tile (migration 027).
+
+    Sparse by design -- a row exists only for a sector the trader has
+    deliberately recolored. Anything absent falls back to the frontend's
+    built-in palette, so this table never needs seeding or backfilling.
+    """
+
+    __tablename__ = "investment_sector_colors"
+
+    sector = Column(Text, primary_key=True)
+    color = Column(Text, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 VARIANT_AUTO = "auto"
 VARIANT_OVERRIDE = "override"
 
@@ -5385,6 +5402,97 @@ async def delete_holding(ticker: str, session: AsyncSession = Depends(get_sessio
     await session.delete(holding)
     await session.commit()
     return {"ticker": ticker, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Sector colors
+# ---------------------------------------------------------------------------
+
+
+class SectorColorIn(BaseModel):
+    color: str
+
+    @field_validator("color")
+    @classmethod
+    def _valid_hex(cls, value: str) -> str:
+        """Mirrors investment_sector_colors_hex so a bad value is a 422 naming
+        the expected format rather than a 500 from the CHECK constraint."""
+        value = value.strip()
+        if len(value) != 7 or value[0] != "#":
+            raise ValueError("color must be a hex value like #3B5978")
+        try:
+            int(value[1:], 16)
+        except ValueError:
+            raise ValueError("color must be a hex value like #3B5978")
+        return value.upper()
+
+
+class SectorColorOut(BaseModel):
+    sector: str
+    color: str
+    updated_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+@app.get(
+    "/api/investments/sector-colors",
+    response_model=list[SectorColorOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_sector_colors(session: AsyncSession = Depends(get_session)):
+    """Every sector the trader has manually recolored. Anything absent from
+    this list uses the frontend's built-in palette."""
+    rows = (
+        (await session.execute(select(InvestmentSectorColor).order_by(InvestmentSectorColor.sector)))
+        .scalars()
+        .all()
+    )
+    return [SectorColorOut.model_validate(row) for row in rows]
+
+
+@app.put(
+    "/api/investments/sector-colors/{sector}",
+    response_model=SectorColorOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def set_sector_color(
+    sector: str, params: SectorColorIn, session: AsyncSession = Depends(get_session)
+):
+    """Create or replace the color for one sector name.
+
+    Upsert on the name itself -- there is no id to look up first, and a
+    second pick for the same sector is a correction, not a new row.
+    """
+    sector = sector.strip()
+    if not sector:
+        raise HTTPException(status_code=422, detail="Sector name cannot be blank.")
+
+    await session.execute(
+        pg_insert(InvestmentSectorColor)
+        .values(sector=sector, color=params.color, updated_at=datetime.now(timezone.utc))
+        .on_conflict_do_update(
+            index_elements=["sector"],
+            set_={"color": params.color, "updated_at": datetime.now(timezone.utc)},
+        )
+    )
+    await session.commit()
+
+    row = await session.get(InvestmentSectorColor, sector)
+    return SectorColorOut.model_validate(row)
+
+
+@app.delete(
+    "/api/investments/sector-colors/{sector}",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_sector_color(sector: str, session: AsyncSession = Depends(get_session)):
+    """Drop the override, returning this sector to the built-in palette."""
+    result = await session.execute(
+        delete(InvestmentSectorColor).where(InvestmentSectorColor.sector == sector.strip())
+    )
+    await session.commit()
+    return {"sector": sector, "deleted": bool(result.rowcount)}
 
 
 # ---------------------------------------------------------------------------

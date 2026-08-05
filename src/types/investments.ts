@@ -244,3 +244,11 @@ export interface SyncResult {
   holdings_created: string[];
   queries_failed: string[];
 }
+
+/** A manually-picked treemap color for one sector. Absent means "use the
+ * built-in palette" -- this is only ever a sparse set of overrides. */
+export interface SectorColor {
+  sector: string;
+  color: string;
+  updated_at: string | null;
+}

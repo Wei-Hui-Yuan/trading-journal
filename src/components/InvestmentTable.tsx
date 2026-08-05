@@ -784,6 +784,7 @@ export const InvestmentTable: React.FC = () => {
         typeOptions={fieldOptions.types}
         countryOptions={fieldOptions.countries}
         currencyOptions={fieldOptions.currencies}
+        totalCostBasis={totals?.total_cost_basis ?? 0}
       />
       {ledgerTicker && (
         <TransactionLedgerModal
@@ -799,6 +800,7 @@ export const InvestmentTable: React.FC = () => {
           typeOptions={fieldOptions.types}
           countryOptions={fieldOptions.countries}
           currencyOptions={fieldOptions.currencies}
+          totalCostBasis={totals?.total_cost_basis ?? 0}
         />
       )}
     </div>

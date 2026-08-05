@@ -8,10 +8,13 @@ import {
   createInvestmentTransaction,
   deleteHolding,
   deleteInvestmentTransaction,
+  deleteSectorColor,
   getInvestmentTransactions,
   getPortfolio,
+  getSectorColors,
   refreshPrices,
   refreshValuations,
+  setSectorColor,
   setValuationOverride,
   syncTransactions,
   updateHolding,
@@ -24,6 +27,7 @@ import type {
   Portfolio,
   PriceRefreshResult,
   RefreshResult,
+  SectorColor,
   SyncResult,
   TransactionPayload,
   TransactionUpdatePayload,
@@ -40,6 +44,7 @@ export const investmentKeys = {
   portfolio: ['investments', 'portfolio'] as const,
   transactions: (ticker?: string) =>
     ['investments', 'transactions', ticker ?? 'all'] as const,
+  sectorColors: ['investments', 'sector-colors'] as const,
 };
 
 /**
@@ -205,6 +210,34 @@ export function useSyncTransactions() {
     mutationFn: syncTransactions,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: investmentKeys.root });
+    },
+  });
+}
+
+/** Sparse -- only the sectors the trader has manually recolored. */
+export function useSectorColors() {
+  return useQuery<SectorColor[], Error>({
+    queryKey: investmentKeys.sectorColors,
+    queryFn: getSectorColors,
+  });
+}
+
+export function useSetSectorColor() {
+  const queryClient = useQueryClient();
+  return useMutation<SectorColor, Error, { sector: string; color: string }>({
+    mutationFn: ({ sector, color }) => setSectorColor(sector, color),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: investmentKeys.sectorColors });
+    },
+  });
+}
+
+export function useDeleteSectorColor() {
+  const queryClient = useQueryClient();
+  return useMutation<void, Error, string>({
+    mutationFn: deleteSectorColor,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: investmentKeys.sectorColors });
     },
   });
 }

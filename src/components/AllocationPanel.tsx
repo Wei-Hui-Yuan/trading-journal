@@ -3,6 +3,7 @@
 import React, { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, PiggyBank } from 'lucide-react';
 
+import { useDeleteSectorColor, useSectorColors, useSetSectorColor } from '@/hooks/useInvestments';
 import type { Holding } from '@/types/investments';
 
 const money = (value: number) =>
@@ -53,6 +54,54 @@ function groupColor(name: string, indexIfUnknown: number): string {
 
 const HATCH_BG =
   'repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,0.04) 4px, rgba(255,255,255,0.04) 8px)';
+
+/**
+ * The legend swatch, made clickable. A real `<input type="color">` sits
+ * invisible on top of the visible square so clicking it opens the browser's
+ * (on Windows, the OS's) native color picker -- the exact matrix in the
+ * screenshot this was built from -- while the swatch itself stays styled the
+ * way the rest of the legend already looks.
+ *
+ * The reset control only appears once a sector actually has an override:
+ * there is nothing to revert for a sector still on the built-in palette.
+ */
+const SectorSwatch: React.FC<{
+  name: string;
+  color: string;
+  hatched: boolean;
+  isOverridden: boolean;
+  onPick: (color: string) => void;
+  onReset: () => void;
+}> = ({ name, color, hatched, isOverridden, onPick, onReset }) => (
+  <span className="group/swatch relative inline-flex h-3 w-3 shrink-0">
+    <input
+      type="color"
+      value={color}
+      onChange={(e) => onPick(e.target.value)}
+      title={`Recolor ${name}`}
+      aria-label={`Recolor ${name}`}
+      className="absolute inset-0 h-full w-full cursor-pointer appearance-none border-0 bg-transparent p-0 opacity-0"
+    />
+    <span
+      className="pointer-events-none h-full w-full rounded-sm ring-1 ring-inset ring-black/25"
+      style={{ backgroundColor: color, backgroundImage: hatched ? HATCH_BG : undefined }}
+    />
+    {isOverridden && (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onReset();
+        }}
+        title={`Reset ${name} to its default color`}
+        aria-label={`Reset ${name} to its default color`}
+        className="absolute -right-1.5 -top-1.5 hidden h-2.5 w-2.5 items-center justify-center rounded-full bg-obsidian-bg text-[7px] leading-none text-obsidian-muted ring-1 ring-obsidian-border hover:text-slate-200 group-hover/swatch:flex"
+      >
+        ×
+      </button>
+    )}
+  </span>
+);
 
 type RowStatus = 'short' | 'funded' | 'no-target';
 
@@ -199,6 +248,18 @@ export const AllocationPanel: React.FC<{
       return next;
     });
 
+  const { data: sectorColorRows } = useSectorColors();
+  const setSectorColor = useSetSectorColor();
+  const deleteSectorColor = useDeleteSectorColor();
+
+  // Sparse -- only sectors the trader has manually recolored have a row.
+  // Everything else keeps resolving through GROUP_COLORS / FALLBACK_COLORS.
+  const colorOverrides = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const row of sectorColorRows ?? []) map[row.sector] = row.color;
+    return map;
+  }, [sectorColorRows]);
+
   const { groups, dca, tiles } = useMemo(() => {
     const funded = holdings.filter((h) => h.cost_basis > 0);
 
@@ -211,7 +272,7 @@ export const AllocationPanel: React.FC<{
 
     let unknownIdx = 0;
     const built: Group[] = Array.from(byGroup.entries()).map(([name, hs]) => {
-      const color = groupColor(name, GROUP_COLORS[name] ? 0 : unknownIdx++);
+      const color = colorOverrides[name] ?? groupColor(name, GROUP_COLORS[name] ? 0 : unknownIdx++);
       const rows: GroupedRow[] = hs
         .map((h) => {
           const target = h.planned_allocation && h.planned_allocation > 0 ? h.planned_allocation : null;
@@ -268,7 +329,7 @@ export const AllocationPanel: React.FC<{
     );
 
     return { groups, dca, tiles };
-  }, [holdings]);
+  }, [holdings, colorOverrides]);
 
   if (groups.length === 0) return null;
 
@@ -335,22 +396,24 @@ export const AllocationPanel: React.FC<{
           })}
         </div>
 
-        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5">
           {groups
             .filter((g) => g.totalDeployed > 0)
             .map((g) => (
-              <div key={g.name} className="flex items-center gap-1 text-[10px] text-slate-300">
-                <span
-                  className="h-2 w-2 shrink-0 rounded-sm"
-                  style={{
-                    backgroundColor: g.color,
-                    backgroundImage: g.name === 'No Target Set' ? HATCH_BG : undefined,
-                  }}
+              <div key={g.name} className="flex items-center gap-1.5 text-[10px] text-slate-300">
+                <SectorSwatch
+                  name={g.name}
+                  color={g.color}
+                  hatched={g.name === 'No Target Set'}
+                  isOverridden={g.name in colorOverrides}
+                  onPick={(color) => setSectorColor.mutate({ sector: g.name, color })}
+                  onReset={() => deleteSectorColor.mutate(g.name)}
                 />
                 {g.name}
               </div>
             ))}
         </div>
+        <div className="mt-1 text-[9px] text-slate-600">Click a swatch to pick its color</div>
       </div>
 
       {/* ---------------- grouped progress table ---------------- */}
