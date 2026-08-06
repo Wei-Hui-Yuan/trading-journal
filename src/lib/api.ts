@@ -2,6 +2,7 @@ import axios from 'axios';
 
 import type {
   AdvancedMetrics,
+  AuditResult,
   AppSettings,
   AppSettingsPayload,
   DashboardStats,
@@ -707,4 +708,20 @@ export async function createDiscipline(
 /** DELETE /api/disciplines/{id} — delete a discipline rule. */
 export async function deleteDiscipline(id: string): Promise<void> {
   await apiClient.delete(`/disciplines/${id}`);
+}
+
+/**
+ * POST /api/audit — re-derive the ledger and report where stored state
+ * disagrees with it.
+ *
+ * A few seconds by design: it rebuilds every ticker's round trips from the
+ * fills to compare against. Deliberately a mutation-shaped call with no
+ * caching, because a remembered result answers "was this healthy earlier",
+ * which is the claim that goes stale silently. Nothing is written.
+ */
+export async function runDataAudit(): Promise<AuditResult> {
+  const { data } = await apiClient.post<AuditResult>('/audit', null, {
+    timeout: 120_000,
+  });
+  return data;
 }

@@ -1207,3 +1207,40 @@ export interface KPIStats {
   avgRoi: number;
   pendingCount: number;
 }
+
+/**
+ * Data health audit — POST /api/audit.
+ *
+ * `clean` means every check passed. `attention` means something is worth
+ * looking at but no displayed figure is known to be wrong (an unimportable
+ * fill, a leg IBKR never gave us a figure for). `critical` means a number the
+ * app is showing disagrees with the fills underneath it.
+ */
+export type AuditStatus = 'clean' | 'attention' | 'critical';
+
+export interface AuditItem {
+  ticker: string;
+  /** STALE | MISSING | DRIFT | FILLS | BROKER | STRANDED */
+  kind: string;
+  detail: string;
+}
+
+export interface AuditCheck {
+  key: string;
+  label: string;
+  status: AuditStatus;
+  /** One sentence stating the finding, already phrased for display. */
+  headline: string;
+  /** Always complete, even when `items` is truncated. */
+  counts: Record<string, number>;
+  /** Capped server-side; the counts above are the authority. */
+  items: AuditItem[];
+}
+
+export interface AuditResult {
+  generated_at: string;
+  duration_ms: number;
+  tickers_checked: number;
+  status: AuditStatus;
+  checks: AuditCheck[];
+}

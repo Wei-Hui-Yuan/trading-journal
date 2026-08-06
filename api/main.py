@@ -1347,6 +1347,30 @@ async def rematch(
     )
 
 
+@app.post("/api/audit", dependencies=[Depends(verify_clerk_token)])
+async def run_data_audit(session: AsyncSession = Depends(get_session)):
+    """Does the stored, derived state still agree with the fills underneath it?
+
+    The diagnosis half of the pair this sits next to: this one only reads and
+    reports, `/api/rematch` above is what fixes what it finds.
+
+    POST, not GET, and deliberately not cached. It is an action with a cost --
+    a cold FIFO rebuild of every ticker plus the stored-state comparisons,
+    measured at ~2.6s over 88 tickers and 199 legs on this ledger -- and
+    caching it would answer a weaker question than the one the UI asks: a
+    stored result says the ledger WAS healthy whenever it last ran, which is
+    exactly the claim that goes stale without anyone noticing. A few seconds
+    behind an explicit button is not worth a cache-invalidation story.
+
+    AUTHENTICATED, unlike `/health`. That one is a liveness probe and is
+    deliberately free of trade data; this reports per-trade P&L and named
+    executions, so the two must not be confused despite the similar shape.
+    """
+    from services.data_health import run_audit  # noqa: PLC0415 - avoids import cycle
+
+    return await run_audit(session)
+
+
 # ---------------------------------------------------------------------------
 # Repairing the execution ledger by hand
 # ---------------------------------------------------------------------------

@@ -6,7 +6,9 @@ import { Activity, BarChart3, BookOpen, BookText, ClipboardList, Landmark, Refre
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
+import { DataHealthModal } from './DataHealthModal';
 import { useLastSync } from '@/hooks/useTradeInbox';
+import { useLastAudit } from '@/hooks/useDataAudit';
 
 interface HeaderProps {
   pendingCount: number;
@@ -70,8 +72,56 @@ const SyncStatusBadge: React.FC = () => {
   );
 };
 
+/**
+ * Whether the ledger's derived state still agrees with its fills.
+ *
+ * Tri-state, not a percentage: the checks behind it count unlike things --
+ * stale round trips, unverified legs, unimportable fills -- and averaging
+ * them into "97% healthy" would invent a quantity that does not exist.
+ *
+ * Says "not run" until it has actually run, exactly like SyncStatusBadge
+ * above. A green badge on page load would be asserting a health nothing had
+ * checked, which is the specific failure the hardcoded "CONNECTED" badge used
+ * to have.
+ */
+const DataHealthBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
+  const audit = useLastAudit();
+
+  const tone = !audit
+    ? { dot: 'bg-slate-600', text: 'text-obsidian-muted', border: 'border-obsidian-border' }
+    : audit.status === 'clean'
+      ? { dot: 'bg-win', text: 'text-win', border: 'border-obsidian-border' }
+      : audit.status === 'attention'
+        ? { dot: 'bg-amber-400', text: 'text-amber-300', border: 'border-amber-500/40' }
+        : { dot: 'bg-loss', text: 'text-loss', border: 'border-loss/40' };
+
+  const flagged = audit
+    ? audit.checks.filter((c) => c.status !== 'clean').length
+    : 0;
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title="FIFO and broker reconciliation — does stored state still agree with the fills?"
+      className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border ${tone.border} text-xs font-mono transition-colors hover:border-slate-600`}
+    >
+      <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
+      <span className="text-slate-300">Data:</span>
+      <span className={`${tone.text} font-semibold`}>
+        {!audit
+          ? 'not audited'
+          : audit.status === 'clean'
+            ? 'ties out'
+            : `${flagged} check${flagged === 1 ? '' : 's'} flagged`}
+      </span>
+    </button>
+  );
+};
+
 export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   const [isPlanOpen, setIsPlanOpen] = useState(false);
+  const [isHealthOpen, setIsHealthOpen] = useState(false);
 
   return (
     <header className="border-b border-obsidian-border bg-obsidian-card/80 backdrop-blur-md sticky top-0 z-50">
@@ -96,6 +146,8 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
             text — it never consulted anything and read as live market state. */}
         <div className="hidden md:flex items-center space-x-6">
           <SyncStatusBadge />
+
+          <DataHealthBadge onOpen={() => setIsHealthOpen(true)} />
 
           {pendingCount > 0 && (
             <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-mono animate-pulse">
@@ -173,6 +225,8 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
       </div>
 
       <PlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
+
+      <DataHealthModal open={isHealthOpen} onClose={() => setIsHealthOpen(false)} />
 
       {/* Mounted here so the summary survives navigating between pages while a
           sync is still in flight — the request outlives any one route. */}
