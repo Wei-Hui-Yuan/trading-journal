@@ -5,9 +5,20 @@ FastAPI app backed by a Supabase Postgres instance.
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
+
+```bash
 cp .env.example .env   # then fill in your Supabase credentials
 ```
+
+`requirements-dev.txt` is the one to install for development: it pulls in the
+runtime lock plus the test suite. `requirements.txt` is runtime only and is what
+the Dockerfile installs, so the production image does not ship pytest.
+
+Both files are **fully pinned, including transitive dependencies**, so an
+install today resolves to exactly what CI and production run. Upgrades are
+deliberate — see the header comment in `requirements.txt` for the procedure.
 
 ## Run
 
@@ -16,6 +27,20 @@ uvicorn main:app --reload
 ```
 
 Interactive docs at http://localhost:8000/docs
+
+## Tests
+
+```bash
+python -m pytest tests/
+```
+
+Runs offline. The ~30 tests that exercise real Postgres semantics skip
+themselves unless `DATABASE_URL` is set; the rest use stub sessions.
+
+CI (`.github/workflows/ci.yml`) runs this on every push and pull request, along
+with the frontend typecheck and production build. It installs dependencies with
+`pip install --no-deps`, so a dependency that is imported but not pinned fails
+the build rather than being silently fetched.
 
 ## Routes
 
