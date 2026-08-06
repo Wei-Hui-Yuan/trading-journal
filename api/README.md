@@ -42,6 +42,80 @@ with the frontend typecheck and production build. It installs dependencies with
 `pip install --no-deps`, so a dependency that is imported but not pinned fails
 the build rather than being silently fetched.
 
+## Migrations
+
+SQL files in `migrations/`, applied by `migrate.py`, which records what it has
+run in a `schema_migrations` table so nothing runs twice.
+
+```bash
+python migrate.py --status
+```
+
+```bash
+python migrate.py --dry-run
+```
+
+```bash
+python migrate.py
+```
+
+**Connect on 5432, not 6543.** These are DDL statements, and Supabase's
+transaction-mode pooler does not reliably support them — the same constraint
+that keeps `create_all` out of app startup. The runner refuses port 6543 unless
+passed `--allow-pooler`.
+
+### Adopting a database migrated by hand
+
+The production database already has all 31 migrations applied, from before this
+tracking existed. Run this against it **once**, and never again:
+
+```bash
+python migrate.py --baseline
+```
+
+That records every migration currently on disk as applied **without running
+any of them**. From then on only genuinely new files run. A fresh, empty
+database needs no baseline — just run `python migrate.py`.
+
+Baselined rows carry a NULL checksum, which `--status` shows as `~`. It means
+"this ran at some point, but what ran was never recorded", which is the honest
+position for a database migrated by hand.
+
+### Rules
+
+- **Never edit a migration that has been applied.** The database keeps the old
+  shape while the file describes a new one, and every environment built fresh
+  from that file diverges from production. The runner detects this by checksum
+  and refuses to proceed. Write a new migration instead.
+- **Never reuse a number.** Two migrations sharing a prefix have no defined
+  order. `migrate.py` refuses to run when it finds one, and a test in
+  `tests/test_migrate.py` catches it before that.
+- **A migration's filename is its identity.** Renaming one that has already run
+  makes the database think it is new. This is why the two historical collisions
+  below were left alone rather than renumbered.
+
+### The 021 and 022 collisions
+
+Two prefixes were each used twice, before any of the above was enforced:
+
+| Prefix | Files |
+| --- | --- |
+| 021 | `021_drop_redundant_position_fill_indexes.sql`, `021_timeframe_presets.sql` |
+| 022 | `022_positions_direction.sql`, `022_realized_legs.sql` |
+
+They are recorded as known exceptions in `GRANDFATHERED_DUPLICATES` and allowed
+through. Renumbering was considered and rejected: an applied migration's
+filename is its identity, and roughly a hundred comments across the codebase
+cite these numbers.
+
+Leaving them is safe because the four touch entirely disjoint objects — two
+indexes on `position_fills`, a new `timeframe_presets` table, a column on
+`positions`, and a new `realized_legs` table — so no ordering between them
+changes the result. The runner still orders them deterministically (by number,
+then by full filename), so every environment applies them identically.
+
+Do not add to that list. Any *new* duplicate is an error.
+
 ## Routes
 
 - `GET /api/trades` — returns all trades grouped by status.
