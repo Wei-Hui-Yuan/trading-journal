@@ -110,6 +110,10 @@ export interface Holding {
   manual_price: number | null;
   manual_price_at: string | null;
   price_is_manual: boolean;
+  /** The day's move in WHOLE PERCENT (-1.09 for -1.09%), as of
+   * `price_updated_at` -- a snapshot from the last price refresh, not a live
+   * tape. Null means no refresh has fetched it yet, which is not 0. */
+  day_change_pct: number | null;
 
   /** Derived from the transaction ledger on read, never stored. A correction
    * (see /basis-correction) is itself a ledger entry, not a second source

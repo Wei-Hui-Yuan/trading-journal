@@ -83,6 +83,10 @@ class Quote:
     symbol: str
     price: float
     currency: str = "USD"
+    # The day's move in WHOLE PERCENT (-1.09 for -1.09%, not -0.0109), as the
+    # provider reports it. None when the response omitted it -- distinct from
+    # 0.0, which is a real flat day.
+    day_change_pct: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -357,6 +361,10 @@ async def fetch_quote(symbol: str, client: Optional[httpx.AsyncClient] = None) -
 
     Nothing else `quote` returns is used, so there is no trade-off: this is
     strictly the endpoint that works for every symbol in the book.
+
+    `changePercentage` rides along on this same response, so the day's move
+    costs no extra call -- see migration 029. A missing price is fatal because
+    it is the reason for the call; a missing change is not, and stays None.
     """
     owned = client is None
     client = client or httpx.AsyncClient(timeout=TIMEOUT)
@@ -365,7 +373,12 @@ async def fetch_quote(symbol: str, client: Optional[httpx.AsyncClient] = None) -
         price = _num(row, "price")
         if price is None:
             raise MarketDataError(f"FMP returned no price for {symbol}.", status=404)
-        return Quote(symbol=symbol, price=price, currency=row.get("currency") or "USD")
+        return Quote(
+            symbol=symbol,
+            price=price,
+            currency=row.get("currency") or "USD",
+            day_change_pct=_num(row, "changePercentage"),
+        )
     finally:
         if owned:
             await client.aclose()

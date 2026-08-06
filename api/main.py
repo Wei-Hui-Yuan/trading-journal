@@ -5075,6 +5075,11 @@ class InvestmentHolding(Base):
     # column rather than re-fetching anything.
     manual_price = Column(Numeric(18, 4), nullable=True)
     manual_price_at = Column(DateTime(timezone=True), nullable=True)
+    # The day's move in whole percent, from the same response current_price
+    # came from (migration 029). Shares price_updated_at deliberately -- one
+    # call, one freshness. Never affected by manual_price: an override is a
+    # correction to the LEVEL, and says nothing about the day's move.
+    day_change_pct = Column(Numeric(10, 4), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -6173,6 +6178,11 @@ async def refresh_prices(session: AsyncSession = Depends(get_session)):
                 continue
             holding.current_price = quote.price
             holding.price_updated_at = now
+            # Only overwritten when the provider actually sent one, so a
+            # response missing the field leaves the last known move in place
+            # rather than blanking a populated column.
+            if quote.day_change_pct is not None:
+                holding.day_change_pct = quote.day_change_pct
             updated += 1
 
     await session.commit()
@@ -6373,6 +6383,8 @@ def _holding_row(holding: InvestmentHolding) -> dict:
         "manual_price": _f(holding.manual_price),
         "manual_price_at": holding.manual_price_at,
         "price_is_manual": holding.manual_price is not None,
+        # As of price_updated_at, not live -- see migration 029.
+        "day_change_pct": _f(holding.day_change_pct),
     }
 
 

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, PiggyBank } from 'lucide-react';
 
 import { useDeleteSectorColor, useSectorColors, useSetSectorColor } from '@/hooks/useInvestments';
@@ -54,6 +54,72 @@ function groupColor(name: string, indexIfUnknown: number): string {
 
 const HATCH_BG =
   'repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,0.04) 4px, rgba(255,255,255,0.04) 8px)';
+
+/**
+ * What the FILL of a tile means. Area is always cost basis and never changes
+ * -- see the panel doc below -- so this only ever reassigns the color
+ * channel.
+ *
+ * Sector identity does not disappear in the performance modes: it moves from
+ * the fill to the labelled container each block sits in, which is how a
+ * market heatmap has always done it. That is what frees the color channel up
+ * in the first place.
+ */
+type ColorMode = 'sector' | 'pnl' | 'day';
+
+const COLOR_MODES: { key: ColorMode; label: string; title: string }[] = [
+  { key: 'sector', label: 'Sector', title: 'Color by sector' },
+  { key: 'pnl', label: 'P&L', title: 'Color by unrealized P&L since purchase' },
+  { key: 'day', label: '1D', title: "Color by the day's move, as of the last price refresh" },
+];
+
+/**
+ * Where the scale reaches full saturation, in whole percent. Everything
+ * beyond clamps.
+ *
+ * Two domains rather than one because the measures live on entirely
+ * different scales: 3% is a large day, while 3% on a position held for years
+ * is noise. A single shared domain would render one of the two maps almost
+ * flat and the other almost uniformly saturated.
+ *
+ * 50 rather than a tighter number for P&L because a book held for years
+ * genuinely spreads that far -- at 25 this one clipped nearly every winner to
+ * the same flat green, which is the failure mode a heatmap exists to avoid:
+ * the gradient has to spend its range where the holdings actually sit, not
+ * where a day trader's would. The big multi-baggers still clip, and that is
+ * the intended trade -- discriminating among the middle of the book matters
+ * more than ranking the two names that ran away with it.
+ */
+const PERF_DOMAIN: Record<'pnl' | 'day', number> = { pnl: 50, day: 3 };
+
+type RGB = [number, number, number];
+
+// A step down from screen-primary red/green, in keeping with the sector
+// palette above: the map is read by comparing tiles to their neighbours, not
+// by how loud any single one is.
+const PERF_NEUTRAL: RGB = [57, 66, 78];
+const PERF_UP: RGB = [18, 128, 92];
+const PERF_DOWN: RGB = [169, 52, 70];
+/** Deliberately NOT the neutral color. "There is no price for this" and "this
+ * has not moved" are different facts and must not look alike. */
+const PERF_UNKNOWN = '#232A33';
+
+const mix = (from: RGB, to: RGB, t: number): string =>
+  `rgb(${from.map((f, i) => Math.round(f + (to[i] - f) * t)).join(', ')})`;
+
+function perfFill(pct: number | null, domain: number): string {
+  if (pct === null || !Number.isFinite(pct)) return PERF_UNKNOWN;
+  return mix(PERF_NEUTRAL, pct >= 0 ? PERF_UP : PERF_DOWN, Math.min(Math.abs(pct) / domain, 1));
+}
+
+const signedPct = (pct: number | null) =>
+  pct === null || !Number.isFinite(pct) ? '—' : `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+
+/** Height of a sector block's label strip, and the smallest block that gets
+ * one -- below this a header would eat the tiles it is meant to caption. */
+const HEADER_PX = 14;
+const HEADER_MIN_H = 46;
+const HEADER_MIN_W = 64;
 
 /**
  * The legend swatch, made clickable. A real `<input type="color">` sits
@@ -215,12 +281,31 @@ function squarifyItems<T>(items: T[], valueOf: (t: T) => number, rect: VRect): {
 
 interface Tile {
   ticker: string;
-  sector: string;
-  color: string;
   deployed: number;
   pctOfTotal: number;
+  /** Both in whole percent. `pnl` is since purchase, `day` is as of the last
+   * price refresh; null in either means the figure is not available, which is
+   * not zero. */
+  pnlPct: number | null;
+  dayPct: number | null;
   isUntargeted: boolean;
+  /** LOCAL to the sector block, not to the whole canvas. */
   rect: VRect;
+}
+
+/** One sector's container: a labelled box with its own tiles laid out inside
+ * it. The nesting already existed geometrically -- this is what makes it
+ * visible. */
+interface SectorBlock {
+  name: string;
+  color: string;
+  totalDeployed: number;
+  pctOfTotal: number;
+  rect: VRect;
+  /** The area the tiles were squarified into: the block minus its header. */
+  inner: VRect;
+  showHeader: boolean;
+  tiles: Tile[];
 }
 
 /**
@@ -248,6 +333,33 @@ export const AllocationPanel: React.FC<{
       return next;
     });
 
+  const [colorMode, setColorMode] = useState<ColorMode>('sector');
+
+  /**
+   * The canvas is MEASURED rather than assumed.
+   *
+   * Squarify optimises for square tiles against the aspect ratio it is given,
+   * so a fixed virtual canvas only produces square tiles when the real box
+   * happens to share its shape. This one does not -- it is a grid column that
+   * stretches to the progress table's height, landing nearer 1:1 than the 2:1
+   * that was assumed, which is precisely why the tiles came out as tall
+   * ribbons. Feeding real pixels in costs one ResizeObserver and makes the
+   * algorithm do what it was chosen for. The fixed CANVAS stays as the
+   * first-paint fallback, before any measurement exists.
+   */
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [canvas, setCanvas] = useState<VRect>(CANVAS);
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      if (width > 0 && height > 0) setCanvas({ x: 0, y: 0, w: width, h: height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   const { data: sectorColorRows } = useSectorColors();
   const setSectorColor = useSetSectorColor();
   const deleteSectorColor = useDeleteSectorColor();
@@ -260,8 +372,9 @@ export const AllocationPanel: React.FC<{
     return map;
   }, [sectorColorRows]);
 
-  const { groups, dca, tiles } = useMemo(() => {
+  const { groups, dca, blocks, priceAsOf, hasDayData } = useMemo(() => {
     const funded = holdings.filter((h) => h.cost_basis > 0);
+    const byTicker = new Map(funded.map((h) => [h.ticker, h]));
 
     const byGroup = new Map<string, Holding[]>();
     for (const h of funded) {
@@ -309,27 +422,59 @@ export const AllocationPanel: React.FC<{
     const sectorPlacement = squarifyItems(
       groups.filter((g) => g.totalDeployed > 0),
       (g) => g.totalDeployed,
-      CANVAS
+      canvas
     );
 
-    const tiles: Tile[] = sectorPlacement.flatMap(({ item: g, rect: sectorRect }) =>
-      squarifyItems(
+    // Tiles are laid out in coordinates LOCAL to their sector block, against
+    // the block's real dimensions minus its header. Positioning them as a
+    // percentage of that local box, inside a container that is itself a
+    // percentage of the canvas, is what keeps the header honest: it takes its
+    // pixels from a flex row rather than from an allowance the layout math
+    // has to guess at and the rendered box then contradicts.
+    const blocks: SectorBlock[] = sectorPlacement.map(({ item: g, rect }) => {
+      const showHeader = rect.h >= HEADER_MIN_H && rect.w >= HEADER_MIN_W;
+      const inner: VRect = {
+        x: 0,
+        y: 0,
+        w: rect.w,
+        h: Math.max(1, rect.h - (showHeader ? HEADER_PX : 0)),
+      };
+      const tiles: Tile[] = squarifyItems(
         g.rows.filter((r) => r.deployed > 0),
         (r) => r.deployed,
-        sectorRect
-      ).map(({ item: r, rect }) => ({
-        ticker: r.ticker,
-        sector: g.name,
+        inner
+      ).map(({ item: r, rect: local }) => {
+        const h = byTicker.get(r.ticker);
+        return {
+          ticker: r.ticker,
+          deployed: r.deployed,
+          pctOfTotal: grandTotal > 0 ? (r.deployed / grandTotal) * 100 : 0,
+          pnlPct: h?.unrealized_pnl_pct ?? null,
+          dayPct: h?.day_change_pct ?? null,
+          isUntargeted: g.name === 'No Target Set',
+          rect: local,
+        };
+      });
+      return {
+        name: g.name,
         color: g.color,
-        deployed: r.deployed,
-        pctOfTotal: grandTotal > 0 ? (r.deployed / grandTotal) * 100 : 0,
-        isUntargeted: g.name === 'No Target Set',
+        totalDeployed: g.totalDeployed,
+        pctOfTotal: grandTotal > 0 ? (g.totalDeployed / grandTotal) * 100 : 0,
         rect,
-      }))
-    );
+        inner,
+        showHeader,
+        tiles,
+      };
+    });
 
-    return { groups, dca, tiles };
-  }, [holdings, colorOverrides]);
+    // Both figures come from the same refresh, so one timestamp covers the
+    // price and the day's move alike -- see migration 029.
+    const stamps = funded.map((h) => h.price_updated_at).filter((s): s is string => !!s).sort();
+    const priceAsOf = stamps.length ? stamps[stamps.length - 1] : null;
+    const hasDayData = funded.some((h) => h.day_change_pct !== null);
+
+    return { groups, dca, blocks, priceAsOf, hasDayData };
+  }, [holdings, colorOverrides, canvas]);
 
   if (groups.length === 0) return null;
 
@@ -343,59 +488,143 @@ export const AllocationPanel: React.FC<{
           instead of leaving dead space, in either direction, if the table
           grows or shrinks. */}
       <div className="flex h-full flex-col">
-        <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-300">
-          Sector treemap
-        </div>
-        <div className="text-[10px] text-obsidian-muted">Sized by cost basis, not market value</div>
-
-        {/* Squarified: tiles are positioned by percentage against the fixed
-            CANVAS above, so the layout is correct at any real render height
-            without measuring the DOM -- it only needs SOME height from the
-            flex parent, not a specific one. Each tile is two nested divs --
-            an outer one at the exact percentage bounds (pure layout, no gap
-            between tiles) and an inner one inset by a couple of pixels,
-            which is what actually creates the seam: the card's own
-            background shows through the inset rather than a drawn border. */}
-        <div className="relative mt-2 min-h-[240px] flex-1 overflow-hidden rounded-lg">
-          {tiles.map((t) => {
-            const showLine1 = t.rect.w > 55 && t.rect.h > 30;
-            const showLine2 = showLine1 && t.rect.h > 55;
-            return (
-              <div
-                key={t.ticker}
-                className="absolute"
-                style={{
-                  left: `${(t.rect.x / CANVAS.w) * 100}%`,
-                  top: `${(t.rect.y / CANVAS.h) * 100}%`,
-                  width: `${(t.rect.w / CANVAS.w) * 100}%`,
-                  height: `${(t.rect.h / CANVAS.h) * 100}%`,
-                }}
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-300">
+              Sector treemap
+            </div>
+            {/* The first clause never changes, in any mode: area is the one
+                thing this panel promises, and switching the fill must not
+                read as switching what the map is of. */}
+            <div className="text-[10px] text-obsidian-muted">
+              {colorMode === 'sector'
+                ? 'Sized by cost basis, not market value'
+                : colorMode === 'pnl'
+                  ? 'Sized by cost basis · colored by unrealized P&L'
+                  : "Sized by cost basis · colored by the day's move"}
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-0.5 rounded-md border border-obsidian-border p-0.5">
+            {COLOR_MODES.map((m) => (
+              <button
+                key={m.key}
+                type="button"
+                title={m.title}
+                onClick={() => setColorMode(m.key)}
+                className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
+                  colorMode === m.key
+                    ? 'bg-obsidian-border text-slate-100'
+                    : 'text-obsidian-muted hover:text-slate-300'
+                }`}
               >
-                <div
-                  title={`${t.ticker} — ${t.sector} — ${money(t.deployed)} (${t.pctOfTotal.toFixed(1)}% of book)`}
-                  className="absolute flex flex-col items-center justify-center overflow-hidden rounded-[3px] text-center"
-                  style={{
-                    inset: '1.5px',
-                    backgroundColor: t.color,
-                    backgroundImage: t.isUntargeted ? HATCH_BG : undefined,
-                  }}
-                >
-                  {showLine1 && (
-                    <span className="px-1 text-[11px] font-bold leading-tight text-slate-100">
-                      {t.ticker}
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Squarified against MEASURED pixels (see `canvas` above), so tiles
+            come out square rather than stretched by the gap between the
+            assumed and the real aspect ratio.
+
+            Three levels of nesting, each with a job: the sector block at
+            exact percentage bounds, a flex column inside it that gives the
+            header real pixels and the tile area whatever remains, and each
+            tile inset a hair -- the seams between tiles are the card
+            background showing through those insets, not drawn borders. */}
+        <div
+          ref={canvasRef}
+          className="relative mt-2 min-h-[240px] flex-1 overflow-hidden rounded-lg"
+        >
+          {blocks.map((b) => (
+            <div
+              key={b.name}
+              className="absolute"
+              style={{
+                left: `${(b.rect.x / canvas.w) * 100}%`,
+                top: `${(b.rect.y / canvas.h) * 100}%`,
+                width: `${(b.rect.w / canvas.w) * 100}%`,
+                height: `${(b.rect.h / canvas.h) * 100}%`,
+              }}
+            >
+              <div className="absolute flex flex-col overflow-hidden rounded-[3px]" style={{ inset: '1px' }}>
+                {b.showHeader && (
+                  <div
+                    className="flex shrink-0 items-center gap-1 px-1 text-[9px] uppercase tracking-wide text-slate-400"
+                    style={{ height: `${HEADER_PX}px` }}
+                  >
+                    {/* In the performance modes the fills no longer carry
+                        sector, so the dot is what keeps each block tied to
+                        the legend below. */}
+                    {colorMode !== 'sector' && (
+                      <span
+                        className="h-1.5 w-1.5 shrink-0 rounded-sm"
+                        style={{ backgroundColor: b.color }}
+                      />
+                    )}
+                    <span className="truncate">{b.name}</span>
+                    <span className="ml-auto shrink-0 font-mono text-slate-500">
+                      {b.pctOfTotal.toFixed(0)}%
                     </span>
-                  )}
-                  {showLine2 && (
-                    <span className="px-1 font-mono text-[9px] leading-tight text-slate-300/80">
-                      {compactMoney(t.deployed)} · {t.pctOfTotal.toFixed(1)}%
-                    </span>
-                  )}
+                  </div>
+                )}
+                <div className="relative flex-1">
+                  {b.tiles.map((t) => {
+                    const showLine1 = t.rect.w > 44 && t.rect.h > 24;
+                    const showLine2 = showLine1 && t.rect.h > 42;
+                    const fill =
+                      colorMode === 'sector'
+                        ? b.color
+                        : perfFill(
+                            colorMode === 'pnl' ? t.pnlPct : t.dayPct,
+                            PERF_DOMAIN[colorMode]
+                          );
+                    return (
+                      <div
+                        key={t.ticker}
+                        className="absolute"
+                        style={{
+                          left: `${(t.rect.x / b.inner.w) * 100}%`,
+                          top: `${(t.rect.y / b.inner.h) * 100}%`,
+                          width: `${(t.rect.w / b.inner.w) * 100}%`,
+                          height: `${(t.rect.h / b.inner.h) * 100}%`,
+                        }}
+                      >
+                        <div
+                          title={`${t.ticker} — ${b.name} — ${money(t.deployed)} (${t.pctOfTotal.toFixed(1)}% of book) · P&L ${signedPct(t.pnlPct)} · 1D ${signedPct(t.dayPct)}`}
+                          className="absolute flex flex-col items-center justify-center overflow-hidden rounded-[3px] text-center"
+                          style={{
+                            inset: '1.5px',
+                            backgroundColor: fill,
+                            backgroundImage: t.isUntargeted ? HATCH_BG : undefined,
+                          }}
+                        >
+                          {showLine1 && (
+                            <span className="px-1 text-[11px] font-bold leading-tight text-slate-100">
+                              {t.ticker}
+                            </span>
+                          )}
+                          {showLine2 && (
+                            <span className="px-1 font-mono text-[9px] leading-tight text-slate-300/80">
+                              {colorMode === 'sector'
+                                ? `${compactMoney(t.deployed)} · ${t.pctOfTotal.toFixed(1)}%`
+                                : signedPct(colorMode === 'pnl' ? t.pnlPct : t.dayPct)}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-            );
-          })}
+            </div>
+          ))}
         </div>
 
+        {/* The swatch legend doubles as the recolor control, so it stays in
+            every mode -- the sector palette still drives the block headers,
+            and hiding it would make the picker reachable only by switching
+            modes first. */}
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5">
           {groups
             .filter((g) => g.totalDeployed > 0)
@@ -413,7 +642,30 @@ export const AllocationPanel: React.FC<{
               </div>
             ))}
         </div>
-        <div className="mt-1 text-[9px] text-slate-600">Click a swatch to pick its color</div>
+
+        {colorMode === 'sector' ? (
+          <div className="mt-1 text-[9px] text-slate-600">Click a swatch to pick its color</div>
+        ) : (
+          <div className="mt-1.5 flex items-center gap-2 text-[9px] text-obsidian-muted">
+            <span className="font-mono">−{PERF_DOMAIN[colorMode]}%</span>
+            <div
+              className="h-2 flex-1 rounded-sm"
+              style={{
+                backgroundImage: `linear-gradient(to right, ${mix(PERF_NEUTRAL, PERF_DOWN, 1)}, ${mix(PERF_NEUTRAL, PERF_DOWN, 0)}, ${mix(PERF_NEUTRAL, PERF_UP, 1)})`,
+              }}
+            />
+            <span className="font-mono">+{PERF_DOMAIN[colorMode]}%</span>
+            <span className="ml-1 shrink-0">
+              {colorMode === 'day'
+                ? hasDayData
+                  ? priceAsOf
+                    ? `as of ${new Date(priceAsOf).toLocaleString()}`
+                    : 'as of last refresh'
+                  : 'run Refresh prices to populate'
+                : 'since purchase'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ---------------- grouped progress table ---------------- */}
