@@ -415,6 +415,26 @@ export const InvestmentTable: React.FC = () => {
     filters.country !== DEFAULT_HOLDING_FILTERS.country ||
     filters.status !== DEFAULT_HOLDING_FILTERS.status;
 
+  // The table's own Total row, over whatever the filter bar currently
+  // narrows it to -- deliberately NOT `totals` (the book-wide Portfolio
+  // object PortfolioKpiHeader/AllocationPanel use). Market value and P&L
+  // skip nulls exactly the way the server's total_market_value /
+  // total_unrealized_pnl already do (main.py get_portfolio), so a holding
+  // with no fetched price still doesn't drag the sum down to a false zero.
+  // Weight is a genuine sum here, not a display artefact: each row's
+  // portfolio_weight_pct is already "% of the WHOLE book", so summing the
+  // filtered subset answers "how much of my entire portfolio is this" --
+  // filtering to Technology and reading 44% is real information, unlike the
+  // old unfiltered footer where it was always exactly 100%.
+  const footerTotals = useMemo(
+    () => ({
+      marketValue: visibleHoldings.reduce((sum, h) => sum + (h.market_value ?? 0), 0),
+      unrealizedPnl: visibleHoldings.reduce((sum, h) => sum + (h.unrealized_pnl ?? 0), 0),
+      weightPct: visibleHoldings.reduce((sum, h) => sum + (h.portfolio_weight_pct ?? 0), 0),
+    }),
+    [visibleHoldings]
+  );
+
   if (isLoading) {
     return (
       <div className="flex items-center gap-2 py-16 text-sm text-obsidian-muted">
@@ -765,18 +785,16 @@ export const InvestmentTable: React.FC = () => {
               <tfoot>
                 <tr className="border-t-2 border-obsidian-border bg-slate-700/30 font-semibold">
                   <td className={`${CELL} text-slate-200`} colSpan={6}>
-                    Total
+                    {isFiltered ? 'Total (filtered)' : 'Total'}
                   </td>
                   <td className={`${NUM} text-slate-100`}>
-                    {money(totals.total_market_value)}
+                    {money(footerTotals.marketValue)}
                   </td>
                   <td className={NUM}>
                     <span
-                      className={
-                        totals.total_unrealized_pnl >= 0 ? 'text-win' : 'text-loss'
-                      }
+                      className={footerTotals.unrealizedPnl >= 0 ? 'text-win' : 'text-loss'}
                     >
-                      {signedMoney(totals.total_unrealized_pnl)}
+                      {signedMoney(footerTotals.unrealizedPnl)}
                     </span>
                   </td>
                   {/* Intrinsic values are per share and belong to different
@@ -785,7 +803,7 @@ export const InvestmentTable: React.FC = () => {
                   <td className={`${NUM} text-obsidian-muted`}>—</td>
                   <td className={`${NUM} text-obsidian-muted`}>—</td>
                   <td className={`${NUM} text-slate-300`}>
-                    {totals.total_market_value > 0 ? '100.0%' : '—'}
+                    {footerTotals.weightPct > 0 ? `${footerTotals.weightPct.toFixed(1)}%` : '—'}
                   </td>
                 </tr>
               </tfoot>
