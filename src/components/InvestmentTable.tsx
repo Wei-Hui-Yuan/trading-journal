@@ -29,6 +29,7 @@ import { AddHoldingModal } from './AddHoldingModal';
 import { TransactionLedgerModal } from './TransactionLedgerModal';
 import { EditHoldingModal } from './EditHoldingModal';
 import { AllocationPanel } from './AllocationPanel';
+import { DEFAULT_HOLDING_FILTERS, HoldingsFilterBar, type HoldingFilters } from './HoldingsFilterBar';
 
 /**
  * Money, in the listed currency and without pretending to more precision than
@@ -340,12 +341,12 @@ export const InvestmentTable: React.FC = () => {
   const [ledgerTicker, setLedgerTicker] = useState<string | null>(null);
   const [editingTicker, setEditingTicker] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  // Off by default: a fully exited position (spun off, sold in full) is not
-  // something you are managing day to day, and it crowded out the active
-  // book. Not removed from `holdings` itself -- AllocationPanel and the KPI
-  // header already scope themselves correctly regardless, and hiding it only
-  // here keeps the ledger/edit controls one click away instead of gone.
-  const [showClosed, setShowClosed] = useState(false);
+  // Scoped to the table body only -- AllocationPanel and the KPI header keep
+  // reading the full `holdings` array regardless of what's filtered here, the
+  // same way `showClosed` used to work before it folded into this. Session
+  // state, not persisted: resets to the default (open positions only) on
+  // reload rather than remembering a filter from last time.
+  const [filters, setFilters] = useState<HoldingFilters>(DEFAULT_HOLDING_FILTERS);
 
   // Largest position first, which is how a portfolio is actually read -- the
   // question is nearly always "what am I most exposed to". Holdings with no
@@ -364,24 +365,55 @@ export const InvestmentTable: React.FC = () => {
   const selectedHolding = holdings.find((h) => h.ticker === selected) ?? null;
   const editingHolding = holdings.find((h) => h.ticker === editingTicker) ?? null;
 
-  // What the Sector/Type/Country/Currency comboboxes offer -- distinct
-  // values already used anywhere in the book, closed positions included:
-  // a fully-exited holding's classification is still real data worth
-  // reoffering, not something a display-only filter should hide from here.
+  // What the Sector/Type/Country/Currency comboboxes -- and now the filter
+  // bar's Sector/Category/Country dropdowns -- offer: distinct values already
+  // used anywhere in the book, closed positions included. A fully-exited
+  // holding's classification is still real data worth reoffering, and these
+  // lists must stay derived from the WHOLE book regardless of what the
+  // filter bar currently narrows the table to (see HoldingsFilterBar).
   const fieldOptions = useMemo(() => {
     const distinct = (values: (string | null)[]) =>
       Array.from(new Set(values.filter((v): v is string => !!v && v.trim() !== '')))
         .sort((a, b) => a.localeCompare(b));
     return {
       sectors: distinct(holdings.map((h) => h.sector)),
+      categories: distinct(holdings.map((h) => h.category)),
       types: distinct(holdings.map((h) => h.holding_type)),
       countries: distinct(holdings.map((h) => h.country)),
       currencies: distinct(holdings.map((h) => h.listed_currency)),
     };
   }, [holdings]);
 
-  const closedHoldings = holdings.filter((h) => h.quantity === 0);
-  const visibleHoldings = showClosed ? holdings : holdings.filter((h) => h.quantity > 0);
+  const openCount = holdings.filter((h) => h.quantity > 0).length;
+  const closedCount = holdings.filter((h) => h.quantity === 0).length;
+
+  // The one place all five filters apply, in order: status narrows to
+  // open/closed/all first, the three classification dropdowns each skip
+  // themselves when unset, and the search text matches last against
+  // whatever survived. Everywhere else on the page (AllocationPanel, the KPI
+  // header, ValuationStatusCard) keeps reading `holdings` directly.
+  const visibleHoldings = useMemo(() => {
+    const query = filters.query.trim().toLowerCase();
+    return holdings.filter((h) => {
+      if (filters.status === 'open' && h.quantity <= 0) return false;
+      if (filters.status === 'closed' && h.quantity !== 0) return false;
+      if (filters.sector && h.sector !== filters.sector) return false;
+      if (filters.category && h.category !== filters.category) return false;
+      if (filters.country && h.country !== filters.country) return false;
+      if (query) {
+        const haystack = `${h.ticker} ${h.name ?? ''}`.toLowerCase();
+        if (!haystack.includes(query)) return false;
+      }
+      return true;
+    });
+  }, [holdings, filters]);
+
+  const isFiltered =
+    filters.query !== DEFAULT_HOLDING_FILTERS.query ||
+    filters.sector !== DEFAULT_HOLDING_FILTERS.sector ||
+    filters.category !== DEFAULT_HOLDING_FILTERS.category ||
+    filters.country !== DEFAULT_HOLDING_FILTERS.country ||
+    filters.status !== DEFAULT_HOLDING_FILTERS.status;
 
   if (isLoading) {
     return (
@@ -548,16 +580,14 @@ export const InvestmentTable: React.FC = () => {
       )}
 
       {/* ---------------- the table ---------------- */}
-      {closedHoldings.length > 0 && (
-        <button
-          type="button"
-          onClick={() => setShowClosed((prev) => !prev)}
-          className="text-[11px] text-obsidian-muted underline decoration-dotted transition-colors hover:text-slate-300"
-        >
-          {showClosed
-            ? 'Hide closed positions'
-            : `${closedHoldings.length} closed position${closedHoldings.length === 1 ? '' : 's'} hidden — show`}
-        </button>
+      {holdings.length > 0 && (
+        <HoldingsFilterBar
+          filters={filters}
+          onChange={setFilters}
+          options={fieldOptions}
+          openCount={openCount}
+          closedCount={closedCount}
+        />
       )}
 
       {holdings.length === 0 ? (
@@ -567,6 +597,20 @@ export const InvestmentTable: React.FC = () => {
             Record a transaction and the holding is created with it.
           </p>
         </div>
+      ) : visibleHoldings.length === 0 && isFiltered ? (
+        <div className="rounded-xl border border-dashed border-obsidian-border px-6 py-16 text-center">
+          <p className="text-sm text-slate-300">No holdings match these filters.</p>
+          <p className="mt-1 text-xs text-obsidian-muted">
+            <button
+              type="button"
+              onClick={() => setFilters(DEFAULT_HOLDING_FILTERS)}
+              className="text-slate-300 underline decoration-dotted hover:text-slate-100"
+            >
+              Clear filters
+            </button>
+            .
+          </p>
+        </div>
       ) : visibleHoldings.length === 0 ? (
         <div className="rounded-xl border border-dashed border-obsidian-border px-6 py-16 text-center">
           <p className="text-sm text-slate-300">No active positions.</p>
@@ -574,7 +618,7 @@ export const InvestmentTable: React.FC = () => {
             Every holding here has been fully exited.{' '}
             <button
               type="button"
-              onClick={() => setShowClosed(true)}
+              onClick={() => setFilters((f) => ({ ...f, status: 'all' }))}
               className="text-slate-300 underline decoration-dotted hover:text-slate-100"
             >
               Show closed positions
