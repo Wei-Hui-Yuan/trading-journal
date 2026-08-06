@@ -126,6 +126,48 @@ apiClient.interceptors.request.use(async (config) => {
   return config;
 });
 
+/** One entry of FastAPI's 422 body: `loc` is the path to the offending field. */
+interface ValidationDetail {
+  loc?: (string | number)[];
+  msg?: string;
+}
+
+/**
+ * Flatten FastAPI's `detail` into a string, whatever shape it arrived in.
+ *
+ * `HTTPException` sends a string, but a Pydantic failure sends an ARRAY of
+ * objects, and the difference is invisible until one reaches a component:
+ * `{error.message}` on an array of objects is React error #31, which unmounts
+ * the tree and replaces the whole page with "Application error". A rejected
+ * field is the most ordinary thing a form can do — it must never be able to
+ * take the app down, so the array is collapsed here, at the one place every
+ * request already passes through, rather than defended against at each
+ * `setError` call site.
+ */
+function messageFromDetail(detail: unknown): string | null {
+  if (typeof detail === 'string') {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    const parts = (detail as ValidationDetail[])
+      .map((entry) => {
+        // Pydantic prefixes every custom `raise ValueError(...)` with
+        // "Value error, ". The sentence after it was written to be read by a
+        // person; the prefix was not.
+        const msg =
+          typeof entry?.msg === 'string' ? entry.msg.replace(/^Value error, /, '') : null;
+        if (!msg) return null;
+        // Drop the leading "body"/"query" segment: it names the part of the
+        // request, not the field the user typed into.
+        const field = (entry.loc ?? []).slice(1).join('.');
+        return field ? `${field}: ${msg}` : msg;
+      })
+      .filter((part): part is string => part !== null);
+    return parts.length ? parts.join('; ') : null;
+  }
+  return null;
+}
+
 /**
  * Normalize errors into something renderable.
  *
@@ -136,7 +178,9 @@ apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     if (axios.isAxiosError(error)) {
-      const detail = (error.response?.data as { detail?: string } | undefined)?.detail;
+      const detail = messageFromDetail(
+        (error.response?.data as { detail?: unknown } | undefined)?.detail
+      );
       if (detail) {
         error.message = detail;
       } else if (!error.response) {
