@@ -1029,6 +1029,15 @@ async def insert_positions(
     revised levels -- is left exactly as it was. A round trip's numbers belong
     to its executions; its review belongs to the trader.
 
+    `strategy_id` is seeded from the OPENING trade the moment a position is
+    first created -- a plan's strategy is copied onto that trade already (see
+    PLAN_TO_TRADE_FIELDS), and the same anchor fill becomes `open_trade_id`
+    here, so this is the one place that hop was missing. Deliberately absent
+    from `refreshed`: on a re-match of a position that already exists, this
+    column must NOT be touched, or a strategy the trader chose by hand during
+    review would be silently replaced by the trade's the next time a fill
+    landed on the ticker.
+
     `position_fills` is resynced the same way, so the drill-down cannot end up
     describing a different trade from the position above it.
     """
@@ -1042,7 +1051,16 @@ async def insert_positions(
         return {}
 
     # Deferred to avoid a circular import with the FastAPI app.
-    from main import Position, PositionFill  # noqa: PLC0415
+    from main import Position, PositionFill, Trade  # noqa: PLC0415
+
+    open_trade_ids = {position.open_trade_id for position in positions}
+    strategy_by_trade = dict(
+        (
+            await session.execute(
+                select(Trade.id, Trade.strategy_id).where(Trade.id.in_(open_trade_ids))
+            )
+        ).all()
+    )
 
     rows = [
         {
@@ -1070,6 +1088,7 @@ async def insert_positions(
             # (rather than an upsert) is what preserves tags and grades a user
             # has already set when the engine is re-run over the same fills.
             "review_status": DEFAULT_REVIEW_STATUS,
+            "strategy_id": strategy_by_trade.get(position.open_trade_id),
         }
         for position in positions
     ]

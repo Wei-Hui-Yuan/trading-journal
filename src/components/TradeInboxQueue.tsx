@@ -117,17 +117,30 @@ export function TradeInboxQueue() {
   const [newRuleName, setNewRuleName] = useState('');
   const [ruleError, setRuleError] = useState<string | null>(null);
 
-  const draftFor = (id: string): ReviewDraft => drafts[id] ?? emptyDraft;
+  // Strategy is the one field a position can already carry before it is ever
+  // reviewed: the matching engine seeds it from the opening trade the moment
+  // the position is created (a plan's choice, or a manual attach, copied
+  // across earlier in the pipeline -- see insert_positions in
+  // matching_engine.py). Every other field here is genuinely unset on a
+  // pending position, so only this one needs to be read off the position
+  // rather than starting blank -- an empty draft is otherwise correct.
+  const seededDraft = (position: Position): ReviewDraft => ({
+    ...emptyDraft,
+    strategy_id: position.strategy_id ?? '',
+  });
 
-  const patchDraft = (id: string, patch: Partial<ReviewDraft>) => {
+  const draftFor = (position: Position): ReviewDraft =>
+    drafts[position.id] ?? seededDraft(position);
+
+  const patchDraft = (position: Position, patch: Partial<ReviewDraft>) => {
     setDrafts((prev) => ({
       ...prev,
-      [id]: { ...(prev[id] ?? emptyDraft), ...patch },
+      [position.id]: { ...(prev[position.id] ?? seededDraft(position)), ...patch },
     }));
   };
 
   const handleSubmit = (position: Position) => {
-    const draft = draftFor(position.id);
+    const draft = draftFor(position);
     const checked = draft.disciplines_checked ?? {};
     const rules = disciplinesQuery.data ?? [];
 
@@ -409,7 +422,7 @@ export function TradeInboxQueue() {
       </p>
 
       {positions.map((position) => {
-        const draft = draftFor(position.id);
+        const draft = draftFor(position);
         const isWin = position.realized_pnl >= 0;
         // Disable only the card being submitted, not the whole queue.
         const isSubmitting =
@@ -494,7 +507,7 @@ export function TradeInboxQueue() {
                   <select
                     value={draft.strategy_id}
                     onChange={(e) =>
-                      patchDraft(position.id, { strategy_id: e.target.value })
+                      patchDraft(position, { strategy_id: e.target.value })
                     }
                     disabled={isSubmitting || strategiesQuery.isPending}
                     className="mt-1 w-full rounded-lg bg-obsidian-card border border-obsidian-border px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50"
@@ -525,7 +538,7 @@ export function TradeInboxQueue() {
                           type="button"
                           disabled={isSubmitting}
                           onClick={() =>
-                            patchDraft(position.id, {
+                            patchDraft(position, {
                               // Click the active grade again to clear it.
                               trade_grade: active ? '' : g,
                             })
@@ -658,7 +671,7 @@ export function TradeInboxQueue() {
                           checked={isChecked}
                           disabled={isSubmitting}
                           onChange={(e) =>
-                            patchDraft(position.id, {
+                            patchDraft(position, {
                               disciplines_checked: {
                                 ...(draft.disciplines_checked ?? {}),
                                 [d.id]: e.target.checked,
@@ -694,7 +707,7 @@ export function TradeInboxQueue() {
                     value={draft[field]}
                     disabled={isSubmitting}
                     onChange={(e) =>
-                      patchDraft(position.id, { [field]: e.target.value })
+                      patchDraft(position, { [field]: e.target.value })
                     }
                     rows={3}
                     placeholder={placeholder}
