@@ -9,6 +9,8 @@
 
 import { apiClient } from './api';
 import type {
+  BasisCorrectionPayload,
+  BasisCorrectionResult,
   Holding,
   HoldingPayload,
   InvestmentTransaction,
@@ -84,6 +86,22 @@ export async function updateHolding(
 
 export async function deleteHolding(ticker: string): Promise<void> {
   await apiClient.delete(`/investments/holdings/${ticker}`);
+}
+
+/**
+ * Moves the derived position to the quantity/average-cost given, by writing
+ * one ADJUSTMENT transaction for the delta. Not a partial-update PATCH --
+ * this is an action with a side effect on the ledger, hence POST.
+ */
+export async function correctBasis(
+  ticker: string,
+  payload: BasisCorrectionPayload
+): Promise<BasisCorrectionResult> {
+  const { data } = await apiClient.post<BasisCorrectionResult>(
+    `/investments/holdings/${ticker}/basis-correction`,
+    payload
+  );
+  return data;
 }
 
 /**

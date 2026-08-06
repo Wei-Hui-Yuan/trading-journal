@@ -293,7 +293,9 @@ export const TransactionLedgerModal: React.FC<{
                                 ? 'text-loss'
                                 : tx.transaction_type === 'DIVIDEND'
                                   ? 'text-win'
-                                  : 'text-slate-300'
+                                  : tx.transaction_type === 'ADJUSTMENT'
+                                    ? 'text-sky-400'
+                                    : 'text-slate-300'
                             }
                           >
                             {tx.transaction_type}
@@ -317,14 +319,22 @@ export const TransactionLedgerModal: React.FC<{
                         </td>
                         <td className="py-1.5 text-right">
                           <div className="inline-flex gap-1 font-sans">
-                            <button
-                              type="button"
-                              onClick={() => startEdit(tx)}
-                              title="Correct this transaction"
-                              className="inline-flex items-center gap-1 rounded border border-obsidian-border px-2 py-0.5 text-[10px] text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200"
-                            >
-                              <Pencil className="h-3 w-3" />
-                            </button>
+                            {/* No pencil for a correction row -- its quantity
+                                and total_amount are signed deltas, which this
+                                form's "quantity must be > 0" rule (below)
+                                would reject even when re-saved unchanged.
+                                Wrong correction: delete it and correct again
+                                from the edit modal. */}
+                            {tx.transaction_type !== 'ADJUSTMENT' && (
+                              <button
+                                type="button"
+                                onClick={() => startEdit(tx)}
+                                title="Correct this transaction"
+                                className="inline-flex items-center gap-1 rounded border border-obsidian-border px-2 py-0.5 text-[10px] text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200"
+                              >
+                                <Pencil className="h-3 w-3" />
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => setConfirming(tx)}
@@ -375,6 +385,12 @@ export const TransactionLedgerModal: React.FC<{
             {confirming.transaction_type === 'DIVIDEND' ? (
               <>
                 Removes the {money(confirming.total_amount)} dividend recorded{' '}
+                {dateFmt.format(new Date(confirming.transaction_date))}.
+              </>
+            ) : confirming.transaction_type === 'ADJUSTMENT' ? (
+              <>
+                Removes the correction of {quantity(confirming.quantity)} shares /{' '}
+                {money(confirming.total_amount)} cost, recorded{' '}
                 {dateFmt.format(new Date(confirming.transaction_date))}.
               </>
             ) : (

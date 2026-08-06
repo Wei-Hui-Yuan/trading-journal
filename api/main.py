@@ -5069,6 +5069,12 @@ class InvestmentHolding(Base):
     is_valuable = Column(Boolean, nullable=False, default=True)
     current_price = Column(Numeric(18, 4), nullable=True)
     price_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Overrides current_price when set (migration 028). current_price keeps
+    # being overwritten wholesale by refresh_prices underneath this -- the
+    # auto figure is never lost, so "reset to auto" is just clearing this
+    # column rather than re-fetching anything.
+    manual_price = Column(Numeric(18, 4), nullable=True)
+    manual_price_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -5123,6 +5129,14 @@ TX_SELL = "SELL"
 TX_DIVIDEND = "DIVIDEND"
 TX_TRANSFER = "TRANSFER"
 TX_TYPES = (TX_BUY, TX_SELL, TX_DIVIDEND, TX_TRANSFER)
+
+# A correction to quantity and/or cost basis (migration 028), written only by
+# the basis-correction endpoint below -- deliberately NOT in TX_TYPES, so the
+# general create-transaction API can never accept one. Unlike every type in
+# TX_TYPES, its quantity and total_amount are SIGNED DELTAS rather than
+# magnitudes: -0.5 corrects an overcounted half share, which TransactionCreate's
+# quantity > 0 rule exists specifically to forbid for an ordinary trade.
+TX_ADJUSTMENT = "ADJUSTMENT"
 
 # Transactions that add shares at a cost. TRANSFER is here because a holding
 # arriving from another broker keeps its basis -- it is a purchase whose cash
@@ -5215,6 +5229,16 @@ def _derive_position(ticker: str, rows: Sequence[InvestmentTransaction]) -> Deri
                 cost = 0.0
         elif kind == TX_DIVIDEND:
             dividends += amount
+        elif kind == TX_ADJUSTMENT:
+            # Signed deltas, not magnitudes -- the one place in this loop
+            # that touches `cost` without abs(). No realized P&L and no
+            # first_acquired effect: a correction is not a trade, it is a
+            # restatement of where the running total already stood.
+            quantity += qty
+            cost += amount
+            if quantity <= 1e-9:
+                quantity = 0.0
+                cost = 0.0
 
     return DerivedPosition(
         ticker=ticker,
@@ -5308,6 +5332,10 @@ class HoldingUpdate(BaseModel):
     exchange_rate: Optional[float] = Field(None, gt=0)
     planned_allocation: Optional[float] = Field(None, ge=0)
     is_valuable: Optional[bool] = None
+    # None clears the override and reverts to the auto-fetched quote; a
+    # number sets it. Distinguished from "field not sent" the same way every
+    # other nullable field here is, via exclude_unset in the handler below.
+    manual_price: Optional[float] = Field(None, ge=0)
 
     _valid_category = field_validator("category")(HoldingCreate._valid_category.__func__)
 
@@ -5357,8 +5385,16 @@ async def update_holding(
     ticker: str, params: HoldingUpdate, session: AsyncSession = Depends(get_session)
 ):
     holding = await _get_holding(session, ticker.strip().upper())
-    for field, value in params.model_dump(exclude_unset=True).items():
+    patch = params.model_dump(exclude_unset=True)
+    for field, value in patch.items():
         setattr(holding, field, value)
+    # Stamped server-side rather than trusted from the client, and only when
+    # the field was actually touched -- every other edit to the holding
+    # (sector, allocation, ...) must not look like a fresh price correction.
+    if "manual_price" in patch:
+        holding.manual_price_at = (
+            datetime.now(timezone.utc) if patch["manual_price"] is not None else None
+        )
     holding.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(holding)
@@ -5402,6 +5438,121 @@ async def delete_holding(ticker: str, session: AsyncSession = Depends(get_sessio
     await session.delete(holding)
     await session.commit()
     return {"ticker": ticker, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Basis correction
+# ---------------------------------------------------------------------------
+
+
+class BasisCorrection(BaseModel):
+    """Corrects quantity and/or average cost to an exact target by writing
+    one ADJUSTMENT transaction for the delta -- see migration 028 for why
+    this cannot be a raw override column the way price is.
+
+    Both are the FINAL state the trader wants, not a delta: "this should read
+    2.5 shares at $180", not "subtract 0.3 shares and $12". The endpoint
+    computes the signed delta itself, against whatever the ledger derives to
+    right now, so the caller never needs to know the current values first.
+    """
+
+    quantity: Optional[float] = Field(None, ge=0)
+    average_cost: Optional[float] = Field(None, ge=0)
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self):
+        if self.quantity is None and self.average_cost is None:
+            raise ValueError("Provide a quantity, an average cost, or both to correct.")
+        return self
+
+
+@app.post(
+    "/api/investments/holdings/{ticker}/basis-correction",
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def correct_basis(
+    ticker: str, params: BasisCorrection, session: AsyncSession = Depends(get_session)
+):
+    """Move the derived position to exactly the quantity and/or average cost
+    supplied, by writing one ADJUSTMENT transaction for the difference.
+
+    Dated now, not backdated -- this corrects the position from THIS point
+    forward. A SELL that already happened keeps the realized P&L it was
+    booked with; any SELL from here on derives its average from the
+    corrected total, which is the entire reason this is a transaction and
+    not a column overriding the display (see migration 028).
+    """
+    ticker = ticker.strip().upper()
+    holding = await _get_holding(session, ticker)
+
+    position = (await _derive_all_positions(session, [ticker])).get(ticker)
+    if position is None or position.transaction_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{ticker} has no transactions yet -- there is no position to correct.",
+        )
+
+    if params.quantity is not None and params.quantity <= 1e-9:
+        # A correction to zero is a full exit: no average cost can attach to
+        # no shares, regardless of what was also sent for it.
+        target_quantity = 0.0
+        target_cost_basis = 0.0
+    else:
+        target_quantity = (
+            params.quantity if params.quantity is not None else position.quantity
+        )
+        target_avg = (
+            params.average_cost if params.average_cost is not None
+            else (position.average_cost or 0.0)
+        )
+        target_cost_basis = target_avg * target_quantity
+
+    qty_delta = target_quantity - position.quantity
+    cost_delta = target_cost_basis - position.cost_basis
+
+    if abs(qty_delta) < 1e-9 and abs(cost_delta) < 1e-6:
+        return {
+            "applied": False,
+            "detail": "Already matches the derived position; nothing to correct.",
+            "quantity": position.quantity,
+            "average_cost": position.average_cost,
+            "cost_basis": position.cost_basis,
+        }
+
+    parts = []
+    if abs(qty_delta) >= 1e-9:
+        parts.append(f"quantity {position.quantity:g} -> {target_quantity:g}")
+    if abs(cost_delta) >= 1e-6:
+        old_avg = position.average_cost or 0.0
+        new_avg = (target_cost_basis / target_quantity) if target_quantity > 0 else 0.0
+        parts.append(f"avg cost {old_avg:.4f} -> {new_avg:.4f}")
+    note = params.note or ("Manual correction: " + ", ".join(parts))
+
+    session.add(
+        InvestmentTransaction(
+            ticker=ticker,
+            transaction_type=TX_ADJUSTMENT,
+            quantity=qty_delta,
+            price=None,
+            total_amount=cost_delta,
+            fees=0,
+            transaction_date=datetime.now(timezone.utc),
+            listed_currency=holding.listed_currency,
+            exchange_rate=holding.exchange_rate,
+            source="MANUAL",
+            note=note,
+        )
+    )
+    await session.commit()
+
+    corrected = (await _derive_all_positions(session, [ticker])).get(ticker)
+    return {
+        "applied": True,
+        "quantity": corrected.quantity if corrected else target_quantity,
+        "average_cost": corrected.average_cost if corrected else None,
+        "cost_basis": corrected.cost_basis if corrected else target_cost_basis,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6191,6 +6342,17 @@ async def refresh_valuation_inputs(
 # ---------------------------------------------------------------------------
 
 
+def _effective_price(holding: InvestmentHolding) -> Optional[float]:
+    """The price every calculation should use: the manual override when the
+    auto-fetched quote is wrong, otherwise whatever refresh_prices last saw.
+
+    `current_price` itself is untouched by an override -- refresh_prices keeps
+    overwriting it wholesale, so the auto baseline is never lost underneath a
+    correction and "reset to auto" costs nothing to fetch.
+    """
+    return _f(holding.manual_price) if holding.manual_price is not None else _f(holding.current_price)
+
+
 def _holding_row(holding: InvestmentHolding) -> dict:
     return {
         "ticker": holding.ticker,
@@ -6203,8 +6365,14 @@ def _holding_row(holding: InvestmentHolding) -> dict:
         "exchange_rate": _f(holding.exchange_rate),
         "planned_allocation": _f(holding.planned_allocation),
         "is_valuable": holding.is_valuable,
-        "current_price": _f(holding.current_price),
+        # The number every downstream calculation (market value, unrealized
+        # P&L, DCF premium) actually uses -- see _effective_price.
+        "current_price": _effective_price(holding),
         "price_updated_at": holding.price_updated_at,
+        "auto_price": _f(holding.current_price),
+        "manual_price": _f(holding.manual_price),
+        "manual_price_at": holding.manual_price_at,
+        "price_is_manual": holding.manual_price is not None,
     }
 
 
@@ -6243,7 +6411,7 @@ def _value_holding(
         discount_rate_override=_f(merged.get("discount_rate")),
     )
     result = valuation_engine.value(inputs)
-    price = _f(holding.current_price)
+    price = _effective_price(holding)
 
     def scenario(s) -> dict:
         return {
@@ -6303,7 +6471,7 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
 
     for holding in holdings:
         position = positions.get(holding.ticker) or DerivedPosition(ticker=holding.ticker)
-        price = _f(holding.current_price)
+        price = _effective_price(holding)
         # Nothing held is not the same as held and worth zero. A watchlist
         # entry, or a position fully exited, has no market value and no
         # unrealised P&L -- and rendering those as 0.00 and +0.00 would put a

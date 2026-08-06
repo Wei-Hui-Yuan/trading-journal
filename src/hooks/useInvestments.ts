@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   clearValuationOverride,
+  correctBasis,
   createHolding,
   createInvestmentTransaction,
   deleteHolding,
@@ -21,6 +22,8 @@ import {
   updateInvestmentTransaction,
 } from '@/lib/investmentsApi';
 import type {
+  BasisCorrectionPayload,
+  BasisCorrectionResult,
   Holding,
   HoldingPayload,
   InvestmentTransaction,
@@ -140,6 +143,26 @@ export function useDeleteHolding() {
   const queryClient = useQueryClient();
   return useMutation<void, Error, string>({
     mutationFn: deleteHolding,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: investmentKeys.root });
+    },
+  });
+}
+
+/**
+ * Writes a correction to the ledger rather than editing a display value --
+ * the whole book (quantity, average cost, cost basis, and everything they
+ * feed) is invalidated because a correction changes what every one of those
+ * derives to, exactly like a new transaction would.
+ */
+export function useCorrectBasis() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    BasisCorrectionResult,
+    Error,
+    { ticker: string; payload: BasisCorrectionPayload }
+  >({
+    mutationFn: ({ ticker, payload }) => correctBasis(ticker, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: investmentKeys.root });
     },

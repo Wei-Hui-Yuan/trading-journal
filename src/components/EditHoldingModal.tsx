@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { AlertCircle, Loader2, Trash2, X } from 'lucide-react';
 
-import { useDeleteHolding, useUpdateHolding } from '@/hooks/useInvestments';
+import { useCorrectBasis, useDeleteHolding, useUpdateHolding } from '@/hooks/useInvestments';
 import type { Holding, HoldingCategory } from '@/types/investments';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Combobox } from './Combobox';
@@ -47,6 +47,7 @@ export const EditHoldingModal: React.FC<{
   totalCostBasis,
 }) => {
   const update = useUpdateHolding();
+  const correctBasis = useCorrectBasis();
   const del = useDeleteHolding();
   const [error, setError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -63,6 +64,40 @@ export const EditHoldingModal: React.FC<{
   );
   const [isValuable, setIsValuable] = useState(holding.is_valuable);
 
+  // Quantity and average cost default to what the ledger derives, editable
+  // when it is wrong -- saving a changed value writes a correction to the
+  // ledger rather than a display override, see useCorrectBasis. Only offered
+  // once a position actually exists: with no transactions there is nothing
+  // for a correction to be relative to.
+  const hasPosition = holding.transaction_count > 0;
+  const [quantity, setQuantity] = useState(String(holding.quantity));
+  // Rounded to cents for the starting value -- the derived figure carries
+  // binary-float noise (e.g. 430.7776444444444) that is real but not
+  // meaningful to type back, unlike quantity, where a fractional share is
+  // itself the actual position and stays unrounded.
+  const [averageCost, setAverageCost] = useState(
+    holding.average_cost !== null ? holding.average_cost.toFixed(2) : ''
+  );
+  // Price is a plain override column (migration 028) rather than a ledger
+  // correction -- refresh_prices keeps overwriting the auto figure
+  // underneath it, so blank here just means "use the live quote".
+  const [manualPrice, setManualPrice] = useState(
+    holding.manual_price !== null ? String(holding.manual_price) : ''
+  );
+
+  const quantityNum = Number(quantity);
+  const averageCostNum = Number(averageCost);
+  const quantityChanged =
+    hasPosition && Number.isFinite(quantityNum) && Math.abs(quantityNum - holding.quantity) > 1e-9;
+  // Half a cent, not 1e-6 -- the starting value above is ROUNDED to cents,
+  // so comparing against the unrounded derived figure at float precision
+  // would call an untouched field "changed" and fire a no-op correction.
+  const averageCostChanged =
+    hasPosition &&
+    Number.isFinite(averageCostNum) &&
+    Math.abs(averageCostNum - (holding.average_cost ?? 0)) > 0.005;
+  const needsCorrection = quantityChanged || averageCostChanged;
+
   // Preview only -- what this target WOULD weigh once funded, against the
   // rest of the book. This holding's own current cost basis is subtracted out
   // of the base first so it is not counted twice: once as what it costs
@@ -76,6 +111,21 @@ export const EditHoldingModal: React.FC<{
 
   const save = () => {
     setError(null);
+
+    if (quantityChanged && (!Number.isFinite(quantityNum) || quantityNum < 0)) {
+      setError('Quantity cannot be negative.');
+      return;
+    }
+    if (averageCostChanged && (!Number.isFinite(averageCostNum) || averageCostNum < 0)) {
+      setError('Average cost cannot be negative.');
+      return;
+    }
+    const manualPriceNum = manualPrice.trim() ? Number(manualPrice) : null;
+    if (manualPriceNum !== null && (!Number.isFinite(manualPriceNum) || manualPriceNum < 0)) {
+      setError('Price cannot be negative.');
+      return;
+    }
+
     update.mutate(
       {
         ticker: holding.ticker,
@@ -89,11 +139,35 @@ export const EditHoldingModal: React.FC<{
           exchange_rate: Number(exchangeRate) || 1,
           planned_allocation: allocation.trim() ? Number(allocation) : null,
           is_valuable: isValuable,
+          manual_price: manualPriceNum,
         },
       },
-      { onSuccess: onClose, onError: (e) => setError(e.message) }
+      {
+        onSuccess: () => {
+          if (!needsCorrection) {
+            onClose();
+            return;
+          }
+          // A separate call on purpose -- classification is a PATCH to the
+          // holding row, a correction is a new row on the ledger. Firing
+          // both from one Save keeps the modal feeling like a single edit.
+          correctBasis.mutate(
+            {
+              ticker: holding.ticker,
+              payload: {
+                quantity: quantityChanged ? quantityNum : undefined,
+                average_cost: averageCostChanged ? averageCostNum : undefined,
+              },
+            },
+            { onSuccess: onClose, onError: (e) => setError(e.message) }
+          );
+        },
+        onError: (e) => setError(e.message),
+      }
     );
   };
+
+  const saving = update.isPending || correctBasis.isPending;
 
   return (
     <>
@@ -218,6 +292,96 @@ export const EditHoldingModal: React.FC<{
               </label>
             </div>
 
+            <div className="space-y-1 border-t border-obsidian-border/50 pt-3.5">
+              <p className="text-[10px] text-obsidian-muted">
+                Position, derived from the ledger — edit only to correct one that&rsquo;s wrong.
+                Saving writes a correction to the ledger, not a display override.
+              </p>
+              {hasPosition ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className={LABEL}>Quantity</span>
+                    <input
+                      type="number"
+                      step="any"
+                      value={quantity}
+                      onChange={(e) => setQuantity(e.target.value)}
+                      className={`mt-1 ${INPUT} font-mono`}
+                    />
+                    <span className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-600">
+                      derived: {holding.quantity}
+                      {quantityChanged && (
+                        <button
+                          type="button"
+                          onClick={() => setQuantity(String(holding.quantity))}
+                          className="text-slate-500 underline decoration-dotted hover:text-slate-300"
+                        >
+                          reset
+                        </button>
+                      )}
+                    </span>
+                  </label>
+                  <label className="block">
+                    <span className={LABEL}>Avg cost</span>
+                    <input
+                      type="number"
+                      step="any"
+                      value={averageCost}
+                      onChange={(e) => setAverageCost(e.target.value)}
+                      className={`mt-1 ${INPUT} font-mono`}
+                    />
+                    <span className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-600">
+                      derived: {holding.average_cost !== null ? holding.average_cost.toFixed(2) : '—'}
+                      {averageCostChanged && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAverageCost(
+                              holding.average_cost !== null ? String(holding.average_cost) : ''
+                            )
+                          }
+                          className="text-slate-500 underline decoration-dotted hover:text-slate-300"
+                        >
+                          reset
+                        </button>
+                      )}
+                    </span>
+                  </label>
+                </div>
+              ) : (
+                <p className="text-[10px] text-slate-600">
+                  No transactions yet — record one to establish a position before correcting
+                  quantity or cost.
+                </p>
+              )}
+
+              <label className="block">
+                <span className={LABEL}>Price</span>
+                <input
+                  type="number"
+                  step="any"
+                  value={manualPrice}
+                  onChange={(e) => setManualPrice(e.target.value)}
+                  placeholder={holding.auto_price !== null ? holding.auto_price.toFixed(2) : 'no quote yet'}
+                  className={`mt-1 ${INPUT} font-mono`}
+                />
+                <span className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-600">
+                  {holding.auto_price !== null
+                    ? `auto: ${holding.auto_price.toFixed(2)}`
+                    : 'no auto quote yet'}
+                  {manualPrice.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => setManualPrice('')}
+                      className="text-slate-500 underline decoration-dotted hover:text-slate-300"
+                    >
+                      reset to auto
+                    </button>
+                  )}
+                </span>
+              </label>
+            </div>
+
             <label className="flex items-start gap-2">
               <input
                 type="checkbox"
@@ -264,11 +428,11 @@ export const EditHoldingModal: React.FC<{
               </button>
               <button
                 type="button"
-                disabled={update.isPending}
+                disabled={saving}
                 onClick={save}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-1.5 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
               >
-                {update.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
+                {saving && <Loader2 className="h-3 w-3 animate-spin" />}
                 Save
               </button>
             </div>

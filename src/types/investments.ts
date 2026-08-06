@@ -13,7 +13,13 @@ export type HoldingCategory = 'Growth' | 'Predictable' | 'ETF';
 /** Which risk table a holding is priced against. */
 export type ValuationRegion = 'US' | 'HK';
 
-export type TransactionType = 'BUY' | 'SELL' | 'DIVIDEND' | 'TRANSFER';
+/**
+ * ADJUSTMENT can appear in a GET of the ledger, but is never something the
+ * create-transaction form offers -- it is written only by the
+ * basis-correction endpoint, which computes its signed quantity/total_amount
+ * itself (see migration 028 and TX_ADJUSTMENT in main.py).
+ */
+export type TransactionType = 'BUY' | 'SELL' | 'DIVIDEND' | 'TRANSFER' | 'ADJUSTMENT';
 
 /** One stage of the twenty-year projection. */
 export interface ValuationScenario {
@@ -93,10 +99,21 @@ export interface Holding {
   /** False for a fund, which has no cash flows of its own to discount. */
   is_valuable: boolean;
 
+  /** The manual override when set, otherwise the last auto-fetched quote --
+   * whichever every other figure below (market value, unrealized P&L, DCF
+   * premium) was actually computed from. */
   current_price: number | null;
   price_updated_at: string | null;
+  /** Always the raw fetched quote, regardless of any override -- what
+   * "reset to auto" reverts to. */
+  auto_price: number | null;
+  manual_price: number | null;
+  manual_price_at: string | null;
+  price_is_manual: boolean;
 
-  /** Derived from the transaction ledger on read, never stored. */
+  /** Derived from the transaction ledger on read, never stored. A correction
+   * (see /basis-correction) is itself a ledger entry, not a second source
+   * of truth -- these numbers already reflect any correction on record. */
   quantity: number;
   average_cost: number | null;
   cost_basis: number;
@@ -188,6 +205,28 @@ export interface HoldingPayload {
   exchange_rate?: number;
   planned_allocation?: number | null;
   is_valuable?: boolean;
+  /** null clears the override and reverts to the auto-fetched quote. */
+  manual_price?: number | null;
+}
+
+/**
+ * Moves the derived position to exactly the quantity and/or average cost
+ * given -- both are the FINAL state wanted, not a delta. Written as one
+ * ADJUSTMENT transaction on the ledger, not a raw override; see migration
+ * 028 for why average cost can't be a column the way price is.
+ */
+export interface BasisCorrectionPayload {
+  quantity?: number | null;
+  average_cost?: number | null;
+  note?: string | null;
+}
+
+export interface BasisCorrectionResult {
+  applied: boolean;
+  detail?: string;
+  quantity: number;
+  average_cost: number | null;
+  cost_basis: number;
 }
 
 /**
