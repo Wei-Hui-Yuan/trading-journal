@@ -4425,6 +4425,14 @@ async def list_position_fills(
 # ---------------------------------------------------------------------------
 
 
+# Ceiling on one page of closed round trips. Not a default -- an unpaged
+# request is still legal and still returns the whole ledger, which the totals
+# elsewhere depend on. This only stops a `limit` large enough to be equivalent
+# to no limit at all from arriving by accident and materialising every row in
+# one response.
+ROUND_TRIP_MAX_PAGE = 500
+
+
 class RoundTripOut(BaseModel):
     """One trade idea, whatever number of executions it took.
 
@@ -4608,6 +4616,10 @@ async def list_round_trips(
     request: Request,
     response: Response,
     ticker: Optional[str] = None,
+    kind: Optional[str] = None,
+    strategy: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
     session: AsyncSession = Depends(get_session),
 ):
     """The journal, grouped the way trades are actually thought about.
@@ -4616,10 +4628,19 @@ async def list_round_trips(
     from executions that FIFO matching never paired off. Both carry their plan
     and their fills, so one row is a whole trade rather than a fragment.
 
-    The most expensive read in the app, and the one a conditional request saves
-    the most on: it loads every position, every execution and every fill before
-    it can answer at all. The version check below is one primary-key lookup, and
-    a 304 skips all three scans.
+    FILTERING AND PAGING HAPPEN IN SQL, not after the fact. This used to load
+    every position, every execution and every fill on every request, and then
+    discard most of them in Python -- three unbounded scans to answer a
+    question about twenty rows. The cost grew with the size of the ledger
+    rather than with the size of the answer, which is the wrong thing for a
+    journal meant to accumulate for years.
+
+    `limit`/`offset` page the CLOSED half only. Open exposure is always
+    returned whole: it is bounded by how many tickers can be held at once, not
+    by history, and it is the half that needs decisions -- paging it would hide
+    a live position behind a "load more" button.
+
+    `kind` selects one half outright. Without it both are returned, open first.
     """
     # Reused rather than hardcoded: the role vocabulary and the cost-basis
     # replay both belong to the matching engine, and two copies would drift.
@@ -4629,32 +4650,160 @@ async def list_round_trips(
         replay_open_exposure,
     )
 
+    if kind is not None and kind not in ("open", "closed"):
+        raise HTTPException(
+            status_code=422,
+            detail="kind must be 'open' or 'closed', or omitted for both.",
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset cannot be negative.")
+    if limit is not None and limit < 1:
+        raise HTTPException(status_code=422, detail="limit must be at least 1.")
+    # A ceiling rather than a default: an unpaged request is still legal and
+    # still returns everything, because the dashboard's own totals depend on
+    # it. What this stops is `limit=10000000` being used to allocate the whole
+    # ledger in one response by accident.
+    page_size = min(limit, ROUND_TRIP_MAX_PAGE) if limit is not None else None
+
+    # Resolved once, here, so the SQL below and the cache tag agree on what was
+    # asked for. `unassigned` is a real filter value, not a missing one -- it
+    # selects round trips whose opening execution carries no strategy.
+    strategy_id: Optional[uuid.UUID] = None
+    if strategy and strategy != "unassigned":
+        try:
+            strategy_id = uuid.UUID(strategy)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="strategy must be a UUID, 'unassigned', or omitted.",
+            ) from exc
+
     # Normalised into the tag rather than taken from the query string, so
     # `?ticker=aapl` and `?ticker=AAPL` -- which produce identical payloads,
     # the filter being upper-cased below -- do not occupy two cache entries
     # that must each be revalidated separately.
     scoped = ticker.strip().upper() if ticker else ""
     version = await _journal_version(session)
-    etag = None if version is None else _etag("round-trips", version, scoped)
+    # Every parameter that changes the payload is in the tag. Leaving the page
+    # out would be the worst kind of caching bug: page 2 answered from page 1's
+    # entry, silently, with a 304 and no way to tell from the client.
+    etag = (
+        None
+        if version is None
+        else _etag(
+            "round-trips", version, scoped, kind or "", strategy or "",
+            page_size if page_size is not None else "", offset,
+        )
+    )
     if (cached := _conditional(request, etag)) is not None:
         return cached
 
-    positions = (
-        await session.execute(select(Position).order_by(Position.exit_time.desc()))
-    ).scalars().all()
-    trades = (await session.execute(select(Trade))).scalars().all()
-    fills = (await session.execute(select(PositionFill))).scalars().all()
+    def _by_strategy(stmt, column):
+        """Apply the strategy filter to whichever table carries it."""
+        if not strategy:
+            return stmt
+        if strategy == "unassigned":
+            return stmt.where(column.is_(None))
+        return stmt.where(column == strategy_id)
 
-    trade_by_id = {t.id: t for t in trades}
-    # When each attached plan was written. Loaded once for the whole page --
-    # it is the evidence that a plan predates its fill, which is the only
-    # thing separating a plan from a post-hoc annotation.
+    # --- closed round trips: one page of positions -------------------------
+    positions: list[Position] = []
+    if kind != "open":
+        closed_stmt = select(Position)
+        # The strategy lives on the OPENING EXECUTION, not on the position, so
+        # filtering by it means joining the trade the position opened with.
+        # open_trade_id has been NOT NULL since migration 019, which is what
+        # makes an inner join safe rather than silently dropping rows.
+        if strategy:
+            closed_stmt = closed_stmt.join(Trade, Trade.id == Position.open_trade_id)
+            closed_stmt = _by_strategy(closed_stmt, Trade.strategy_id)
+        if scoped:
+            closed_stmt = closed_stmt.where(Position.symbol == scoped)
+        # id breaks ties so the order is total. Without it two round trips
+        # closing in the same instant can swap places between requests, and a
+        # paged reader would see one twice and miss the other.
+        closed_stmt = closed_stmt.order_by(
+            Position.exit_time.desc(), Position.id.desc()
+        )
+        if page_size is not None:
+            closed_stmt = closed_stmt.limit(page_size).offset(offset)
+        positions = (await session.execute(closed_stmt)).scalars().all()
+
+    # --- fills belonging to that page only ---------------------------------
+    position_ids = [p.id for p in positions]
+    fills: list[PositionFill] = []
+    if position_ids:
+        fills = (
+            await session.execute(
+                select(PositionFill).where(PositionFill.position_id.in_(position_ids))
+            )
+        ).scalars().all()
+
+    # --- open exposure: only what FIFO never fully paired off ---------------
+    #
+    # The sum that decides this used to be built in Python from every fill row
+    # in the table. It is a GROUP BY, so Postgres does it without the round
+    # trip, and the answer is the handful of executions that are actually open
+    # rather than the whole ledger filtered down to them.
+    #
+    # PARTLY matters, and is why this compares quantities instead of testing
+    # membership: an oversell closes the long it was aimed at AND opens a short
+    # with the remainder, so it appears in position_fills as a 10-share CLOSE
+    # while five shares of it are a live position.
+    open_rows: list[tuple[Trade, Decimal]] = []
+    if kind != "closed":
+        consumed_sq = (
+            select(
+                PositionFill.trade_id.label("trade_id"),
+                func.sum(PositionFill.quantity).label("consumed"),
+            )
+            .group_by(PositionFill.trade_id)
+            .subquery()
+        )
+        remaining_expr = Trade.quantity - func.coalesce(
+            consumed_sq.c.consumed, literal(Decimal("0"))
+        )
+        open_stmt = (
+            select(Trade, remaining_expr.label("remaining"))
+            .outerjoin(consumed_sq, consumed_sq.c.trade_id == Trade.id)
+            # NULL quantity yields NULL here, which fails this test and is
+            # excluded -- matching _unmatched_quantity, which floors at zero.
+            .where(remaining_expr > 0)
+            .order_by(Trade.entry_date)
+        )
+        if scoped:
+            open_stmt = open_stmt.where(Trade.ticker == scoped)
+        open_stmt = _by_strategy(open_stmt, Trade.strategy_id)
+        open_rows = [
+            (row[0], Decimal(str(row[1])))
+            for row in (await session.execute(open_stmt)).all()
+        ]
+
+    # --- the executions those two halves actually reference -----------------
+    #
+    # Bounded by the page, not by the ledger. Needed for two things: the plan
+    # attached to each opening execution, and whether any fill behind a closed
+    # round trip was added by hand.
+    trade_by_id: dict[uuid.UUID, Trade] = {trade.id: trade for trade, _ in open_rows}
+    wanted = (
+        {p.open_trade_id for p in positions if p.open_trade_id is not None}
+        | {f.trade_id for f in fills}
+    ) - trade_by_id.keys()
+    if wanted:
+        for trade in (
+            await session.execute(select(Trade).where(Trade.id.in_(wanted)))
+        ).scalars().all():
+            trade_by_id[trade.id] = trade
+
+    # When each attached plan was written. It is the evidence that a plan
+    # predates its fill, which is the only thing separating a plan from a
+    # post-hoc annotation.
     plan_created_at: dict[uuid.UUID, datetime] = {}
     # Which of them carry a chart. Sent so the ledger can decide whether to
     # render the image slot at all -- without it every plan without a
     # screenshot would still fire a request for one and take a 404 to find out.
     plan_has_chart: dict[uuid.UUID, bool] = {}
-    plan_ids = {t.plan_id for t in trades if t.plan_id is not None}
+    plan_ids = {t.plan_id for t in trade_by_id.values() if t.plan_id is not None}
     if plan_ids:
         plan_rows = (
             await session.execute(
@@ -4667,21 +4816,10 @@ async def list_round_trips(
         ).all()
         plan_has_chart = {row[0]: row[2] is not None for row in plan_rows}
         plan_created_at = {row[0]: row[1] for row in plan_rows}
-    disciplines_by_position = await _disciplines_by_position(
-        session, [p.id for p in positions]
-    )
+    disciplines_by_position = await _disciplines_by_position(session, position_ids)
     fills_by_position: dict[uuid.UUID, list[PositionFill]] = {}
     for fill in fills:
         fills_by_position.setdefault(fill.position_id, []).append(fill)
-
-    # How much of each execution the closed round trips account for. Summed
-    # from the fills already loaded above rather than re-queried -- an
-    # execution can be partly consumed, and the remainder is live exposure.
-    consumed_by_trade: dict[uuid.UUID, Decimal] = {}
-    for fill in fills:
-        consumed_by_trade[fill.trade_id] = consumed_by_trade.get(
-            fill.trade_id, Decimal("0")
-        ) + (fill.quantity or Decimal("0"))
 
     rows: list[RoundTripOut] = []
 
@@ -4763,25 +4901,19 @@ async def list_round_trips(
         )
 
     # --- open exposure -----------------------------------------------------
-    # Executions FIFO never paired off, in whole or in PART. Grouped per
-    # ticker, because that is the unit of exposure: two unsold AAPL buys are
-    # one open position, not two.
+    # Executions FIFO never paired off, in whole or in PART, as selected by the
+    # query above. Grouped per ticker here, because that is the unit of
+    # exposure: two unsold AAPL buys are one open position, not two.
     #
-    # Partly matters. This used to skip any execution present in
-    # `position_fills` at all, on the reading that appearing there means
-    # consumed. An oversell breaks that reading: the sell closes the long it
-    # was aimed at AND opens a short with the remainder, so it is recorded as a
+    # Partly matters, and is why the query compares quantities rather than
+    # testing membership of position_fills. An oversell closes the long it was
+    # aimed at AND opens a short with the remainder, so it is recorded as a
     # 10-share CLOSE while five shares of it are a live position. Being in the
-    # table excluded it, and the short existed nowhere in the app -- not as a
-    # row, not in exposure, not in the fill list. The matcher had it the whole
-    # time in `MatchingResult.open_lots`; this endpoint just never asked.
+    # table at all used to exclude it, and the short existed nowhere in the app
+    # -- not as a row, not in exposure, not in the fill list. The matcher had it
+    # the whole time in `MatchingResult.open_lots`; this endpoint never asked.
     open_by_ticker: dict[str, list[tuple[Trade, Decimal]]] = {}
-    for trade in trades:
-        if ticker and trade.ticker != ticker.strip().upper():
-            continue
-        remaining = _unmatched_quantity(trade, consumed_by_trade)
-        if remaining <= 0:
-            continue
+    for trade, remaining in open_rows:
         open_by_ticker.setdefault(trade.ticker, []).append((trade, remaining))
 
     for symbol, group in open_by_ticker.items():
