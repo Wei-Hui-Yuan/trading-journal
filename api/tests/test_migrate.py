@@ -238,6 +238,33 @@ def test_the_two_known_duplicate_pairs_are_all_present():
     assert GRANDFATHERED_DUPLICATES <= on_disk
 
 
+def test_migration_000_sorts_before_001():
+    """000_bootstrap_hand_created_tables.sql recreates trades and strategies --
+    hand-created in Supabase before this directory existed, and never CREATEd
+    by any numbered migration. It has to run first, or 001's foreign key into
+    trades fails on a table that is not there yet."""
+    migrations = load_migrations()
+    assert migrations[0].filename == "000_bootstrap_hand_created_tables.sql"
+
+
+def test_migration_000_is_entirely_guarded():
+    """The whole reason it is safe to run against production, where both
+    tables already exist: every statement has to be CREATE ... IF NOT EXISTS
+    or ADD COLUMN IF NOT EXISTS, so applying it there does nothing rather than
+    erroring on a duplicate table or column."""
+    bootstrap = load_migrations()[0]
+    statements = bootstrap.statements.upper()
+    assert "CREATE TABLE IF NOT EXISTS" in statements
+    assert "ADD COLUMN IF NOT EXISTS" in statements
+    # A bare CREATE TABLE (no guard) or ADD COLUMN (no guard) would fail
+    # loudly on a database that already has these tables -- which is every
+    # database except a brand new one, including production.
+    import re
+
+    bare_create = re.search(r"CREATE TABLE(?! IF NOT EXISTS)\s", statements)
+    assert bare_create is None, "found an unguarded CREATE TABLE in migration 000"
+
+
 def test_every_real_migration_checksums_distinctly():
     """Two identical migrations would be a copy-paste mistake worth catching."""
     migrations = load_migrations()

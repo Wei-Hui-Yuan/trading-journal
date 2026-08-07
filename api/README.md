@@ -34,13 +34,32 @@ Interactive docs at http://localhost:8000/docs
 python -m pytest tests/
 ```
 
-Runs offline. The ~30 tests that exercise real Postgres semantics skip
-themselves unless `DATABASE_URL` is set; the rest use stub sessions.
+Runs offline by default. The ~30 tests that exercise real Postgres semantics
+(EXISTS correlation, transaction/savepoint behaviour a stub session cannot
+stand in for) skip themselves unless `DATABASE_URL` is set; the rest use stub
+sessions and need nothing external.
 
-CI (`.github/workflows/ci.yml`) runs this on every push and pull request, along
-with the frontend typecheck and production build. It installs dependencies with
-`pip install --no-deps`, so a dependency that is imported but not pinned fails
-the build rather than being silently fetched.
+CI (`.github/workflows/ci.yml`) runs the full suite on every push and pull
+request against an actual Postgres 17 service container — matching
+production's version — with the schema built from nothing but `migrate.py`
+applying every migration in order. That build-from-scratch is itself real
+coverage: it is what caught migration 000's absence (see below) the first time
+a genuinely empty database tried to run these files. `DATABASE_URL` is set at
+the job level, so the `requires_db` tests run there instead of skipping.
+
+Dependencies install with `pip install --no-deps`, so a dependency that is
+imported but not pinned fails the build rather than being silently fetched.
+
+To run the same thing locally, point `DATABASE_URL` at any empty Postgres and
+apply the migrations first:
+
+```bash
+python migrate.py
+```
+
+```bash
+python -m pytest tests/
+```
 
 ## Response caching
 
@@ -93,10 +112,36 @@ transaction-mode pooler does not reliably support them — the same constraint
 that keeps `create_all` out of app startup. The runner refuses port 6543 unless
 passed `--allow-pooler`.
 
+### Migration 000: two tables this directory did not create
+
+`trades` and `strategies` were created by hand in the Supabase SQL Editor
+before `migrations/` existed. No file here ever issues their `CREATE TABLE` —
+every migration from 001 onward simply assumes both are already there, which
+was invisible for as long as every environment descended from the same
+hand-created database.
+
+It stopped being invisible the moment CI needed a genuinely empty Postgres:
+migration 001 failed immediately with `relation "trades" does not exist`.
+`000_bootstrap_hand_created_tables.sql` recreates both tables in their
+pre-migration-001 shape — reconstructed by reading every later migration for
+what it assumes already exists, then verified column-for-column against
+production's actual `information_schema.columns` (a byte-for-byte match: 34
+columns on `trades`, 8 on `strategies`, including types, nullability and
+defaults).
+
+Safe to run against production, where both tables already exist: every
+statement is `IF NOT EXISTS`, so it is a no-op there and only does real work
+on a database that has never seen either table. It is new, though, so
+production's `schema_migrations` shows it as genuinely pending — a plain
+`python migrate.py` picks it up (not `--baseline`, which would skip running it
+and record it with an unverified NULL checksum for a file that is in fact safe
+to actually execute).
+
 ### Adopting a database migrated by hand
 
-The production database already has all 31 migrations applied, from before this
-tracking existed. Run this against it **once**, and never again:
+The production database already has 31 of these migrations applied, from
+before this tracking existed (000 and 030 came later — see above and
+`030_data_version.sql`). Run this against it **once**, and never again:
 
 ```bash
 python migrate.py --baseline

@@ -37,6 +37,43 @@ jobs:
       run:
         working-directory: api
 
+    # A real Postgres, not a mock. This project's own migrations, its
+    # matching-engine advisory locks, and the ~30 tests marked `requires_db`
+    # (EXISTS correlation, transaction/savepoint semantics) all specifically
+    # test behaviour a stub session cannot stand in for -- which is exactly
+    # why they used to be skipped in CI and only ever run against production
+    # by hand. That gap is what this service closes.
+    #
+    # Version 17, matching Supabase's production Postgres
+    # (supabase/.temp/postgres-version). A migration that behaves differently
+    # across major versions is a migration worth knowing about before it runs
+    # against the real database, not after.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: trading_journal_ci
+        ports:
+          - 5432:5432
+        # Waits for Postgres to actually accept connections before any step
+        # below runs. Without this the first migration can race the
+        # container's startup and fail on a connection refused that has
+        # nothing to do with the code being tested.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # No pooler in CI -- this connects straight to the service container, so
+      # there is no PgBouncer transaction-mode restriction to work around
+      # (contrast api/README.md's port 5432 vs 6543 note, which is a
+      # Supabase-specific concern that does not apply here).
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/trading_journal_ci
+
     steps:
       - uses: actions/checkout@v4
 
@@ -69,11 +106,23 @@ jobs:
       - name: Verify the dependency tree is internally consistent
         run: pip check
 
-      # No DATABASE_URL is set, so the ~30 tests that need real Postgres
-      # semantics skip themselves (see the `requires_db` marker in
-      # tests/conftest.py). The rest -- the FIFO matching engine, commission
-      # accounting, analytics windows, error handling -- run against stub
-      # sessions and need nothing external.
+      # Builds the schema this run's tests execute against, from nothing but
+      # the migration files -- the same files a fresh deploy or a rebuilt
+      # database would apply. This is real coverage, not a formality: it is
+      # what caught migration 000's absence in the first place, when the
+      # service container's brand-new database hit migration 001 and failed
+      # on `relation "trades" does not exist`.
+      #
+      # DATABASE_URL is set at the job level above; migrate.py reads it the
+      # same way it does anywhere else. No --baseline here -- this database
+      # has no history to adopt, so every migration genuinely runs.
+      - name: Apply migrations
+        run: python migrate.py
+
+      # DATABASE_URL is set, so the ~30 tests requiring real Postgres
+      # semantics (see the `requires_db` marker in tests/conftest.py) now run
+      # here instead of skipping, alongside everything that only ever needed
+      # a stub session.
       - name: Run tests
         run: python -m pytest tests/ -q
 
