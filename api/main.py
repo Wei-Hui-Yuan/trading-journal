@@ -4616,6 +4616,7 @@ async def list_round_trips(
     request: Request,
     response: Response,
     ticker: Optional[str] = None,
+    search: Optional[str] = None,
     kind: Optional[str] = None,
     strategy: Optional[str] = None,
     limit: Optional[int] = None,
@@ -4638,9 +4639,18 @@ async def list_round_trips(
     `limit`/`offset` page the CLOSED half only. Open exposure is always
     returned whole: it is bounded by how many tickers can be held at once, not
     by history, and it is the half that needs decisions -- paging it would hide
-    a live position behind a "load more" button.
+    a live position behind a "load more" button. It comes back on the first
+    page only (offset 0), so a client concatenating pages does not see every
+    live position repeated once per page.
 
     `kind` selects one half outright. Without it both are returned, open first.
+
+    `ticker` matches a symbol exactly; `search` matches any part of one. Both
+    exist because they answer different questions -- "show me AAPL" and "what
+    was that ticker starting with NV" -- and collapsing them would make the
+    first one silently also match NVAAPL. `search` is what the journal's search
+    box sends, and it has to run in SQL rather than over the loaded rows, or it
+    would only ever find what the current page happened to contain.
     """
     # Reused rather than hardcoded: the role vocabulary and the cost-basis
     # replay both belong to the matching engine, and two copies would drift.
@@ -4683,6 +4693,20 @@ async def list_round_trips(
     # the filter being upper-cased below -- do not occupy two cache entries
     # that must each be revalidated separately.
     scoped = ticker.strip().upper() if ticker else ""
+
+    # A LIKE pattern built from user input, with the wildcards neutralised.
+    # Without escaping, typing `%` in the search box matches every symbol and
+    # `_` matches any single character -- so the box would quietly behave as a
+    # pattern language nobody documented, and `A_L` would find AAPL.
+    searched = search.strip().upper() if search else ""
+    search_pattern = (
+        "%"
+        + searched.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        + "%"
+        if searched
+        else ""
+    )
+
     version = await _journal_version(session)
     # Every parameter that changes the payload is in the tag. Leaving the page
     # out would be the worst kind of caching bug: page 2 answered from page 1's
@@ -4691,7 +4715,7 @@ async def list_round_trips(
         None
         if version is None
         else _etag(
-            "round-trips", version, scoped, kind or "", strategy or "",
+            "round-trips", version, scoped, searched, kind or "", strategy or "",
             page_size if page_size is not None else "", offset,
         )
     )
@@ -4719,6 +4743,10 @@ async def list_round_trips(
             closed_stmt = _by_strategy(closed_stmt, Trade.strategy_id)
         if scoped:
             closed_stmt = closed_stmt.where(Position.symbol == scoped)
+        if search_pattern:
+            closed_stmt = closed_stmt.where(
+                Position.symbol.ilike(search_pattern, escape="\\")
+            )
         # id breaks ties so the order is total. Without it two round trips
         # closing in the same instant can swap places between requests, and a
         # paged reader would see one twice and miss the other.
@@ -4750,8 +4778,13 @@ async def list_round_trips(
     # membership: an oversell closes the long it was aimed at AND opens a short
     # with the remainder, so it appears in position_fills as a 10-share CLOSE
     # while five shares of it are a live position.
+    # Open exposure belongs to the FIRST page and only the first page. It is
+    # not paged -- it always arrives whole -- so repeating it on page two would
+    # duplicate every live position in a client that concatenates pages, which
+    # is the only sane way to consume an endpoint like this. offset 0 covers
+    # both the unpaged request and the first page of a paged one.
     open_rows: list[tuple[Trade, Decimal]] = []
-    if kind != "closed":
+    if kind != "closed" and offset == 0:
         consumed_sq = (
             select(
                 PositionFill.trade_id.label("trade_id"),
@@ -4773,6 +4806,10 @@ async def list_round_trips(
         )
         if scoped:
             open_stmt = open_stmt.where(Trade.ticker == scoped)
+        if search_pattern:
+            open_stmt = open_stmt.where(
+                Trade.ticker.ilike(search_pattern, escape="\\")
+            )
         open_stmt = _by_strategy(open_stmt, Trade.strategy_id)
         open_rows = [
             (row[0], Decimal(str(row[1])))
