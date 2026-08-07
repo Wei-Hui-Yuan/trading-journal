@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import uuid
@@ -27,6 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import (
     CHAR,
+    BigInteger,
     Boolean,
     Column,
     Computed,
@@ -762,6 +764,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The browser's own HTTP cache revalidates without this -- If-None-Match is
+    # set by the browser, not by fetch, and is not subject to CORS. Exposing
+    # ETag is for JavaScript that wants to read it: without it the header is
+    # present on the wire and invisible to the page, which turns any attempt to
+    # debug a caching problem from the client into guesswork.
+    expose_headers=["ETag"],
 )
 
 
@@ -4597,6 +4605,8 @@ def _entry_slippage(
     dependencies=[Depends(verify_clerk_token)],
 )
 async def list_round_trips(
+    request: Request,
+    response: Response,
     ticker: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
 ):
@@ -4605,6 +4615,11 @@ async def list_round_trips(
     Closed round trips come from `positions`; open exposure is reconstructed
     from executions that FIFO matching never paired off. Both carry their plan
     and their fills, so one row is a whole trade rather than a fragment.
+
+    The most expensive read in the app, and the one a conditional request saves
+    the most on: it loads every position, every execution and every fill before
+    it can answer at all. The version check below is one primary-key lookup, and
+    a 304 skips all three scans.
     """
     # Reused rather than hardcoded: the role vocabulary and the cost-basis
     # replay both belong to the matching engine, and two copies would drift.
@@ -4613,6 +4628,16 @@ async def list_round_trips(
         ROLE_OPEN,
         replay_open_exposure,
     )
+
+    # Normalised into the tag rather than taken from the query string, so
+    # `?ticker=aapl` and `?ticker=AAPL` -- which produce identical payloads,
+    # the filter being upper-cased below -- do not occupy two cache entries
+    # that must each be revalidated separately.
+    scoped = ticker.strip().upper() if ticker else ""
+    version = await _journal_version(session)
+    etag = None if version is None else _etag("round-trips", version, scoped)
+    if (cached := _conditional(request, etag)) is not None:
+        return cached
 
     positions = (
         await session.execute(select(Position).order_by(Position.exit_time.desc()))
@@ -4855,6 +4880,7 @@ async def list_round_trips(
 
     # Open exposure first (it needs decisions), then closed by recency.
     rows.sort(key=lambda r: (r.kind != "open", -(r.exit_time or r.entry_time).timestamp()))
+    response.headers.update(_cache_headers(etag))
     return rows
 
 
@@ -4960,12 +4986,133 @@ async def review_position(
 
 
 # ---------------------------------------------------------------------------
+# Conditional responses
+# ---------------------------------------------------------------------------
+
+
+class DataVersion(Base):
+    """A counter bumped whenever the journal changes (migration 030).
+
+    One row, scope 'journal'. Triggers on positions, trades, position_fills,
+    realized_legs, planned_trades, strategies, disciplines and
+    position_disciplines increment it; nothing in Python writes it.
+    """
+
+    __tablename__ = "data_version"
+
+    scope = Column(Text, primary_key=True)
+    version = Column(BigInteger, nullable=False, default=0)
+    changed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# Served on every conditionally-cacheable response. `no-cache` does not mean
+# "do not store" -- it means "store it, but revalidate before reuse", which is
+# exactly the contract here: the browser keeps the payload and asks whether it
+# is still current, and the answer is a 304 with no body.
+#
+# `private` because these responses are per-user and the requests carry a
+# bearer token. Shared caches must not keep them.
+CONDITIONAL_CACHE_CONTROL = "private, no-cache"
+
+
+async def _journal_version(session: AsyncSession) -> Optional[int]:
+    """The current journal counter, or None if it cannot be read.
+
+    None means "do not attempt to cache this response" -- served fresh, with no
+    ETag, exactly as before this existed. That is the honest degradation for
+    the window between deploying this code and applying migration 030, and it
+    keeps a missing table from turning the whole dashboard into a 500.
+
+    Only UndefinedTable is swallowed, matching list_timeframes: "the migration
+    is not applied yet" and "the database is unreachable" must not look alike.
+    """
+    try:
+        return await session.scalar(
+            select(DataVersion.version).where(DataVersion.scope == "journal")
+        )
+    except ProgrammingError as exc:
+        if not isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            raise
+        logger.warning("data_version is missing; apply migration 030")
+        await session.rollback()
+        return None
+
+
+def _etag(scope: str, version: int, *parts: object) -> str:
+    """A validator for one payload, at one version, for one set of parameters.
+
+    `parts` is what makes two requests to the same endpoint distinct -- the
+    dashboard's window, above all. Without it a 1Y request and an ALL request
+    would share a tag and each would be served the other's cached body.
+
+    Hashed rather than concatenated so the tag stays a fixed, opaque length
+    whatever the parameters are, and so a date containing a quote cannot break
+    out of the header. Strong (unquoted by W/), because the bytes really are
+    identical: the same version and the same window rebuild the same payload.
+    """
+    raw = "|".join([scope, str(version), *(str(part) for part in parts)])
+    return '"' + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32] + '"'
+
+
+def _not_modified(request: Request, etag: str) -> bool:
+    """Whether the client already holds this exact payload.
+
+    If-None-Match is a LIST -- a client may hold several variants and offer all
+    of them, and RFC 9110 allows `*`. Splitting on comma rather than comparing
+    the raw header is what makes this work with more than one cached entry.
+
+    Weak-comparison prefixes are stripped before comparing so a tag that made a
+    round trip through a proxy that weakened it still matches; for a 304 that
+    is the correct comparison to use.
+    """
+    header = request.headers.get("if-none-match")
+    if not header:
+        return False
+    offered = {candidate.strip() for candidate in header.split(",")}
+    if "*" in offered:
+        return True
+    return etag in {tag[2:] if tag.startswith("W/") else tag for tag in offered}
+
+
+def _conditional(request: Request, etag: Optional[str]) -> Optional[Response]:
+    """A 304 when the client's copy is current, otherwise None.
+
+    Returned bare so the caller decides what to do next; a helper that also
+    built the 200 would have to know how to serialise every payload shape.
+
+    The 304 carries the ETag and Cache-Control again because a 304 REPLACES the
+    stored headers for the cached entry. Omitting them leaves the browser's copy
+    with no validator, so the next request is unconditional and the saving
+    happens exactly once.
+    """
+    if etag is None or not _not_modified(request, etag):
+        return None
+    return Response(
+        status_code=304,
+        headers={"ETag": etag, "Cache-Control": CONDITIONAL_CACHE_CONTROL},
+    )
+
+
+def _cache_headers(etag: Optional[str]) -> dict[str, str]:
+    """Headers for the 200 that accompanies a validator.
+
+    Empty when there is no version to key on, which leaves the response
+    uncacheable rather than tagged with something that cannot be trusted.
+    """
+    if etag is None:
+        return {}
+    return {"ETag": etag, "Cache-Control": CONDITIONAL_CACHE_CONTROL}
+
+
+# ---------------------------------------------------------------------------
 # Analytics
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/analytics/dashboard", dependencies=[Depends(verify_clerk_token)])
 async def analytics_dashboard(
+    request: Request,
+    response: Response,
     preset: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
@@ -4998,19 +5145,48 @@ async def analytics_dashboard(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return await build_dashboard(session, window)
+    # Keyed on the RESOLVED window, not on the query string. `preset=1Y` names
+    # a span that moves every day, and two requests a week apart mean different
+    # things by it; the dates they expand to are what the payload actually
+    # depends on. Resolving first is also what lets an explicit range and the
+    # preset that happens to match it share a cache entry.
+    version = await _journal_version(session)
+    etag = (
+        None
+        if version is None
+        else _etag("dashboard", version, window.start, window.end)
+    )
+    if (cached := _conditional(request, etag)) is not None:
+        return cached
+
+    payload = await build_dashboard(session, window)
+    response.headers.update(_cache_headers(etag))
+    return payload
 
 
 @app.get("/api/analytics/advanced", dependencies=[Depends(verify_clerk_token)])
-async def analytics_advanced(session: AsyncSession = Depends(get_session)):
+async def analytics_advanced(
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+):
     """R-multiples, slippage, expectancy, and the per-mistake breakdown.
 
     Sourced from `trades` rather than `positions`: R-multiple and slippage
     need the plan (stop_loss, planned_entry), which only the ledger carries.
+
+    Takes no parameters, so the version alone identifies the payload.
     """
     from services.analytics import build_advanced_analytics
 
-    return await build_advanced_analytics(session)
+    version = await _journal_version(session)
+    etag = None if version is None else _etag("advanced", version)
+    if (cached := _conditional(request, etag)) is not None:
+        return cached
+
+    payload = await build_advanced_analytics(session)
+    response.headers.update(_cache_headers(etag))
+    return payload
 
 
 # ===========================================================================

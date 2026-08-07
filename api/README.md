@@ -42,6 +42,35 @@ with the frontend typecheck and production build. It installs dependencies with
 `pip install --no-deps`, so a dependency that is imported but not pinned fails
 the build rather than being silently fetched.
 
+## Response caching
+
+`GET /api/analytics/dashboard`, `GET /api/analytics/advanced` and
+`GET /api/round-trips` answer conditional requests. Each sends an `ETag` and
+`Cache-Control: private, no-cache`; a client that sends back a matching
+`If-None-Match` gets a `304` with no body.
+
+The saving is compute, not bandwidth. These endpoints scan whole tables —
+round-trips loads every position, every execution and every fill before it can
+answer — so the 304 is only worth having if producing it skips that work. It
+does: the only database access before the decision is a single primary-key
+lookup of a counter.
+
+That counter is `data_version` (migration 030), incremented by statement-level
+triggers on every table the cached endpoints read. It notices inserts, updates
+and deletes, which `MAX(created_at)` would not — these tables have no
+`updated_at`, so a review being written or a rematch rewriting P&L would leave
+a timestamp-keyed cache serving stale numbers.
+
+There is deliberately **one** counter rather than one per endpoint. Renaming a
+strategy invalidates the equity curve unnecessarily; that costs a
+recomputation nobody notices. Per-endpoint scopes would mean every future
+endpoint has to correctly declare its dependencies, and getting that wrong
+produces a stale figure that looks plausible.
+
+Before migration 030 is applied the counter cannot be read, and the endpoints
+degrade to untagged `200`s — exactly their previous behaviour. They never 500
+over it.
+
 ## Migrations
 
 SQL files in `migrations/`, applied by `migrate.py`, which records what it has
