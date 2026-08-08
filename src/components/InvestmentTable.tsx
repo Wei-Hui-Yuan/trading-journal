@@ -65,13 +65,21 @@ const CELL = 'px-2.5 py-2 align-middle';
 const NUM = `${CELL} text-right font-mono tabular-nums`;
 
 /**
- * Discount or premium to the model's average intrinsic value.
+ * Discount or premium to the model's BASE-case intrinsic value.
+ *
+ * Computed here rather than read from the API's `premium_pct` field, which is
+ * relative to the AVERAGE of base and conservative. That field is left alone
+ * because the valuation modal's own "vs price" tile still reads it — this
+ * column is scoped to the main table, and changing the shared field would
+ * have silently moved the modal's figure too. Same formula as the backend's
+ * `premium_pct` (price / intrinsic value - 1) x 100, just against a different
+ * baseline, so the two stay comparable in shape.
  *
  * The sign is the opposite of intuition and so is spelled out rather than left
- * to a colour: the API returns (price / value - 1), so POSITIVE means the
- * market is asking MORE than the model says it is worth. Green is therefore
- * the negative number. A bare signed percentage here would be read backwards
- * by anyone who has not just written the formula.
+ * to a colour: POSITIVE means the market is asking MORE than the model says
+ * it is worth. Green is therefore the negative number. A bare signed
+ * percentage here would be read backwards by anyone who has not just written
+ * the formula.
  */
 const DiscountPremium: React.FC<{ holding: Holding }> = ({ holding }) => {
   const valuation = holding.valuation;
@@ -89,8 +97,14 @@ const DiscountPremium: React.FC<{ holding: Holding }> = ({ holding }) => {
       </span>
     );
   }
-  const premium = valuation.premium_pct;
-  if (premium === null || premium === undefined) {
+
+  const iv = valuation.base?.intrinsic_value;
+  const price = holding.current_price;
+  // <= 0 is excluded like the backend does: a non-positive intrinsic value
+  // has nothing meaningful to be a percentage against.
+  const premium = iv && iv > 0 && price !== null ? (price / iv - 1) * 100 : null;
+
+  if (premium === null) {
     return <span className="text-obsidian-muted" title="No price to compare against">—</span>;
   }
 
@@ -100,8 +114,8 @@ const DiscountPremium: React.FC<{ holding: Holding }> = ({ holding }) => {
       className={discounted ? 'text-win' : 'text-loss'}
       title={
         discounted
-          ? 'Trading below the model’s value — a discount'
-          : 'Trading above the model’s value — a premium'
+          ? 'Trading below the model’s base-case value — a discount'
+          : 'Trading above the model’s base-case value — a premium'
       }
     >
       {discounted ? '−' : '+'}
@@ -756,8 +770,8 @@ export const InvestmentTable: React.FC = () => {
                     </td>
 
                     <td className={`${NUM} text-slate-300`}>
-                      {holding.valuation?.available
-                        ? money(holding.valuation.average_intrinsic_value)
+                      {holding.valuation?.available && holding.valuation.base
+                        ? money(holding.valuation.base.intrinsic_value)
                         : '—'}
                       {holding.valuation?.overridden_fields?.length ? (
                         <div
