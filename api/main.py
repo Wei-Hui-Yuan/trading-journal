@@ -128,12 +128,35 @@ class Strategy(Base):
 
 
 class Discipline(Base):
-    """A rule the trader holds themselves to. User-editable (migration 013)."""
+    """A rule the trader holds themselves to. User-editable (migration 013).
+
+    NULL `strategy_id` is a general rule, checked on every reviewed trade.
+    Set, it scopes the rule to one playbook entry (migration 032) -- "Price
+    reclaimed the prior day high on volume" only means something on a trade
+    actually following that strategy, and only the review checklist for a
+    trade tagged with it should ever show it.
+
+    Uniqueness on `name` is NOT declared here as `unique=True`: it needs to
+    hold separately within each strategy and separately among general rules,
+    which a single-column constraint cannot express. Migration 032 enforces
+    it with two partial indexes instead -- see that file for why one
+    composite UNIQUE(strategy_id, name) does not work (Postgres does not
+    treat two NULLs as equal, so it would silently permit the same general
+    rule name twice).
+    """
 
     __tablename__ = "disciplines"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(Text, nullable=False, unique=True)
+    name = Column(Text, nullable=False)
+    # ON DELETE CASCADE, not SET NULL: a strategy-specific rule has no
+    # meaning once its strategy is gone, and SET NULL would silently turn it
+    # into a general rule asked on every OTHER trade instead.
+    strategy_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("strategies.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -3120,6 +3143,14 @@ class StrategyUsage(BaseModel):
     trades: int = 0
     positions: int = 0
     plans: int = 0
+    # Checklist rules scoped to this strategy (migration 032). Reported so
+    # the delete confirmation can say what disappears, but deliberately
+    # EXCLUDED from `total` below: these cascade-delete with the strategy
+    # automatically, with nowhere sensible to reassign a rule like "waited
+    # for the gap fill" to a different setup. Forcing reassign_to on a
+    # strategy that has never been traded, purely because someone wrote its
+    # checklist first, would block a delete that has no real history to lose.
+    checklist_items: int = 0
 
     @property
     def total(self) -> int:
@@ -3171,6 +3202,7 @@ async def _strategy_usage(session: AsyncSession) -> dict[uuid.UUID, StrategyUsag
             (Trade, "trades"),
             (Position, "positions"),
             (PlannedTrade, "plans"),
+            (Discipline, "checklist_items"),
         )
     ]
 
@@ -3381,6 +3413,11 @@ async def delete_strategy(
 
 class DisciplineCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
+    # None is a general rule, checked on every trade. Set, it scopes the rule
+    # to one playbook entry (migration 032) -- validated to actually exist
+    # before the insert is attempted, so a bad id surfaces as its own 404
+    # rather than as an FK violation wearing the duplicate-name 409's message.
+    strategy_id: Optional[uuid.UUID] = None
 
     @field_validator("name")
     @classmethod
@@ -3394,6 +3431,7 @@ class DisciplineCreate(BaseModel):
 class DisciplineOut(BaseModel):
     id: uuid.UUID
     name: str
+    strategy_id: Optional[uuid.UUID] = None
     created_at: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)
@@ -3451,16 +3489,25 @@ async def create_discipline(
     params: DisciplineCreate,
     session: AsyncSession = Depends(get_session),
 ):
-    """Add a new discipline rule."""
-    discipline = Discipline(name=params.name)
+    """Add a new discipline rule, general or scoped to one strategy."""
+    if params.strategy_id is not None:
+        strategy = await session.get(Strategy, params.strategy_id)
+        if strategy is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="The strategy to scope this rule to was not found.",
+            )
+
+    discipline = Discipline(name=params.name, strategy_id=params.strategy_id)
     session.add(discipline)
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
+        where = "in this strategy" if params.strategy_id is not None else "as a general rule"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"A discipline rule named '{params.name}' already exists",
+            detail=f"A discipline rule named '{params.name}' already exists {where}",
         )
     except ProgrammingError as exc:
         await session.rollback()

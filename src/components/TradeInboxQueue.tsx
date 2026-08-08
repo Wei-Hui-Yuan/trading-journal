@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownRight,
@@ -86,6 +86,14 @@ export function TradeInboxQueue() {
   const positionsQuery = usePendingPositions();
   const strategiesQuery = useStrategies();
   const disciplinesQuery = useDisciplines();
+  // Same for every card in the queue, so hoisted out of the per-position
+  // render rather than refiltered once per row. A rule created from the
+  // "Manage Rules" popover has no strategy selector, so it always lands
+  // here -- strategy-specific items only ever come from the Strategies page.
+  const generalDisciplines = useMemo(
+    () => (disciplinesQuery.data ?? []).filter((d) => d.strategy_id === null),
+    [disciplinesQuery.data]
+  );
   const createDisciplineMutation = useCreateDiscipline();
   const deleteDisciplineMutation = useDeleteDiscipline();
   const reviewMutation = useReviewPosition();
@@ -423,6 +431,16 @@ export function TradeInboxQueue() {
 
       {positions.map((position) => {
         const draft = draftFor(position);
+        // General rules plus whichever strategy this card currently has
+        // selected -- the DRAFT selection, not the position's already-saved
+        // one, so picking a strategy for the first time during this review
+        // immediately surfaces its checklist rather than requiring a save
+        // and reopen first.
+        const checklistForDraft = draft.strategy_id
+          ? (disciplinesQuery.data ?? []).filter(
+              (d) => d.strategy_id === null || d.strategy_id === draft.strategy_id
+            )
+          : generalDisciplines;
         const isWin = position.realized_pnl >= 0;
         // Disable only the card being submitted, not the whole queue.
         const isSubmitting =
@@ -589,8 +607,14 @@ export function TradeInboxQueue() {
                       </button>
                     </div>
 
+                    {/* General rules only -- a rule created here has no
+                        selector for a strategy, so it would be surprising for
+                        it to silently pick up whatever strategy this one
+                        position happens to be tagged with. Strategy-specific
+                        checklist items are authored on that strategy's own
+                        page, where scoping is explicit. */}
                     <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
-                      {(disciplinesQuery.data ?? []).map((d) => (
+                      {generalDisciplines.map((d) => (
                         <div key={d.id} className="flex items-center justify-between bg-obsidian-bg/60 px-2 py-1 rounded border border-obsidian-border/50 text-slate-300">
                           <span className="truncate pr-2">{d.name}</span>
                           <button
@@ -615,7 +639,7 @@ export function TradeInboxQueue() {
                         type="text"
                         value={newRuleName}
                         onChange={(e) => setNewRuleName(e.target.value)}
-                        placeholder="New rule name…"
+                        placeholder="New general rule…"
                         className="flex-1 rounded bg-obsidian-bg border border-obsidian-border px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-slate-600"
                       />
                       <button
@@ -638,6 +662,10 @@ export function TradeInboxQueue() {
                         Add
                       </button>
                     </div>
+                    <p className="text-[10px] text-obsidian-muted">
+                      Strategy-specific checklist items are added from the
+                      Strategies page.
+                    </p>
                   </div>
                 )}
 
@@ -646,10 +674,10 @@ export function TradeInboxQueue() {
                     <Loader2 className="h-3 w-3 animate-spin" />
                     <span>Loading rules…</span>
                   </div>
-                ) : (disciplinesQuery.data ?? []).length === 0 ? (
+                ) : checklistForDraft.length === 0 ? (
                   <p className="text-xs text-obsidian-muted py-1">No discipline rules defined.</p>
                 ) : (
-                  (disciplinesQuery.data ?? []).map((d) => {
+                  checklistForDraft.map((d) => {
                     // Keyed by id, never by name. Name-keying meant a rule the
                     // user added had no column to land in and was dropped on
                     // save, and renaming a default rule silently detached its
