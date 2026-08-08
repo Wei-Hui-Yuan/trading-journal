@@ -335,6 +335,75 @@ function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
   );
 }
 
+/**
+ * The coarser question `DisciplineBreakdown` above can't answer: not "is
+ * rule X worth following", but "does following your rules AS A WHOLE track
+ * the outcome at all" — the headline comparison a compliance checklist
+ * exists to make ("100% compliant = 68% win rate | under 50% = 25%").
+ *
+ * Fixed ranges, always all four, even ones with no trades in them yet — the
+ * bucket a trade lands in does not depend on how many rules exist today, so
+ * emptiness here is itself information rather than something to hide.
+ */
+function ComplianceBuckets({ metrics }: { metrics: AdvancedMetrics }) {
+  const rows = metrics.compliance_buckets ?? [];
+  const scored = rows.reduce((sum, r) => sum + r.trade_count, 0);
+
+  const pct = (value: number | null) => (value === null ? '—' : `${value}%`);
+
+  return (
+    <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+      <h3 className="text-sm font-semibold text-slate-200 mb-1">
+        Does Overall Compliance Pay?
+      </h3>
+      <p className="text-[11px] text-obsidian-muted mb-4">
+        Win rate grouped by how much of your answered playbook you followed on
+        each trade.
+      </p>
+      {scored === 0 ? (
+        <p className="text-xs text-obsidian-muted py-4 text-center">
+          No trades reviewed against a rule yet.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-obsidian-muted text-[10px] uppercase tracking-wider">
+                <th className="text-left font-medium pb-2">Compliance</th>
+                <th className="text-right font-medium pb-2">Trades</th>
+                <th className="text-right font-medium pb-2">Win %</th>
+                <th className="text-right font-medium pb-2">Avg R</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.compliance} className="border-t border-obsidian-border">
+                  <td className="py-2 text-slate-200">{row.compliance}</td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {row.trade_count}
+                  </td>
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {pct(row.win_rate_pct)}
+                  </td>
+                  {/* r_sample can be smaller than trade_count -- not every
+                      trade carries a stop to score R against -- so a
+                      near-empty sample is shown as a dash rather than a
+                      confident-looking number. */}
+                  <td className="py-2 text-right font-mono text-slate-300">
+                    {row.avg_r === null || row.r_sample === 0
+                      ? '—'
+                      : `${row.avg_r >= 0 ? '+' : ''}${row.avg_r.toFixed(2)}R`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MistakeBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
   const rows = metrics.mistake_breakdown ?? [];
 
@@ -668,8 +737,9 @@ export default function AnalyticsPage() {
               <StrategyBreakdownChart metrics={m} />
             </section>
 
-            <section>
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <DisciplineBreakdown metrics={m} />
+              <ComplianceBuckets metrics={m} />
             </section>
           </>
         ) : null}
