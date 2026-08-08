@@ -509,6 +509,13 @@ export interface TradePlan {
   /** Stored size of that image, so the UI can report what charts cost. */
   chart_bytes: number | null;
   chart_uploaded_at: string | null; // ISO 8601
+  /**
+   * Pre-trade checklist answers (migration 033). Only rules actually
+   * answered appear — same absence-means-unanswered convention as
+   * `Position.disciplines`. Carried into the post-trade review as a starting
+   * value only; never itself read by analytics.
+   */
+  disciplines: PositionDiscipline[];
 }
 
 /** POST /api/plans. Every price is optional — a ticker and a bias is enough. */
@@ -523,6 +530,8 @@ export interface TradePlanPayload {
   risk_amount?: number | null;
   strategy_id?: string | null;
   thesis?: string | null;
+  /** Keyed by discipline id. Omitting the field saves the plan unanswered. */
+  disciplines?: Record<string, boolean>;
 }
 
 /** PATCH /api/plans/{id}. Only keys present are applied. */

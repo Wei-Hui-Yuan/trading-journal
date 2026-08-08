@@ -8,6 +8,7 @@ import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucid
 import {
   useCreatePlan,
   useDeletePlanChart,
+  useDisciplines,
   useSettings,
   useStrategies,
   useUpdatePlan,
@@ -52,6 +53,13 @@ interface FormState {
    * trade, so it is read from Settings rather than retyped here.
    */
   riskPercent: string;
+  /**
+   * Pre-trade checklist answers, keyed by discipline id. Every rule visible
+   * when the plan is saved gets a real entry here (unticked -> false) --
+   * see handleSubmit, and the same "an unticked box is a real answer"
+   * reasoning TradeInboxQueue's own review checklist already uses.
+   */
+  disciplinesChecked: Record<string, boolean>;
 }
 
 /** '' / whitespace / unparseable -> null, so the API never receives NaN. */
@@ -79,6 +87,7 @@ const blankForm = (): FormState => ({
   strategyId: '',
   thesis: '',
   riskPercent: '',
+  disciplinesChecked: {},
 });
 
 /**
@@ -98,6 +107,9 @@ const formFrom = (plan: TradePlan): FormState => ({
   strategyId: plan.strategy_id ?? '',
   thesis: plan.thesis ?? '',
   riskPercent: plan.risk_percent === null ? '' : String(plan.risk_percent),
+  disciplinesChecked: Object.fromEntries(
+    plan.disciplines.map((d) => [d.discipline_id, d.followed])
+  ),
 });
 
 /** Money, to the cent. */
@@ -170,6 +182,20 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   const updateMutation = useUpdatePlan();
   // Offered straight from the playbook, so the two cannot drift apart.
   const { data: strategies } = useStrategies();
+  const disciplinesQuery = useDisciplines();
+  // General rules plus whichever strategy is currently selected -- the same
+  // "general + this one strategy" scoping TradeInboxQueue's own checklist
+  // uses, so a rule ticked here and one ticked at review time mean the same
+  // thing.
+  const generalDisciplines = useMemo(
+    () => (disciplinesQuery.data ?? []).filter((d) => d.strategy_id === null),
+    [disciplinesQuery.data]
+  );
+  const checklistForPlan = form.strategyId
+    ? (disciplinesQuery.data ?? []).filter(
+        (d) => d.strategy_id === null || d.strategy_id === form.strategyId
+      )
+    : generalDisciplines;
   // Read-only here. Editing lives on /settings so account size is set
   // occasionally rather than retyped for every trade.
   const { data: settings } = useSettings();
@@ -309,6 +335,15 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
         return setError(`${labels[typedKey]} must be greater than zero.`);
     }
 
+    // Every rule on screen gets a real answer, not just the ticked ones --
+    // mirrors the Trade Inbox review checklist, so an unticked box here means
+    // the same thing an unticked box means there. Omitted entirely when no
+    // rule applies, so a plan with no strategy chosen sends nothing.
+    const disciplines: Record<string, boolean> = {};
+    for (const rule of checklistForPlan) {
+      disciplines[rule.id] = Boolean(form.disciplinesChecked[rule.id]);
+    }
+
     const payload = {
       ticker: symbol,
       direction: form.side,
@@ -321,6 +356,7 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
       risk_amount: plannedRisk,
       risk_percent: plannedRiskPercent,
       ...optional,
+      ...(checklistForPlan.length > 0 ? { disciplines } : {}),
     };
 
     if (isEdit && plan) {
@@ -882,6 +918,43 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 </span>
               )}
             </label>
+
+            {/* General rules plus this strategy's own checklist -- ticked here
+                before the outcome is known, then carried into the Trade Inbox
+                review as a starting point once the trade closes. A box left
+                unticked here is not final: the review is what actually
+                counts towards the discipline score, this is only a plan. */}
+            {checklistForPlan.length > 0 && (
+              <div className="mt-3">
+                <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                  Pre-Trade Checklist
+                </span>
+                <div className="mt-1.5 space-y-1.5">
+                  {checklistForPlan.map((d) => (
+                    <label
+                      key={d.id}
+                      className="flex items-center space-x-2 cursor-pointer select-none"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(form.disciplinesChecked[d.id])}
+                        disabled={isSaving}
+                        onChange={(e) =>
+                          patch({
+                            disciplinesChecked: {
+                              ...form.disciplinesChecked,
+                              [d.id]: e.target.checked,
+                            },
+                          })
+                        }
+                        className="h-3.5 w-3.5 rounded border-obsidian-border bg-obsidian-card accent-win disabled:opacity-50"
+                      />
+                      <span className="text-xs text-slate-300">{d.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <label className="mt-3 block">
               <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">

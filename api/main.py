@@ -188,6 +188,93 @@ class PositionDiscipline(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class PlanDiscipline(Base):
+    """Whether one pre-trade plan's checklist rule was ticked (migration 033).
+
+    Shaped exactly like PositionDiscipline, but answers a different question
+    at a different time: this is what you expected to do before the trade,
+    not what you actually did. list_positions consults it only to seed a
+    starting value for a pending position's review checklist -- see
+    _plan_defaults_by_position. Nothing in services/analytics.py reads this
+    table; a plan-time answer counts towards a discipline score only once it
+    has been saved for real through review_position.
+    """
+
+    __tablename__ = "plan_disciplines"
+
+    plan_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("planned_trades.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    discipline_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("disciplines.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    followed = Column(Boolean, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PositionDisciplineOut(BaseModel):
+    """One rule's answer, for one round trip or one plan.
+
+    Carries `name` alongside the id so a caller can render the checklist
+    without a second lookup, and so a historical answer stays readable if the
+    rule is later renamed. Shared between positions and plans -- the shape is
+    identical either way, only which join table it came from differs.
+    """
+
+    discipline_id: uuid.UUID
+    name: str
+    followed: bool
+
+
+async def _upsert_discipline_answers(
+    session: AsyncSession,
+    model: type,
+    owner_column: str,
+    owner_id: uuid.UUID,
+    answers: dict[uuid.UUID, bool],
+) -> None:
+    """Upsert discipline answers into a position_disciplines-shaped table.
+
+    Shared by the post-trade review (PositionDiscipline) and the pre-trade
+    plan checklist (PlanDiscipline) -- both are (owner_id, discipline_id) ->
+    followed, differing only in which table and which column names the owner.
+    Upsert rather than delete-and-reinsert so a corrected answer keeps its
+    original created_at instead of looking freshly reviewed.
+    """
+    known = set(
+        (
+            await session.execute(
+                select(Discipline.id).where(Discipline.id.in_(list(answers)))
+            )
+        ).scalars().all()
+    )
+    unknown = set(answers) - known
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown discipline rule(s): {sorted(str(u) for u in unknown)}",
+        )
+
+    for discipline_id, followed in answers.items():
+        stmt = (
+            pg_insert(model)
+            .values(
+                **{owner_column: owner_id},
+                discipline_id=discipline_id,
+                followed=bool(followed),
+            )
+            .on_conflict_do_update(
+                index_elements=[owner_column, "discipline_id"],
+                set_={"followed": bool(followed)},
+            )
+        )
+        await session.execute(stmt)
+
+
 class AppSetting(Base):
     """The one row of trader-level defaults (migration 015).
 
@@ -1855,6 +1942,12 @@ class PlanCreate(BaseModel):
     strategy_id: Optional[uuid.UUID] = None
     thesis: Optional[str] = None
 
+    # Pre-trade checklist answers (migration 033), keyed by discipline id.
+    # Optional -- a plan is worth saving before any of its checklist is
+    # answered. Carried into the post-trade review as a starting value only;
+    # see _plan_defaults_by_position. Never itself read by analytics.
+    disciplines: Optional[dict[uuid.UUID, bool]] = None
+
     @field_validator("ticker")
     @classmethod
     def _upper_ticker(cls, value: str) -> str:
@@ -1887,6 +1980,10 @@ class PlanUpdate(BaseModel):
     strategy_id: Optional[uuid.UUID] = None
     thesis: Optional[str] = None
     status: Optional[str] = None
+
+    # Same as PlanCreate.disciplines. Blocked, like every other field, once
+    # the plan is ATTACHED -- see update_plan.
+    disciplines: Optional[dict[uuid.UUID, bool]] = None
 
     @field_validator("ticker")
     @classmethod
@@ -1957,9 +2054,17 @@ class PlanOut(BaseModel):
     has_chart: bool = False
     chart_bytes: Optional[int] = None
     chart_uploaded_at: Optional[datetime] = None
+    # Pre-trade checklist answers (migration 033). Only rules actually
+    # answered appear -- same absence-means-unanswered convention as
+    # PositionOut.disciplines.
+    disciplines: list[PositionDisciplineOut] = []
 
 
-def _plan_out(plan: PlannedTrade, attached_ids: Sequence[uuid.UUID] = ()) -> PlanOut:
+def _plan_out(
+    plan: PlannedTrade,
+    attached_ids: Sequence[uuid.UUID] = (),
+    disciplines: Sequence[PositionDisciplineOut] = (),
+) -> PlanOut:
     """Serialise a plan, converting Decimal to float at the boundary."""
     def num(value) -> Optional[float]:
         return float(value) if value is not None else None
@@ -1984,6 +2089,7 @@ def _plan_out(plan: PlannedTrade, attached_ids: Sequence[uuid.UUID] = ()) -> Pla
         has_chart=plan.chart_path is not None,
         chart_bytes=plan.chart_bytes,
         chart_uploaded_at=plan.chart_uploaded_at,
+        disciplines=list(disciplines),
     )
 
 
@@ -2035,7 +2141,11 @@ async def list_plans(
 
     plans = (await session.execute(stmt)).scalars().all()
     attached = await _attached_ids_by_plan(session, [p.id for p in plans])
-    return [_plan_out(p, attached.get(p.id, [])) for p in plans]
+    disciplines = await _disciplines_by_plan(session, [p.id for p in plans])
+    return [
+        _plan_out(p, attached.get(p.id, []), disciplines.get(p.id, []))
+        for p in plans
+    ]
 
 
 async def _new_plan(session: AsyncSession, params: PlanCreate) -> PlannedTrade:
@@ -2064,6 +2174,10 @@ async def _new_plan(session: AsyncSession, params: PlanCreate) -> PlannedTrade:
     await _derive_plan_risk(session, plan)
     session.add(plan)
     await session.flush()
+    if params.disciplines:
+        await _upsert_discipline_answers(
+            session, PlanDiscipline, "plan_id", plan.id, params.disciplines
+        )
     return plan
 
 
@@ -2091,7 +2205,8 @@ async def create_plan(
     # planned_r and the timestamps were produced by the database; re-read
     # rather than report what we sent, which did not include them.
     await session.refresh(plan)
-    return _plan_out(plan)
+    disciplines = (await _disciplines_by_plan(session, [plan.id])).get(plan.id, [])
+    return _plan_out(plan, disciplines=disciplines)
 
 
 async def _derive_plan_risk(session: AsyncSession, plan: PlannedTrade) -> None:
@@ -2191,6 +2306,11 @@ async def update_plan(
             detail="Attach a plan to a trade instead of setting its status directly.",
         )
 
+    # Lives in its own table, like review_position's discipline_answers --
+    # assigning it to the ORM object would silently become a stray Python
+    # attribute that never reaches the database.
+    discipline_answers = changes.pop("disciplines", None)
+
     decimal_fields = {
         "quantity", "planned_entry", "stop_loss", "take_profit",
         "risk_percent", "risk_amount",
@@ -2203,12 +2323,18 @@ async def update_plan(
     # what let the stored figure drift away from them.
     await _derive_plan_risk(session, plan)
 
+    if discipline_answers:
+        await _upsert_discipline_answers(
+            session, PlanDiscipline, "plan_id", plan.id, discipline_answers
+        )
+
     plan.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(plan)
 
     attached = await _attached_ids_by_plan(session, [plan.id])
-    return _plan_out(plan, attached.get(plan.id, []))
+    disciplines = await _disciplines_by_plan(session, [plan.id])
+    return _plan_out(plan, attached.get(plan.id, []), disciplines.get(plan.id, []))
 
 
 @app.delete(
@@ -3594,19 +3720,6 @@ class PositionReviewUpdate(BaseModel):
     disciplines: Optional[dict[uuid.UUID, bool]] = None
 
 
-class PositionDisciplineOut(BaseModel):
-    """One rule's answer for one round trip.
-
-    Carries `name` alongside the id so a caller can render the checklist
-    without a second lookup, and so a historical answer stays readable if the
-    rule is later renamed.
-    """
-
-    discipline_id: uuid.UUID
-    name: str
-    followed: bool
-
-
 class PositionOut(BaseModel):
     id: uuid.UUID
     symbol: str
@@ -3683,6 +3796,86 @@ async def _disciplines_by_position(
             )
         )
     return grouped
+
+
+async def _disciplines_by_plan(
+    session: AsyncSession, plan_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[PositionDisciplineOut]]:
+    """Checklist answers for many plans in one query, not one per row.
+
+    Mirrors _disciplines_by_position exactly -- see that function.
+    """
+    if not plan_ids:
+        return {}
+
+    rows = (
+        await session.execute(
+            select(
+                PlanDiscipline.plan_id,
+                PlanDiscipline.discipline_id,
+                PlanDiscipline.followed,
+                Discipline.name,
+            )
+            .join(Discipline, Discipline.id == PlanDiscipline.discipline_id)
+            .where(PlanDiscipline.plan_id.in_(plan_ids))
+            .order_by(Discipline.created_at)
+        )
+    ).all()
+
+    grouped: dict[uuid.UUID, list[PositionDisciplineOut]] = {}
+    for plan_id, discipline_id, followed, name in rows:
+        grouped.setdefault(plan_id, []).append(
+            PositionDisciplineOut(
+                discipline_id=discipline_id, name=name, followed=followed
+            )
+        )
+    return grouped
+
+
+async def _plan_defaults_by_position(
+    session: AsyncSession, positions: Sequence[Position]
+) -> dict[uuid.UUID, list[PositionDisciplineOut]]:
+    """Checklist answers carried over from the plan that opened each position.
+
+    A plan is about ENTRY, so it is the opening trade -- not the closing one
+    -- whose plan_id names the plan to read: positions.open_trade_id ->
+    trades.id -> trades.plan_id -> plan_disciplines. Consulted only by
+    list_positions, and only to seed a starting value for a checklist nobody
+    has answered yet; a position with its own position_disciplines row for a
+    rule keeps that answer regardless of what the plan says.
+    """
+    open_trade_ids = [p.open_trade_id for p in positions]
+    if not open_trade_ids:
+        return {}
+
+    rows = (
+        await session.execute(
+            select(
+                Trade.id.label("trade_id"),
+                PlanDiscipline.discipline_id,
+                PlanDiscipline.followed,
+                Discipline.name,
+            )
+            .select_from(Trade)
+            .join(PlanDiscipline, PlanDiscipline.plan_id == Trade.plan_id)
+            .join(Discipline, Discipline.id == PlanDiscipline.discipline_id)
+            .where(Trade.id.in_(open_trade_ids))
+        )
+    ).all()
+
+    by_trade: dict[uuid.UUID, list[PositionDisciplineOut]] = {}
+    for trade_id, discipline_id, followed, name in rows:
+        by_trade.setdefault(trade_id, []).append(
+            PositionDisciplineOut(
+                discipline_id=discipline_id, name=name, followed=followed
+            )
+        )
+
+    return {
+        position.id: by_trade[position.open_trade_id]
+        for position in positions
+        if position.open_trade_id in by_trade
+    }
 
 
 async def _position_out(session: AsyncSession, position: Position) -> PositionOut:
@@ -4701,11 +4894,26 @@ async def list_positions(
 
     # One query for the whole page rather than a lookup per row.
     by_position = await _disciplines_by_position(session, [p.id for p in positions])
+    # Only consulted below for positions still pending review -- see
+    # _plan_defaults_by_position.
+    plan_defaults = await _plan_defaults_by_position(session, positions)
 
     out: list[PositionOut] = []
     for position in positions:
         row = PositionOut.model_validate(position)
-        row.disciplines = by_position.get(position.id, [])
+        answered = by_position.get(position.id, [])
+        row.disciplines = answered
+        if position.review_status == ReviewStatus.pending.value:
+            # A rule the plan never answered, or one added to the strategy's
+            # checklist after the plan was written, is left for the reviewer
+            # to tick -- only filling gaps the plan actually has an opinion
+            # on, never overriding what the plan itself did not cover.
+            answered_ids = {a.discipline_id for a in answered}
+            row.disciplines = answered + [
+                d
+                for d in plan_defaults.get(position.id, [])
+                if d.discipline_id not in answered_ids
+            ]
         out.append(row)
     return out
 
@@ -5430,39 +5638,12 @@ async def review_position(
         setattr(position, field, value)
 
     if discipline_answers:
-        known = set(
-            (
-                await session.execute(
-                    select(Discipline.id).where(
-                        Discipline.id.in_(list(discipline_answers))
-                    )
-                )
-            ).scalars().all()
-        )
-        unknown = set(discipline_answers) - known
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown discipline rule(s): {sorted(str(u) for u in unknown)}",
-            )
-
         # Upsert: re-saving a review must correct the previous answer, not
         # collide with it. Deleting and re-inserting would lose created_at and
         # briefly leave the round trip looking unreviewed.
-        for discipline_id, followed in discipline_answers.items():
-            stmt = (
-                pg_insert(PositionDiscipline)
-                .values(
-                    position_id=position_id,
-                    discipline_id=discipline_id,
-                    followed=bool(followed),
-                )
-                .on_conflict_do_update(
-                    index_elements=["position_id", "discipline_id"],
-                    set_={"followed": bool(followed)},
-                )
-            )
-            await session.execute(stmt)
+        await _upsert_discipline_answers(
+            session, PositionDiscipline, "position_id", position_id, discipline_answers
+        )
 
     if params.mark_reviewed:
         position.review_status = ReviewStatus.reviewed.value
