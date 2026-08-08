@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   BookOpen,
   Check,
+  ListChecks,
   Loader2,
   Plus,
   Target,
@@ -15,8 +16,11 @@ import {
 } from 'lucide-react';
 
 import {
+  useCreateDiscipline,
   useCreateStrategy,
+  useDeleteDiscipline,
   useDeleteStrategy,
+  useDisciplines,
   useStrategies,
   useUpdateStrategy,
 } from '@/hooks/useTradeInbox';
@@ -62,6 +66,107 @@ const toDraft = (s: Strategy): StrategyDraft => ({
 
 /** Sentinel id for the unsaved "new strategy" row. */
 const NEW_ID = '__new__';
+
+/**
+ * Checklist items scoped to one strategy (migration 032) -- separate from
+ * `entry_criteria`/`exit_criteria` above, which stay free text. Those explain
+ * the setup; these are the literal yes/no items the review checklist shows
+ * on a trade tagged with this strategy, alongside the general rules that
+ * apply to every trade regardless of setup.
+ *
+ * Own component so its own discipline-mutation loading/error state does not
+ * get tangled with the surrounding strategy-editor form's.
+ */
+function StrategyChecklist({ strategyId }: { strategyId: string }) {
+  const disciplinesQuery = useDisciplines();
+  const createMutation = useCreateDiscipline();
+  const deleteMutation = useDeleteDiscipline();
+  const [newItem, setNewItem] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const items = (disciplinesQuery.data ?? []).filter(
+    (d) => d.strategy_id === strategyId
+  );
+
+  const handleAdd = () => {
+    const name = newItem.trim();
+    if (!name) return;
+    setError(null);
+    createMutation.mutate(
+      { name, strategy_id: strategyId },
+      {
+        onSuccess: () => setNewItem(''),
+        onError: (err) => setError(err.message),
+      }
+    );
+  };
+
+  return (
+    <div>
+      <span className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-obsidian-muted">
+        <ListChecks className="h-3 w-3 text-slate-400" />
+        Review Checklist
+      </span>
+      <p className="mt-1 text-[10px] text-obsidian-muted">
+        Shown alongside the general rules when reviewing a trade tagged with
+        this strategy. Separate from the rules above, which are notes for
+        yourself rather than something checked off per trade.
+      </p>
+
+      <div className="mt-2 space-y-1.5">
+        {disciplinesQuery.isPending ? (
+          <div className="flex items-center gap-1.5 text-xs text-obsidian-muted">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            <span>Loading…</span>
+          </div>
+        ) : items.length === 0 ? (
+          <p className="text-xs text-obsidian-muted">No checklist items yet.</p>
+        ) : (
+          items.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center justify-between rounded border border-obsidian-border/50 bg-obsidian-bg px-2.5 py-1.5 text-xs text-slate-300"
+            >
+              <span className="truncate pr-2">{item.name}</span>
+              <button
+                type="button"
+                onClick={() => deleteMutation.mutate(item.id)}
+                disabled={deleteMutation.isPending}
+                title="Remove item"
+                className="p-0.5 text-obsidian-muted hover:text-loss disabled:opacity-50"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+
+      {error && <p className="mt-2 text-[10px] text-loss">{error}</p>}
+
+      <div className="mt-2 flex gap-1.5">
+        <input
+          type="text"
+          value={newItem}
+          onChange={(e) => setNewItem(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+          placeholder="e.g. Price reclaimed prior day high"
+          disabled={createMutation.isPending}
+          className="flex-1 rounded-lg bg-obsidian-bg border border-obsidian-border px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-obsidian-muted focus:outline-none focus:border-slate-600 disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={handleAdd}
+          disabled={createMutation.isPending || !newItem.trim()}
+          className="inline-flex items-center gap-1 rounded-lg border border-win-border bg-win-glow px-2.5 py-1.5 text-xs font-medium text-win hover:bg-win/20 disabled:opacity-50"
+        >
+          <Plus className="h-3 w-3" />
+          Add
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export default function StrategiesPage() {
   const strategiesQuery = useStrategies();
@@ -436,6 +541,13 @@ export default function StrategiesPage() {
                       One rule per line.
                     </span>
                   </label>
+
+                  {/* Needs a persisted id to scope items to, so this waits
+                      for the strategy to exist -- an unsaved draft has
+                      nowhere for a checklist item to point. */}
+                  {!isCreating && selected && (
+                    <StrategyChecklist strategyId={selected.id} />
+                  )}
                 </div>
 
                 {formError && (
@@ -536,6 +648,14 @@ export default function StrategiesPage() {
           <p>
             Nothing references this strategy, so deleting it changes no trade
             and no statistic.
+            {(confirmingDelete?.usage?.checklist_items ?? 0) > 0 && (
+              <>
+                {' '}
+                Its {confirmingDelete?.usage?.checklist_items} checklist item
+                {confirmingDelete?.usage?.checklist_items === 1 ? '' : 's'} will
+                be deleted along with it.
+              </>
+            )}
           </p>
         ) : (
           <>
@@ -564,6 +684,22 @@ export default function StrategiesPage() {
               )}{' '}
               currently use this strategy. They will be reassigned, not deleted.
             </p>
+
+            {/* Unlike trades/positions/plans above, checklist items have
+                nowhere sensible to be reassigned TO -- a rule like "waited
+                for the gap fill" describes this setup specifically. They are
+                deleted, not moved, which is why this is its own sentence
+                rather than folded into the reassignment note above. */}
+            {(confirmingDelete?.usage?.checklist_items ?? 0) > 0 && (
+              <p>
+                Its{' '}
+                <span className="text-slate-100">
+                  {confirmingDelete?.usage?.checklist_items} checklist item
+                  {confirmingDelete?.usage?.checklist_items === 1 ? '' : 's'}
+                </span>{' '}
+                will be deleted, not reassigned.
+              </p>
+            )}
 
             <label className="block pt-1">
               <span className="text-[10px] uppercase tracking-wider text-obsidian-muted">

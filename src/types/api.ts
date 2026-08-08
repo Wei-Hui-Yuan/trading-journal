@@ -40,6 +40,13 @@ export interface StrategyUsage {
   trades: number;
   positions: number;
   plans: number;
+  /**
+   * Checklist rules scoped to this strategy (migration 032). NOT part of
+   * what forces a reassignment target on delete — these cascade away with
+   * the strategy automatically, so a never-traded strategy whose checklist
+   * is already written can still be deleted outright.
+   */
+  checklist_items: number;
 }
 
 /**
@@ -90,11 +97,19 @@ export interface StrategyUpdatePayload {
 export interface Discipline {
   id: string; // UUID
   name: string;
+  /**
+   * Null is a general rule, checked on every reviewed trade. Set, it scopes
+   * the rule to one playbook entry (migration 032) — only relevant on a
+   * trade tagged with that same strategy.
+   */
+  strategy_id: string | null;
   created_at: string | null;
 }
 
 export interface DisciplineCreatePayload {
   name: string;
+  /** Omitted or null creates a general rule. */
+  strategy_id?: string | null;
 }
 
 /**
