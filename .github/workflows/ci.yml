@@ -1,0 +1,170 @@
+# Continuous integration: run everything that can fail, on every change.
+#
+# The repository already had 678 API tests, a strict TypeScript config and a
+# production build -- and nothing that ran any of them unless someone
+# remembered to. For a project intended to run for years, with changes arriving
+# in occasional evening sessions months apart, "remembered to" is not a
+# strategy. This is the thing that remembers.
+#
+# Two jobs, run in parallel because they share nothing.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a run be triggered by hand from the Actions tab -- useful for
+  # confirming the build still works after a long gap, when nothing has changed
+  # in the repo but a great deal has changed in the world outside it.
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+# Cancel it rather than paying for it. Never cancels on main, where each commit
+# is a distinct release and its result is worth keeping.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: API (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+
+    # A real Postgres, not a mock. This project's own migrations, its
+    # matching-engine advisory locks, and the ~30 tests marked `requires_db`
+    # (EXISTS correlation, transaction/savepoint semantics) all specifically
+    # test behaviour a stub session cannot stand in for -- which is exactly
+    # why they used to be skipped in CI and only ever run against production
+    # by hand. That gap is what this service closes.
+    #
+    # Version 17, matching Supabase's production Postgres
+    # (supabase/.temp/postgres-version). A migration that behaves differently
+    # across major versions is a migration worth knowing about before it runs
+    # against the real database, not after.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: trading_journal_ci
+        ports:
+          - 5432:5432
+        # Waits for Postgres to actually accept connections before any step
+        # below runs. Without this the first migration can race the
+        # container's startup and fail on a connection refused that has
+        # nothing to do with the code being tested.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # No pooler in CI -- this connects straight to the service container, so
+      # there is no PgBouncer transaction-mode restriction to work around
+      # (contrast api/README.md's port 5432 vs 6543 note, which is a
+      # Supabase-specific concern that does not apply here).
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/trading_journal_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to match api/Dockerfile's python:3.12-slim. CI testing a
+          # different interpreter than production runs is a test of the wrong
+          # thing; when the Dockerfile moves, this moves with it.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: api/requirements-dev.txt
+
+      # --no-deps is the point of this step, not a speed optimisation.
+      #
+      # It forbids pip from resolving anything, so the install succeeds only if
+      # requirements.txt already names every package in the tree. A normal
+      # install would paper over an incomplete lock by silently fetching the
+      # newest release of whatever was missing -- which is exactly how the
+      # undeclared tzdata dependency survived unnoticed until a clean install
+      # was attempted. This job fails loudly instead.
+      #
+      # It also runs on Linux, which is the only place the uvloop pin can be
+      # checked at all: uvloop does not install on Windows, so a developer
+      # machine can never prove that line is right.
+      - name: Install locked dependencies (no resolution permitted)
+        run: pip install --no-deps -r requirements-dev.txt
+
+      # Catches the reverse failure: a pin that IS present but conflicts with
+      # what another pinned package declares it needs.
+      - name: Verify the dependency tree is internally consistent
+        run: pip check
+
+      # Builds the schema this run's tests execute against, from nothing but
+      # the migration files -- the same files a fresh deploy or a rebuilt
+      # database would apply. This is real coverage, not a formality: it is
+      # what caught migration 000's absence in the first place, when the
+      # service container's brand-new database hit migration 001 and failed
+      # on `relation "trades" does not exist`.
+      #
+      # DATABASE_URL is set at the job level above; migrate.py reads it the
+      # same way it does anywhere else. No --baseline here -- this database
+      # has no history to adopt, so every migration genuinely runs.
+      - name: Apply migrations
+        run: python migrate.py
+
+      # DATABASE_URL is set, so the ~30 tests requiring real Postgres
+      # semantics (see the `requires_db` marker in tests/conftest.py) now run
+      # here instead of skipping, alongside everything that only ever needed
+      # a stub session.
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  web:
+    name: Web (typecheck + build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Comfortably above Next 14.2's floor of >=18.17, and an LTS line, so
+          # this does not need revisiting on a whim. Note there is no .nvmrc or
+          # `engines` field in the repo: local development and Vercel each pick
+          # their own version independently. Adding one is worth doing, but it
+          # would change the version Vercel builds with, so it is left as a
+          # deliberate decision rather than smuggled in here.
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` rather than `npm install`: it installs exactly what
+      # package-lock.json says and fails if the lock and package.json disagree,
+      # which is the same reproducibility guarantee the Python side now has.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Clerk's provider wraps every statically prerendered page, so the build
+      # needs a publishable key present and well-formed. These are throwaway
+      # values with no account behind them -- structurally valid so the SDK can
+      # parse them, worthless if leaked. The real keys live in Vercel and are
+      # deliberately NOT wired in here: this job proves the app compiles, and
+      # giving CI production credentials to prove that would be a poor trade.
+      #
+      # The publishable key decodes to "example.clerk.accounts.dev$", which is
+      # the format Clerk expects rather than an account anyone controls.
+      - name: Build
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_ZXhhbXBsZS5jbGVyay5hY2NvdW50cy5kZXYk
+          CLERK_SECRET_KEY: sk_test_ci_placeholder_not_a_real_secret
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+        run: npm run build

@@ -1,0 +1,24 @@
+# Development and test dependencies.
+#
+# Installs everything the app needs at runtime, plus the test suite's own tree.
+# Split out from requirements.txt so the production image does not ship pytest:
+# the Dockerfile installs requirements.txt only, and a test runner in a
+# container that serves traffic is dead weight at best.
+#
+#     pip install -r requirements-dev.txt
+#     python -m pytest tests/
+#
+# Pinned on the same terms as the runtime lock -- see the header there for why,
+# and for the upgrade procedure.
+
+-r requirements.txt
+
+pytest==9.1.1
+
+# --- transitive, via pytest ---
+iniconfig==2.3.0
+pluggy==1.6.0
+pygments==2.20.0
+
+# packaging is already pinned in requirements.txt (via gunicorn); pytest needs
+# it too and the versions agree, so it is not repeated here.

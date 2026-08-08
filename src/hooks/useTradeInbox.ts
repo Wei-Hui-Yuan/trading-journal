@@ -1,7 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 
 import {
   annotateTrade,
@@ -85,12 +90,46 @@ import type {
 } from '@/types/api';
 
 /**
+ * How many CLOSED round trips one page carries.
+ *
+ * Large enough that the common case — opening the journal and scanning recent
+ * trades — is one request and no "load more", and small enough that the page
+ * stays cheap once the ledger has years in it. Open exposure is not counted
+ * against it; that always arrives whole on the first page.
+ */
+export const ROUND_TRIP_PAGE_SIZE = 50;
+
+/** What the journal is currently narrowed to. Sent to the server, not applied
+ * here — see useRoundTrips. */
+export interface RoundTripFilters {
+  /** Undefined means both halves. */
+  kind?: 'open' | 'closed';
+  /** A strategy id, 'unassigned', or undefined for any. */
+  strategy?: string;
+  /** Substring match on the symbol. Empty means no search. */
+  search: string;
+}
+
+/**
  * Query keys, centralized so a hook and its invalidator can never drift apart.
  */
 export const queryKeys = {
   pendingPositions: ['positions', 'pending'] as const,
   trades: ['trades'] as const,
+  // Prefix. Every filter combination is its own cache entry beneath it, so the
+  // dozen or so mutations that invalidate this one key keep refreshing all of
+  // them — which they must, since a review written on one filter changes what
+  // the others show.
   roundTrips: ['roundTrips'] as const,
+  roundTripsFor: (filters: RoundTripFilters) =>
+    [
+      'roundTrips',
+      filters.kind ?? 'all',
+      filters.strategy ?? 'all',
+      // Normalised, so `aapl` and `AAPL ` do not open two entries holding the
+      // same rows — the server upper-cases and trims before matching.
+      filters.search.trim().toUpperCase(),
+    ] as const,
   positionFills: (id: string) => ['positions', id, 'fills'] as const,
   strategies: ['strategies'] as const,
   disciplines: ['disciplines'] as const,
@@ -158,12 +197,73 @@ export function useTrades() {
   });
 }
 
-/** The journal: one row per trade idea, open or closed. */
-export function useRoundTrips() {
-  return useQuery<RoundTrip[]>({
-    queryKey: queryKeys.roundTrips,
-    queryFn: () => getRoundTrips(),
+/**
+ * The journal: one row per trade idea, open or closed.
+ *
+ * Paged, and filtered by the SERVER. Both matter and for the same reason: the
+ * ledger is meant to accumulate for years, and a filter applied to the rows
+ * already fetched narrows a page rather than the journal. A search for a
+ * symbol has to be able to find it wherever it sits in the history, not only
+ * where it happens to have been loaded.
+ *
+ * Open exposure arrives on the first page only, so `flat` below can simply
+ * concatenate. Paging applies to closed round trips.
+ */
+export function useRoundTrips(filters: RoundTripFilters) {
+  const query = useInfiniteQuery({
+    queryKey: queryKeys.roundTripsFor(filters),
+    queryFn: ({ pageParam }) =>
+      getRoundTrips({
+        kind: filters.kind,
+        strategy: filters.strategy,
+        search: filters.search.trim() || undefined,
+        limit: ROUND_TRIP_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, _all, lastOffset) => {
+      // Counted over CLOSED rows only. The first page also carries open
+      // exposure, so measuring the whole page against the size would read a
+      // full page as partial whenever anything is open, and stop paging one
+      // page early — hiding closed history behind a button that had already
+      // decided there was no more.
+      const closed = lastPage.filter((rt) => rt.kind === 'closed').length;
+      return closed < ROUND_TRIP_PAGE_SIZE
+        ? undefined
+        : lastOffset + ROUND_TRIP_PAGE_SIZE;
+    },
   });
+
+  return {
+    ...query,
+    /** Every page so far, in order, as one list. */
+    flat: useMemo(
+      () => (query.data?.pages ?? []).flat(),
+      [query.data]
+    ),
+  };
+}
+
+/**
+ * How many positions are currently open, independent of what the journal is
+ * filtered to.
+ *
+ * Its own request rather than a count over the loaded rows, because those are
+ * now server-filtered: under the CLOSED filter no open row comes back at all,
+ * and counting them would report zero open positions while several were live.
+ * The badge has to mean "how many are open", not "how many are open and also
+ * match what you are looking at".
+ *
+ * Cheap to ask for. Open exposure is bounded by how many tickers can be held
+ * at once, never returns more than a handful of rows, and shares the journal's
+ * cache prefix so every mutation already refreshes it.
+ */
+export function useOpenRoundTripCount() {
+  const { data } = useQuery<RoundTrip[]>({
+    queryKey: [...queryKeys.roundTrips, 'openCount'] as const,
+    queryFn: () => getRoundTrips({ kind: 'open' }),
+  });
+  return data?.length ?? 0;
 }
 
 /** Attach a strategy, thesis or plan to a round trip's opening execution. */

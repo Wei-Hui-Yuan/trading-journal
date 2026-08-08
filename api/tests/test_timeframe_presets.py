@@ -228,9 +228,31 @@ def test_listing_does_not_swallow_other_database_errors():
 # ---------------------------------------------------------------------------
 
 
+# The endpoint takes `request` and `response` so it can answer a conditional
+# request with a 304 and tag the 200 it does send. Neither is reached on the
+# paths below -- the window is resolved first, and an invalid one raises before
+# anything is read or written -- but the signature still has to be satisfied.
+@dataclass
+class _NoConditionalHeaders:
+    """A request offering no If-None-Match, so nothing can match it."""
+
+    headers: dict = field(default_factory=dict)
+
+
+@dataclass
+class _CollectsHeaders:
+    """Stands in for the Response FastAPI injects, whose headers the handler
+    sets the ETag on."""
+
+    headers: dict = field(default_factory=dict)
+
+
 def test_the_dashboard_refuses_an_unknown_preset_with_a_422():
     with pytest.raises(main.HTTPException) as caught:
-        run(main.analytics_dashboard(preset="3Y", session=_Session()))
+        run(main.analytics_dashboard(
+            _NoConditionalHeaders(), _CollectsHeaders(),
+            preset="3Y", session=_Session(),
+        ))
     assert caught.value.status_code == 422
     assert "YTD" in caught.value.detail
 
@@ -239,7 +261,21 @@ def test_the_dashboard_refuses_a_backwards_range_with_a_422():
     """Rather than answering with an empty payload the user has to diagnose."""
     with pytest.raises(main.HTTPException) as caught:
         run(main.analytics_dashboard(
-            start_date=date(2026, 5, 1), end_date=date(2026, 1, 1), session=_Session()
+            _NoConditionalHeaders(), _CollectsHeaders(),
+            start_date=date(2026, 5, 1), end_date=date(2026, 1, 1),
+            session=_Session(),
         ))
     assert caught.value.status_code == 422
     assert "after end_date" in caught.value.detail
+
+
+def test_validation_happens_before_the_cache_is_consulted():
+    """A 422 must not depend on the database being reachable. `_Session` here
+    raises on any query, so if the version lookup moved above resolve_window
+    this would surface as that error instead of the 422 the caller needs."""
+    with pytest.raises(main.HTTPException) as caught:
+        run(main.analytics_dashboard(
+            _NoConditionalHeaders(), _CollectsHeaders(),
+            preset="NOPE", session=_Session(),
+        ))
+    assert caught.value.status_code == 422

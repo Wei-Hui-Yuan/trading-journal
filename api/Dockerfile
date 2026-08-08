@@ -9,8 +9,19 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --user -r requirements.txt \
-    && pip install --no-cache-dir --user gunicorn
+# requirements.txt only -- NOT requirements-dev.txt. The test suite and its tree
+# stay out of the image that serves traffic.
+#
+# gunicorn used to be a second, unpinned `pip install` on the end of this line,
+# which left the process manager supervising everything else as the one
+# dependency no lockfile described. It is a normal pinned entry now.
+#
+# --no-deps enforces the lock: every transitive dependency is already named and
+# pinned in requirements.txt, so pip has nothing left to resolve. Without it a
+# pin that is quietly incomplete still builds, by silently fetching the newest
+# release of whatever is missing -- which is the failure this file exists to
+# prevent. If the build breaks here, the lock is wrong; fix the lock.
+RUN pip install --no-cache-dir --user --no-deps -r requirements.txt
 
 # ---- Stage 2: runner ----
 FROM python:3.12-slim AS runner

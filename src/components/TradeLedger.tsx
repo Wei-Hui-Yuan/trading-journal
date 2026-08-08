@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownRight,
@@ -24,12 +24,14 @@ import {
   useAttachPlan,
   useDeleteTrade,
   useDetachPlan,
+  useOpenRoundTripCount,
   usePlans,
   useReviewPosition,
   useRoundTrips,
   useStrategies,
   useUpdateExecution,
 } from '@/hooks/useTradeInbox';
+import type { RoundTripFilters } from '@/hooks/useTradeInbox';
 import type {
   PositionFill,
   RoundTrip,
@@ -695,7 +697,41 @@ const AttachPlanPanel: React.FC<{
  * honestly.
  */
 export const TradeLedger: React.FC = () => {
-  const { data: roundTrips, isLoading, error } = useRoundTrips();
+  const [filter, setFilter] = useState<Filter>('all');
+  const [query, setQuery] = useState('');
+  const [selectedStrategy, setSelectedStrategy] = useState<string>('all');
+
+  // The search box drives a request now, so the value that reaches the server
+  // trails the one being typed. Without this every keystroke is a query, and
+  // "AAPL" costs four of them -- three for prefixes nobody wanted to see.
+  const [searchTerm, setSearchTerm] = useState('');
+  useEffect(() => {
+    const timer = setTimeout(() => setSearchTerm(query), 250);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // Sent to the server rather than applied to what came back. Narrowing the
+  // fetched rows would narrow the PAGE, not the journal: a search would match
+  // on the loaded page and miss identical rows on the next one.
+  const filters = useMemo<RoundTripFilters>(
+    () => ({
+      kind: filter === 'all' ? undefined : filter,
+      strategy: selectedStrategy === 'all' ? undefined : selectedStrategy,
+      search: searchTerm,
+    }),
+    [filter, selectedStrategy, searchTerm]
+  );
+
+  const {
+    flat: visible,
+    isLoading,
+    error,
+    hasNextPage,
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useRoundTrips(filters);
+  // Independent of the filter above — see the hook.
+  const openCount = useOpenRoundTripCount();
   const { data: strategies } = useStrategies();
   const annotate = useAnnotateTrade();
   const review = useReviewPosition();
@@ -720,9 +756,6 @@ export const TradeLedger: React.FC = () => {
   // round trip every time a row opens rather than one shared list.
   const { data: openPlans } = usePlans('OPEN');
   const [planError, setPlanError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>('all');
-  const [query, setQuery] = useState('');
-  const [selectedStrategy, setSelectedStrategy] = useState<string>('all');
   // Which fill is being corrected, and the in-progress values. Kept as strings
   // for the same reason the manual form does: a controlled number input has to
   // represent "empty" and mid-typing states that Number() would mangle.
@@ -732,27 +765,6 @@ export const TradeLedger: React.FC = () => {
   const [addingFor, setAddingFor] = useState<string | null>(null);
   const [planDrafts, setPlanDrafts] = useState<Record<string, PlanDraft>>({});
   const [reviewDrafts, setReviewDrafts] = useState<Record<string, ReviewDraft>>({});
-
-  const visible = useMemo(() => {
-    const term = query.trim().toUpperCase();
-    return (roundTrips ?? []).filter((rt) => {
-      if (filter === 'open' && rt.kind !== 'open') return false;
-      if (filter === 'closed' && rt.kind !== 'closed') return false;
-      if (selectedStrategy === 'unassigned' && rt.strategy_id !== null) return false;
-      if (
-        selectedStrategy !== 'all' &&
-        selectedStrategy !== 'unassigned' &&
-        rt.strategy_id !== selectedStrategy
-      )
-        return false;
-      return !term || rt.symbol.includes(term);
-    });
-  }, [roundTrips, filter, query, selectedStrategy]);
-
-  const openCount = useMemo(
-    () => (roundTrips ?? []).filter((rt) => rt.kind === 'open').length,
-    [roundTrips]
-  );
 
   // Id -> name, so each row is an O(1) lookup instead of a scan.
   const strategyNameById = useMemo(
@@ -1498,6 +1510,22 @@ export const TradeLedger: React.FC = () => {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Only closed round trips page, so this appears once the server has
+          more history than has been asked for. Open exposure is never behind
+          it — that always arrives complete on the first page. */}
+      {hasNextPage && (
+        <div className="flex justify-center pt-4">
+          <button
+            type="button"
+            onClick={() => fetchNextPage()}
+            disabled={isFetchingNextPage}
+            className="border border-obsidian-line px-4 py-2 text-[11px] uppercase tracking-wider text-obsidian-muted transition-colors hover:text-slate-200 disabled:opacity-50"
+          >
+            {isFetchingNextPage ? 'Loading…' : 'Load older trades'}
+          </button>
         </div>
       )}
 

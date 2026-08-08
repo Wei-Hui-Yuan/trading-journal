@@ -250,16 +250,50 @@ export async function getTrades(ticker?: string): Promise<Trade[]> {
   return data;
 }
 
+/** What the journal can ask the server to narrow by, and how much to send. */
+export interface RoundTripQuery {
+  /** Exact symbol match. */
+  ticker?: string;
+  /** Substring match on the symbol — what the search box sends. */
+  search?: string;
+  /** One half of the journal, or both when omitted. */
+  kind?: 'open' | 'closed';
+  /** A strategy id, or 'unassigned' for round trips carrying none. */
+  strategy?: string;
+  /** Page size, applied to CLOSED round trips only. */
+  limit?: number;
+  offset?: number;
+}
+
 /**
  * GET /api/round-trips — the journal, one row per trade idea.
  *
  * Prefer this over getTrades() for anything user-facing: /trades returns raw
  * executions, so a scale-in reads as several unrelated rows.
+ *
+ * Filtering happens SERVER-SIDE. Doing it here would only ever narrow the rows
+ * already fetched, which is correct while the whole ledger is in memory and
+ * quietly wrong the moment it is paged — a search would find matches on the
+ * current page and miss identical ones on the next.
+ *
+ * `limit`/`offset` page the closed half only; open exposure always arrives
+ * whole, because it is the half that needs decisions.
  */
-export async function getRoundTrips(ticker?: string): Promise<RoundTrip[]> {
-  const { data } = await apiClient.get<RoundTrip[]>('/round-trips', {
-    params: ticker ? { ticker } : undefined,
-  });
+export async function getRoundTrips(
+  query: RoundTripQuery = {}
+): Promise<RoundTrip[]> {
+  // Empty strings are omitted rather than sent: `?search=` would otherwise
+  // reach the API as a filter for the empty string and occupy its own cache
+  // entry, distinct from the unfiltered one that returns the same rows.
+  const params: Record<string, string | number> = {};
+  if (query.ticker) params.ticker = query.ticker;
+  if (query.search) params.search = query.search;
+  if (query.kind) params.kind = query.kind;
+  if (query.strategy) params.strategy = query.strategy;
+  if (query.limit !== undefined) params.limit = query.limit;
+  if (query.offset) params.offset = query.offset;
+
+  const { data } = await apiClient.get<RoundTrip[]>('/round-trips', { params });
   return data;
 }
 
