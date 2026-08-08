@@ -1120,6 +1120,7 @@ export interface AdvancedMetrics {
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
   discipline_breakdown: DisciplineBreakdown[];
+  compliance_buckets: ComplianceBucket[];
   strategy_breakdown: StrategyBreakdown[];
 }
 
@@ -1171,6 +1172,20 @@ export interface DisciplineBreakdown {
   edge_win_rate_pct: number | null;
   edge_r: number | null;
   sample: number;
+}
+
+/**
+ * Win rate and average R for one range of "how much of the answered
+ * playbook did this trade follow" — the coarser question
+ * `DisciplineBreakdown` can't answer, since that scores one rule at a time.
+ *
+ * `compliance` is one of a FIXED set of ranges ('100%', '80-99%', '50-79%',
+ * '<50%'), always present in that order even when empty — matching
+ * `r_distribution`'s own precedent of a complete shape a chart can render
+ * without special-casing an empty bucket.
+ */
+export interface ComplianceBucket extends DisciplineSideStats {
+  compliance: string;
 }
 
 // ---------------------------------------------------------------------------

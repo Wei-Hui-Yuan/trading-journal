@@ -39,6 +39,7 @@ import type {
   TradePlan,
   TradeSide,
 } from '@/types/api';
+import { computeDisciplineScore } from '@/lib/discipline';
 import { RepairFillModal } from './RepairFillModal';
 import { PlanChartView } from './PlanChart';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -925,6 +926,9 @@ export const TradeLedger: React.FC = () => {
             // they were passed through.
             const plan = isExpanded ? planOf(rt) : null;
             const rev = isExpanded ? reviewOf(rt) : null;
+            const disciplineScore = isExpanded
+              ? computeDisciplineScore(rt.disciplines)
+              : null;
 
             return (
               <div key={rt.key} className="rounded-xl border border-obsidian-border bg-obsidian-card">
@@ -1487,8 +1491,19 @@ export const TradeLedger: React.FC = () => {
                         </div>
 
                         <div className="mt-3 flex items-center justify-between">
-                          <span className="text-[10px] text-obsidian-muted">
+                          <span className="flex items-center gap-2 text-[10px] text-obsidian-muted">
                             {rt.review_status === 'reviewed' ? 'Reviewed' : 'Awaiting review'}
+                            {/* Null (never checked against any rule) shows
+                                nothing rather than a misleading 0% — see
+                                computeDisciplineScore. */}
+                            {disciplineScore !== null && (
+                              <span
+                                className="font-mono text-slate-300"
+                                title={`${rt.disciplines.filter((d) => d.followed).length} of ${rt.disciplines.length} answered rules followed`}
+                              >
+                                · {disciplineScore}% compliant
+                              </span>
+                            )}
                           </span>
                           <button
                             type="button"

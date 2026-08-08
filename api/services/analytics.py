@@ -1111,6 +1111,92 @@ def _side_stats(pnls: list[float], r_multiples: list[float]) -> dict[str, Any]:
     }
 
 
+def compute_discipline_score(disciplines: dict[str, bool]) -> Optional[float]:
+    """One trade's compliance, as a percentage of the rules it was ANSWERED
+    against -- never of however many rules exist today.
+
+    That distinction matters twice over. A rule added last month has no
+    opinion about a trade from a year ago, so scoring against today's rule
+    count would silently fail every historical trade on rules it never saw.
+    And None, not 0, when nothing was answered at all: an unreviewed trade
+    has no compliance to report, and reading it as 0% would count a review
+    backlog as total indiscipline -- the exact trap PositionDiscipline's own
+    docstring warns against for the single-rule case.
+    """
+    if not disciplines:
+        return None
+    followed = sum(1 for value in disciplines.values() if value)
+    return round(followed / len(disciplines) * 100, 2)
+
+
+# Fixed percentage ranges, not derived from the current rule count. The
+# number of disciplines in play changes over time -- adding or retiring a
+# rule must not reshuffle every historical trade into different buckets, and
+# a fixed scale is also the only one two trades scored against a different
+# NUMBER of rules can be compared on at all.
+#
+# 100% is kept as its own bucket rather than folded into "80-99%" because it
+# is the one figure a trader actually asks about: "what do I shoot when I do
+# everything right".
+COMPLIANCE_BUCKET_ORDER: tuple[str, ...] = ("100%", "80-99%", "50-79%", "<50%")
+
+
+def _compliance_bucket(score: float) -> str:
+    if score >= 100:
+        return "100%"
+    if score >= 80:
+        return "80-99%"
+    if score >= 50:
+        return "50-79%"
+    return "<50%"
+
+
+def compute_compliance_buckets(
+    trades: list[ReviewedTrade],
+    r_by_id: dict[str, float],
+) -> list[dict[str, Any]]:
+    """Win rate and average R, grouped by how much of the answered playbook a
+    trade actually followed.
+
+    `compute_discipline_breakdown` answers "is this ONE rule worth following";
+    this answers the coarser question the same data can support -- does
+    following your rules AS A WHOLE correlate with the outcome, regardless of
+    which particular rules they were.
+
+    A trade never checked against any rule contributes to no bucket, for the
+    same reason `compute_discipline_score` returns None for it: an unreviewed
+    trade is missing data, not a trade that broke every rule.
+
+    All four buckets are always returned, in a fixed order, even ones with no
+    trades in them -- matching `_r_distribution`'s own precedent of a complete
+    shape a chart can render without special-casing absence. `_side_stats`
+    already answers "0 trades" with nulls rather than a division by zero.
+    """
+    grouped: dict[str, dict[str, list]] = {
+        label: {"pnl": [], "r": []} for label in COMPLIANCE_BUCKET_ORDER
+    }
+
+    for trade in trades:
+        if trade.realized_pnl is None:
+            continue
+        score = compute_discipline_score(trade.disciplines)
+        if score is None:
+            continue
+        bucket = grouped[_compliance_bucket(score)]
+        bucket["pnl"].append(float(trade.realized_pnl))
+        r = r_by_id.get(trade.trade_id)
+        if r is not None:
+            bucket["r"].append(r)
+
+    return [
+        {
+            "compliance": label,
+            **_side_stats(grouped[label]["pnl"], grouped[label]["r"]),
+        }
+        for label in COMPLIANCE_BUCKET_ORDER
+    ]
+
+
 def compute_discipline_breakdown(
     trades: list[ReviewedTrade],
     r_by_id: dict[str, float],
@@ -1330,6 +1416,9 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
         "r_distribution": _r_distribution(r_multiples),
         "mistake_breakdown": mistake_breakdown,
         "discipline_breakdown": compute_discipline_breakdown(
+            trades, {t.trade_id: r for t, r in scored}
+        ),
+        "compliance_buckets": compute_compliance_buckets(
             trades, {t.trade_id: r for t, r in scored}
         ),
         "strategy_breakdown": compute_strategy_breakdown(
