@@ -38,6 +38,11 @@ import type {
   TimeframePresetPayload,
   TimeframeSelection,
 } from '@/types/api';
+import type {
+  SizingEntryPayload,
+  SizingEntryUpdatePayload,
+  SizingScratchpadEntry,
+} from '@/types/sizing';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -757,5 +762,67 @@ export async function runDataAudit(): Promise<AuditResult> {
   const { data } = await apiClient.post<AuditResult>('/audit', null, {
     timeout: 120_000,
   });
+  return data;
+}
+
+/**
+ * GET /api/sizing-scratchpad — everything noted in the last three days,
+ * newest first.
+ *
+ * The server deletes anything older as part of answering this request, so
+ * "the log clears itself" is literally true on every call rather than a
+ * filter over rows that are still sitting there.
+ */
+export async function getSizingScratchpad(): Promise<SizingScratchpadEntry[]> {
+  const { data } = await apiClient.get<SizingScratchpadEntry[]>(
+    '/sizing-scratchpad'
+  );
+  return data;
+}
+
+/** POST /api/sizing-scratchpad — note a possible trade, fast. */
+export async function createSizingEntry(
+  payload: SizingEntryPayload
+): Promise<SizingScratchpadEntry> {
+  const { data } = await apiClient.post<SizingScratchpadEntry>(
+    '/sizing-scratchpad',
+    payload
+  );
+  return data;
+}
+
+/**
+ * PATCH /api/sizing-scratchpad/{id} — adjust a note in place.
+ *
+ * Does not reset the note's three-day clock: `created_at` is untouched by
+ * the server regardless of what changes here.
+ */
+export async function updateSizingEntry(
+  id: string,
+  payload: SizingEntryUpdatePayload
+): Promise<SizingScratchpadEntry> {
+  const { data } = await apiClient.patch<SizingScratchpadEntry>(
+    `/sizing-scratchpad/${id}`,
+    payload
+  );
+  return data;
+}
+
+/** DELETE /api/sizing-scratchpad/{id} — discard a note. */
+export async function deleteSizingEntry(id: string): Promise<void> {
+  await apiClient.delete(`/sizing-scratchpad/${id}`);
+}
+
+/**
+ * POST /api/sizing-scratchpad/{id}/promote — turn a note into a real plan.
+ *
+ * One-way: the server deletes the note in the same transaction as creating
+ * the plan, so the scratchpad and the journal can never end up disagreeing
+ * about whether this trade was promoted.
+ */
+export async function promoteSizingEntry(id: string): Promise<TradePlan> {
+  const { data } = await apiClient.post<TradePlan>(
+    `/sizing-scratchpad/${id}/promote`
+  );
   return data;
 }
