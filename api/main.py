@@ -2015,6 +2015,35 @@ async def list_plans(
     return [_plan_out(p, attached.get(p.id, [])) for p in plans]
 
 
+async def _new_plan(session: AsyncSession, params: PlanCreate) -> PlannedTrade:
+    """Build, price and stage one plan -- flushed, not committed.
+
+    Shared by `create_plan` and `promote_sizing_entry`, which turns a sizing
+    scratchpad note into exactly this same kind of row. Flushing rather than
+    committing leaves the transaction boundary to the caller: promotion needs
+    the new plan and the deletion of the note it came from to succeed or fail
+    together, and a commit in here would make that impossible.
+    """
+    plan = PlannedTrade(
+        id=uuid.uuid4(),
+        ticker=params.ticker,
+        direction=params.direction,
+        quantity=to_decimal(params.quantity),
+        planned_entry=to_decimal(params.planned_entry),
+        stop_loss=to_decimal(params.stop_loss),
+        take_profit=to_decimal(params.take_profit),
+        risk_percent=to_decimal(params.risk_percent),
+        risk_amount=to_decimal(params.risk_amount),
+        strategy_id=params.strategy_id,
+        thesis=params.thesis,
+        status=PLAN_OPEN,
+    )
+    await _derive_plan_risk(session, plan)
+    session.add(plan)
+    await session.flush()
+    return plan
+
+
 @app.post(
     "/api/plans",
     response_model=PlanOut,
@@ -2034,22 +2063,7 @@ async def create_plan(
     entry, stop and target, so it cannot drift out of step with them.
     `risk_amount` and `risk_percent` are derived for the same reason.
     """
-    plan = PlannedTrade(
-        id=uuid.uuid4(),
-        ticker=params.ticker,
-        direction=params.direction,
-        quantity=to_decimal(params.quantity),
-        planned_entry=to_decimal(params.planned_entry),
-        stop_loss=to_decimal(params.stop_loss),
-        take_profit=to_decimal(params.take_profit),
-        risk_percent=to_decimal(params.risk_percent),
-        risk_amount=to_decimal(params.risk_amount),
-        strategy_id=params.strategy_id,
-        thesis=params.thesis,
-        status=PLAN_OPEN,
-    )
-    await _derive_plan_risk(session, plan)
-    session.add(plan)
+    plan = await _new_plan(session, params)
     await session.commit()
     # planned_r and the timestamps were produced by the database; re-read
     # rather than report what we sent, which did not include them.
@@ -2533,6 +2547,263 @@ async def detach_plan(
         trades_unlinked=unlinked,
         status=plan.status if plan else PLAN_OPEN,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sizing scratchpad
+# ---------------------------------------------------------------------------
+#
+# A holding pen for the four numbers that decide how many shares to buy --
+# entry, stop, take profit, quantity -- for the moment there is no time to
+# open the Plan modal and write a real plan (migration 031). Nothing here is
+# read by the matching engine or analytics; the only bridge to a real plan is
+# `promote_sizing_entry` below, and it is one-way.
+
+
+class SizingScratchpadEntry(Base):
+    __tablename__ = "sizing_scratchpad"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticker = Column(String(10), nullable=False)
+    direction = Column(String(5), nullable=False)
+    entry = Column(Numeric(10, 4), nullable=True)
+    stop_loss = Column(Numeric(10, 4), nullable=True)
+    take_profit = Column(Numeric(10, 4), nullable=True)
+    quantity = Column(Numeric(18, 8), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# How long a note survives before the read path below deletes it. Three days,
+# matching the request this table was built for: a note is a reminder of what
+# was decided moments ago, not a record worth keeping.
+SIZING_SCRATCHPAD_MAX_AGE = timedelta(days=3)
+
+
+def _valid_side(value: str) -> str:
+    side = value.strip().upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("direction must be 'BUY' or 'SELL'")
+    return side
+
+
+class SizingEntryCreate(BaseModel):
+    """One note. Only ticker and direction are required -- the rest may be
+    filled in over several quick edits as a price is watched, matching the
+    same "worth recording before it is complete" reasoning as PlanCreate."""
+
+    ticker: str = Field(..., min_length=1, max_length=10)
+    direction: str = Field(..., description="BUY or SELL")
+    entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    take_profit: Optional[float] = Field(None, gt=0)
+    quantity: Optional[float] = Field(None, gt=0)
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("direction")
+    @classmethod
+    def _check_direction(cls, value: str) -> str:
+        return _valid_side(value)
+
+
+class SizingEntryUpdate(BaseModel):
+    """Partial update -- only fields present in the request body change."""
+
+    ticker: Optional[str] = Field(None, min_length=1, max_length=10)
+    direction: Optional[str] = None
+    entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    take_profit: Optional[float] = Field(None, gt=0)
+    quantity: Optional[float] = Field(None, gt=0)
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() if value is not None else None
+
+    @field_validator("direction")
+    @classmethod
+    def _check_direction(cls, value: Optional[str]) -> Optional[str]:
+        return _valid_side(value) if value is not None else None
+
+
+class SizingEntryOut(BaseModel):
+    id: uuid.UUID
+    ticker: str
+    direction: str
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    quantity: Optional[float] = None
+    created_at: datetime
+
+
+def _sizing_entry_out(entry: SizingScratchpadEntry) -> SizingEntryOut:
+    return SizingEntryOut(
+        id=entry.id,
+        ticker=entry.ticker,
+        direction=entry.direction,
+        entry=_f(entry.entry),
+        stop_loss=_f(entry.stop_loss),
+        take_profit=_f(entry.take_profit),
+        quantity=_f(entry.quantity),
+        created_at=entry.created_at,
+    )
+
+
+@app.get(
+    "/api/sizing-scratchpad",
+    response_model=list[SizingEntryOut],
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def list_sizing_entries(session: AsyncSession = Depends(get_session)):
+    """Everything noted in the last three days, newest first.
+
+    Deletes anything older FIRST, in this same request, rather than filtering
+    it out of the SELECT. Storage was never the reason for the three-day
+    limit -- these rows are a handful of numbers each -- so a filter that left
+    the old rows sitting underneath would be the cosmetic version of "clears
+    itself". Deleting here is the literal version, and needs no external
+    scheduler: the tab clears on the next visit, always.
+    """
+    cutoff = datetime.now(timezone.utc) - SIZING_SCRATCHPAD_MAX_AGE
+    await session.execute(
+        delete(SizingScratchpadEntry).where(SizingScratchpadEntry.created_at < cutoff)
+    )
+    await session.commit()
+
+    # id breaks ties. Postgres's now() is transaction-scoped, so two notes
+    # created moments apart within the same transaction -- exactly what
+    # happens in this file's own tests, and can happen in production under
+    # a fast double-click -- get an IDENTICAL created_at, and created_at
+    # alone is then not a total order.
+    rows = (
+        await session.execute(
+            select(SizingScratchpadEntry).order_by(
+                SizingScratchpadEntry.created_at.desc(),
+                SizingScratchpadEntry.id.desc(),
+            )
+        )
+    ).scalars().all()
+    return [_sizing_entry_out(row) for row in rows]
+
+
+@app.post(
+    "/api/sizing-scratchpad",
+    response_model=SizingEntryOut,
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def create_sizing_entry(
+    params: SizingEntryCreate, session: AsyncSession = Depends(get_session)
+):
+    entry = SizingScratchpadEntry(
+        id=uuid.uuid4(),
+        ticker=params.ticker,
+        direction=params.direction,
+        entry=to_decimal(params.entry),
+        stop_loss=to_decimal(params.stop_loss),
+        take_profit=to_decimal(params.take_profit),
+        quantity=to_decimal(params.quantity),
+    )
+    session.add(entry)
+    await session.commit()
+    await session.refresh(entry)
+    return _sizing_entry_out(entry)
+
+
+@app.patch(
+    "/api/sizing-scratchpad/{entry_id}",
+    response_model=SizingEntryOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def update_sizing_entry(
+    entry_id: uuid.UUID,
+    params: SizingEntryUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Adjust a note in place.
+
+    `created_at` is never touched, so editing a value does not restart its
+    three-day clock -- a note is exactly as old as when it was first written
+    down, however many times its numbers change before then.
+    """
+    entry = await session.get(SizingScratchpadEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Scratchpad entry not found.")
+
+    updates = params.model_dump(exclude_unset=True)
+    for field in ("entry", "stop_loss", "take_profit", "quantity"):
+        if field in updates:
+            updates[field] = to_decimal(updates[field])
+    for key, value in updates.items():
+        setattr(entry, key, value)
+
+    await session.commit()
+    await session.refresh(entry)
+    return _sizing_entry_out(entry)
+
+
+@app.delete(
+    "/api/sizing-scratchpad/{entry_id}",
+    status_code=204,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def delete_sizing_entry(
+    entry_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    entry = await session.get(SizingScratchpadEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Scratchpad entry not found.")
+    await session.delete(entry)
+    await session.commit()
+
+
+@app.post(
+    "/api/sizing-scratchpad/{entry_id}/promote",
+    response_model=PlanOut,
+    status_code=201,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def promote_sizing_entry(
+    entry_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Turn a scratchpad note into a real plan the matching engine can attach
+    a fill to.
+
+    One-way, and one transaction: the note is deleted the moment the plan
+    exists, in the SAME commit as creating it. A failure partway through
+    leaves neither behind, rather than a plan and its scratch copy both
+    existing, or the note surviving a promotion that silently did not happen.
+    The scratchpad is scrap paper once it has done its job.
+
+    Strategy and thesis are not carried over -- the scratchpad never captured
+    them, by design (see the section header above). The promoted plan starts
+    without them, exactly like any plan entered without that detail; they can
+    be added afterwards like any other plan.
+    """
+    entry = await session.get(SizingScratchpadEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Scratchpad entry not found.")
+
+    plan = await _new_plan(
+        session,
+        PlanCreate(
+            ticker=entry.ticker,
+            direction=entry.direction,
+            quantity=_f(entry.quantity),
+            planned_entry=_f(entry.entry),
+            stop_loss=_f(entry.stop_loss),
+            take_profit=_f(entry.take_profit),
+        ),
+    )
+    await session.delete(entry)
+    await session.commit()
+    await session.refresh(plan)
+    return _plan_out(plan)
 
 
 # ---------------------------------------------------------------------------

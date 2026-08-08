@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
-import { Activity, BarChart3, BookOpen, BookText, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, Calculator, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
@@ -192,6 +192,18 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
           >
             <BookOpen className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Strategies</span>
+          </Link>
+
+          {/* Deliberately separate from "Plan Trade" below, not a variant of
+              it: this is scrap paper for the seconds before an order goes
+              in, and promoting a note is the only way anything here ever
+              becomes a real plan. */}
+          <Link
+            href="/sizing"
+            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
+          >
+            <Calculator className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Sizing</span>
           </Link>
 
           {/* Was "Manual Log", which wrote straight into `trades` and so could
