@@ -712,7 +712,7 @@ export const AllocationPanel: React.FC<{
                 g.rows.map((r) => (
                   <div
                     key={r.ticker}
-                    className="grid grid-cols-[52px_1fr_40px_92px] items-center gap-2 rounded px-1 py-1 pl-6 text-[11px] hover:bg-slate-700/15"
+                    className="grid grid-cols-[48px_1fr_125px_36px_85px] items-center gap-2 rounded px-1 py-1 pl-6 text-[11px] hover:bg-slate-700/15"
                   >
                     <span className="font-medium text-slate-300">{r.ticker}</span>
 
@@ -729,7 +729,18 @@ export const AllocationPanel: React.FC<{
                       </div>
                     )}
 
-                    <span className="text-right font-mono text-obsidian-muted">
+                    <span className="text-right font-mono text-[10px] tabular-nums">
+                      {r.status === 'no-target' ? (
+                        <span className="text-obsidian-muted">{money(r.deployed)} / —</span>
+                      ) : (
+                        <>
+                          <span className="text-slate-200">{money(r.deployed)}</span>
+                          <span className="text-obsidian-muted"> / {money(r.target as number)}</span>
+                        </>
+                      )}
+                    </span>
+
+                    <span className="text-right font-mono text-[10px] text-obsidian-muted tabular-nums">
                       {r.status === 'no-target' ? '—' : `${(r.fundedPct ?? 0).toFixed(0)}%`}
                     </span>
 
