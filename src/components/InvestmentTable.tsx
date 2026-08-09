@@ -12,6 +12,7 @@ import {
   Plus,
   Receipt,
   RefreshCw,
+  Target,
   TrendingUp,
   Wallet,
 } from 'lucide-react';
@@ -175,8 +176,20 @@ const PortfolioKpiHeader: React.FC<{ portfolio: Portfolio }> = ({ portfolio }) =
   const unpriced = holdings.filter((h) => h.quantity > 0 && h.market_value === null);
   const unpricedCostBasis = unpriced.reduce((sum, h) => sum + h.cost_basis, 0);
 
+  // Planned allocation metrics across the entire book
+  const totalPlannedAllocation = holdings.reduce(
+    (sum, h) => sum + (h.planned_allocation ?? 0),
+    0
+  );
+  const targetedCount = holdings.filter(
+    (h) => h.planned_allocation !== null && h.planned_allocation > 0
+  ).length;
+  const plannedPctOfCost =
+    total_cost_basis > 0 ? (totalPlannedAllocation / total_cost_basis) * 100 : null;
+  const planVariance = totalPlannedAllocation - total_cost_basis;
+
   return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       <div className={KPI_CARD}>
         <div className={KPI_LABEL}>
           <Wallet className="h-3.5 w-3.5 text-sky-400" />
@@ -204,6 +217,41 @@ const PortfolioKpiHeader: React.FC<{ portfolio: Portfolio }> = ({ portfolio }) =
         <div className={`${KPI_FIGURE} text-slate-100`}>{money(total_cost_basis)}</div>
         <div className={KPI_SUBTITLE}>
           {transactionCount} transaction{transactionCount === 1 ? '' : 's'}
+        </div>
+      </div>
+
+      <div className={KPI_CARD}>
+        <div className={KPI_LABEL}>
+          <Target className="h-3.5 w-3.5 text-amber-400" />
+          Planned allocation
+        </div>
+        <div className={`${KPI_FIGURE} text-slate-100`}>
+          {money(totalPlannedAllocation)}
+        </div>
+        <div className={KPI_SUBTITLE}>
+          {plannedPctOfCost === null ? (
+            'vs capital invested'
+          ) : (
+            <>{plannedPctOfCost.toFixed(1)}% of capital invested</>
+          )}
+        </div>
+        <div
+          className="mt-0.5 text-[10px] text-obsidian-muted"
+          title={`${targetedCount} of ${holdings.length} stocks have a target set. Variance: ${
+            planVariance >= 0 ? '+' : ''
+          }${money(planVariance)}`}
+        >
+          {targetedCount}/{holdings.length} targeted
+          {planVariance !== 0 && (
+            <span
+              className={
+                planVariance > 0 ? ' ml-1 text-amber-400' : ' ml-1 text-slate-400'
+              }
+            >
+              ({planVariance > 0 ? '+' : ''}
+              {money(planVariance)})
+            </span>
+          )}
         </div>
       </div>
 
