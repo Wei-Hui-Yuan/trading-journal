@@ -9,6 +9,30 @@ import type { Holding } from '@/types/investments';
 const money = (value: number) =>
   value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+/** Whole dollars. The deployed/target pair in the progress table is a
+ * progress read, not an accounting one, and two sets of cents is exactly what
+ * overruns its column once a target reaches six figures. The basis to the
+ * cent is one row away in the holdings table. */
+const wholeMoney = (value: number) =>
+  value.toLocaleString('en-US', { maximumFractionDigits: 0 });
+
+/**
+ * One row of the progress table: ticker, bar, deployed/target, funded %, and
+ * either the shortfall or the button that sets a target.
+ *
+ * The deployed/target column is dropped below `sm`, and the track list drops
+ * with it. 294px of fixed columns plus their gaps does not fit the ~267px a
+ * 375px viewport leaves once the page, the card and this row have each taken
+ * their padding, and the cell that would absorb the overrun is the `1fr`
+ * progress bar -- the only one here that is not a number readable somewhere
+ * else. `hidden` takes the span out of the grid entirely rather than merely
+ * blanking it, so the four children that remain land on the four tracks
+ * named first.
+ */
+const PROGRESS_ROW =
+  'grid grid-cols-[48px_1fr_36px_85px] items-center gap-2 rounded px-1 py-1 pl-6 ' +
+  'text-[11px] hover:bg-slate-700/15 sm:grid-cols-[48px_1fr_125px_36px_85px]';
+
 /** `$243`, `$1.1k` -- a treemap tile has room for one short number, not a
  * fully punctuated one. */
 const compactMoney = (value: number) => {
@@ -712,7 +736,7 @@ export const AllocationPanel: React.FC<{
                 g.rows.map((r) => (
                   <div
                     key={r.ticker}
-                    className="grid grid-cols-[48px_1fr_125px_36px_85px] items-center gap-2 rounded px-1 py-1 pl-6 text-[11px] hover:bg-slate-700/15"
+                    className={PROGRESS_ROW}
                   >
                     <span className="font-medium text-slate-300">{r.ticker}</span>
 
@@ -729,13 +753,16 @@ export const AllocationPanel: React.FC<{
                       </div>
                     )}
 
-                    <span className="text-right font-mono text-[10px] tabular-nums">
+                    <span className="hidden text-right font-mono text-[10px] tabular-nums sm:inline">
                       {r.status === 'no-target' ? (
-                        <span className="text-obsidian-muted">{money(r.deployed)} / —</span>
+                        <span className="text-obsidian-muted">{wholeMoney(r.deployed)} / —</span>
                       ) : (
                         <>
-                          <span className="text-slate-200">{money(r.deployed)}</span>
-                          <span className="text-obsidian-muted"> / {money(r.target as number)}</span>
+                          <span className="text-slate-200">{wholeMoney(r.deployed)}</span>
+                          <span className="text-obsidian-muted">
+                            {' '}
+                            / {wholeMoney(r.target as number)}
+                          </span>
                         </>
                       )}
                     </span>

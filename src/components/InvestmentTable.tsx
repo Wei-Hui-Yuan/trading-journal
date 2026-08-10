@@ -134,7 +134,10 @@ const KPI_SUBTITLE = 'mt-0.5 text-[10px] text-obsidian-muted';
 
 /**
  * The four numbers the table's footer row already sums, surfaced above it so
- * they don't require scrolling to the bottom of a fourteen-row table to find.
+ * they don't require scrolling to the bottom of a fourteen-row table to find,
+ * plus planned allocation -- which the footer does NOT sum, because a target
+ * is an intention rather than a position and belongs beside the book's
+ * totals rather than underneath its rows.
  *
  * Realized P&L and dividends are shown as two distinct figures rather than
  * summed into one -- a closed trade's gain and a dividend received are both
@@ -176,17 +179,36 @@ const PortfolioKpiHeader: React.FC<{ portfolio: Portfolio }> = ({ portfolio }) =
   const unpriced = holdings.filter((h) => h.quantity > 0 && h.market_value === null);
   const unpricedCostBasis = unpriced.reduce((sum, h) => sum + h.cost_basis, 0);
 
-  // Planned allocation metrics across the entire book
-  const totalPlannedAllocation = holdings.reduce(
+  // BOTH sides of every figure below are scoped to the holdings that actually
+  // carry a target, for the same reason unrealizedPct above is scoped to the
+  // priced ones. Dividing the targeted subset's planned total by the whole
+  // book's total_cost_basis would mix two populations and distort in both
+  // directions at once: a funded holding with no target lands in the
+  // denominator only, a watchlist entry or a closed position with a target
+  // (planned_allocation outlives the exit that zeroed its basis) lands in the
+  // numerator only. With no targets set at all that arithmetic reported the
+  // entire book as capital deployed past plan, which is the sign inverted on
+  // a comparison that was never valid to begin with.
+  //
+  // AllocationPanel's progress table deliberately scopes tighter still
+  // (cost_basis > 0), so its rows are a subset of what this card counts -- a
+  // target on something not yet bought is a real plan, but not yet progress.
+  const targeted = holdings.filter(
+    (h) => h.planned_allocation !== null && h.planned_allocation > 0
+  );
+  const totalPlannedAllocation = targeted.reduce(
     (sum, h) => sum + (h.planned_allocation ?? 0),
     0
   );
-  const targetedCount = holdings.filter(
-    (h) => h.planned_allocation !== null && h.planned_allocation > 0
-  ).length;
-  const plannedPctOfCost =
-    total_cost_basis > 0 ? (totalPlannedAllocation / total_cost_basis) * 100 : null;
-  const planVariance = totalPlannedAllocation - total_cost_basis;
+  const targetedCostBasis = targeted.reduce((sum, h) => sum + h.cost_basis, 0);
+  // The book-wide form of a row's fundedPct in AllocationPanel: deployed over
+  // target, not the inverse -- same figure, same direction, same wording.
+  const plannedFundedPct =
+    totalPlannedAllocation > 0 ? (targetedCostBasis / totalPlannedAllocation) * 100 : null;
+  // Positive is capital still to deploy, negative is capital already past
+  // plan. Rendered as a magnitude plus a word rather than a signed number,
+  // because which of the two a bare minus sign means is not self-evident.
+  const planVariance = totalPlannedAllocation - targetedCostBasis;
 
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
@@ -229,27 +251,20 @@ const PortfolioKpiHeader: React.FC<{ portfolio: Portfolio }> = ({ portfolio }) =
           {money(totalPlannedAllocation)}
         </div>
         <div className={KPI_SUBTITLE}>
-          {plannedPctOfCost === null ? (
-            'vs capital invested'
+          {plannedFundedPct === null ? (
+            'no targets set'
           ) : (
-            <>{plannedPctOfCost.toFixed(1)}% of capital invested</>
+            <>{plannedFundedPct.toFixed(1)}% funded</>
           )}
         </div>
         <div
           className="mt-0.5 text-[10px] text-obsidian-muted"
-          title={`${targetedCount} of ${holdings.length} stocks have a target set. Variance: ${
-            planVariance >= 0 ? '+' : ''
-          }${money(planVariance)}`}
+          title={`${targeted.length} of ${holdings.length} tracked tickers have a target set. Every figure on this card covers only those ${targeted.length} — a holding with no target is counted on neither side.`}
         >
-          {targetedCount}/{holdings.length} targeted
-          {planVariance !== 0 && (
-            <span
-              className={
-                planVariance > 0 ? ' ml-1 text-amber-400' : ' ml-1 text-slate-400'
-              }
-            >
-              ({planVariance > 0 ? '+' : ''}
-              {money(planVariance)})
+          {targeted.length}/{holdings.length} targeted
+          {Math.abs(planVariance) >= 0.005 && (
+            <span className={planVariance > 0 ? 'ml-1 text-amber-400' : 'ml-1 text-sky-400'}>
+              {money(Math.abs(planVariance))} {planVariance > 0 ? 'to deploy' : 'over plan'}
             </span>
           )}
         </div>
