@@ -450,6 +450,20 @@ EXEC_PREFIX_REPAIR = "REPAIR-"
 # working rather than a stale row.
 PLAN_ATTACH_MAX_AGE = timedelta(days=30)
 
+# How long AFTER a fill a plan may still be written and claim it. A plan is
+# supposed to precede its trade, and for a long time this was absolute -- but
+# it caught the ordinary case of clicking buy and then writing the setup up a
+# minute later (a real fill that trailed its plan by 61 seconds) and orphaned
+# the plan permanently, since auto-attach never retries.
+#
+# The bound this trades against is hindsight: a plan written once the trade has
+# resolved is a reconstruction presented as a prior commitment. Two hours does
+# not protect against that on its own -- a five-minute scalp resolves well
+# inside it -- which is why `_plan_can_claim` also refuses to reach past the
+# position's exit. The window covers logging lag; the exit is what covers
+# hindsight.
+PLAN_ATTACH_GRACE = timedelta(hours=2)
+
 
 class PlannedTrade(Base):
     """A trade you intend to take, before the broker knows anything about it.
@@ -1771,24 +1785,30 @@ def _plan_can_claim(
     ticker: str,
     direction: Optional[str],
     executed_at: datetime,
+    closed_at: Optional[datetime] = None,
 ) -> bool:
     """Whether an open plan is allowed to claim a fill that just arrived.
 
     Separated from the allocation loop because this rule, not the loop, is what
     decides whether an attachment is trustworthy.
 
-    A plan must predate the fill: one written after a trade executed cannot be
-    that trade's plan, whatever it says. And it must be recent -- without
-    PLAN_ATTACH_MAX_AGE, a setup written months ago and never cancelled would
-    silently claim the next fill on that ticker, and the mis-attribution would
-    look exactly like the feature working.
+    A plan may trail the fill by up to PLAN_ATTACH_GRACE -- logging lag, not
+    hindsight -- but never past the moment the position closed: `closed_at` is
+    the earliest opposing fill after `executed_at`, and once that exists the
+    outcome is on the screen, so anything written after it is a reconstruction
+    presented as a prior commitment. `closed_at` is None for a position still
+    open, which has no outcome yet to have seen. And it must be recent overall
+    -- without PLAN_ATTACH_MAX_AGE, a setup written months ago and never
+    cancelled would silently claim the next fill on that ticker, and the
+    mis-attribution would look exactly like the feature working.
     """
     return (
         plan.status == PLAN_OPEN
         and plan.ticker == ticker
         and (plan.direction or "").upper() == (direction or "").upper()
         and plan.created_at is not None
-        and plan.created_at <= executed_at
+        and plan.created_at <= executed_at + PLAN_ATTACH_GRACE
+        and (closed_at is None or plan.created_at <= closed_at)
         and executed_at - plan.created_at <= PLAN_ATTACH_MAX_AGE
     )
 
@@ -1849,10 +1869,11 @@ async def _auto_attach_plans(
     re-examining old fills would let a plan written today claim a trade from
     last month.
 
-    Two rules keep a stale plan from claiming a fill it has nothing to do with:
-    a plan must have been written BEFORE the fill executed -- a plan cannot
-    describe a trade that already happened -- and it must be no older than
-    PLAN_ATTACH_MAX_AGE, so a setup you wrote up and forgot stops competing.
+    Three rules keep a stale or hindsight-written plan from claiming a fill it
+    has nothing to do with: a plan may trail the fill by no more than
+    PLAN_ATTACH_GRACE, it may never be written after the position closed, and
+    it must be no older than PLAN_ATTACH_MAX_AGE, so a setup you wrote up and
+    forgot stops competing. See `_plan_can_claim` for the detail.
 
     When several plans qualify, the most recent wins, and each is used once.
     Getting that choice wrong mislabels a trade; it cannot duplicate one,
@@ -1892,6 +1913,24 @@ async def _auto_attach_plans(
     if not candidates:
         return 0
 
+    # The earliest opposing fill on each ticker, which is what bounds the grace
+    # window per group below. One query for every ticker rather than one query
+    # per group: both collections are small, and the join is cheaper in Python
+    # than a round trip each. Not restricted to `created_exec_ids` -- the fill
+    # that closes a position can be an OLDER row this sync did not touch, and
+    # missing it would let the grace window reach past a close that already
+    # happened.
+    tickers = {t for t, _, _ in groups}
+    earliest = min(fills[0].entry_date for fills in groups.values())
+    opposing = (
+        await session.execute(
+            select(Trade.ticker, Trade.direction, Trade.entry_date).where(
+                Trade.ticker.in_(tickers),
+                Trade.entry_date >= earliest,
+            )
+        )
+    ).all()
+
     # Allocated in Python rather than re-querying per group, so a plan claimed
     # by one group is not offered to the next before the flush lands.
     used: set[uuid.UUID] = set()
@@ -1901,12 +1940,25 @@ async def _auto_attach_plans(
         groups.items(), key=lambda kv: kv[1][0].entry_date
     ):
         executed_at = fills[0].entry_date
+        # The moment this position closed, if it has -- the earliest fill on
+        # the OPPOSING side after this one opened. None leaves it open, which
+        # is what lets a plan for a position still running claim it any time.
+        closed_at = min(
+            (
+                when
+                for tkr, dirn, when in opposing
+                if tkr == ticker
+                and (dirn or "").upper() != (direction or "").upper()
+                and when > executed_at
+            ),
+            default=None,
+        )
         match = next(
             (
                 plan
                 for plan in candidates
                 if plan.id not in used
-                and _plan_can_claim(plan, ticker, direction, executed_at)
+                and _plan_can_claim(plan, ticker, direction, executed_at, closed_at)
             ),
             None,
         )
@@ -2025,6 +2077,26 @@ class PlanUpdate(BaseModel):
         return status
 
 
+class PlanCandidate(BaseModel):
+    """An unplanned opening leg this plan could be attached to by hand.
+
+    Exists because a plan that auto-attach declined is indistinguishable, from
+    the dock, from one whose fill simply has not arrived -- and the two want
+    opposite actions from the user. One is a click; the other is patience.
+    """
+
+    # The fill to POST /api/trades/{trade_id}/attach-plan against. The earliest
+    # in the leg, matching the anchor `_opening_leg_fills` resolves to.
+    trade_id: uuid.UUID
+    entry_date: datetime
+    fill_count: int
+    quantity: float
+    avg_entry: float
+    # Signed minutes from the fill to the plan: positive means the fill came
+    # first. Sent as a number rather than a sentence so the UI owns the wording.
+    minutes_from_fill_to_plan: Optional[float] = None
+
+
 class PlanOut(BaseModel):
     id: uuid.UUID
     ticker: str
@@ -2058,12 +2130,16 @@ class PlanOut(BaseModel):
     # answered appear -- same absence-means-unanswered convention as
     # PositionOut.disciplines.
     disciplines: list[PositionDisciplineOut] = []
+    # Fills that match this plan but are not linked to it. Only ever populated
+    # for an OPEN plan; an attached or cancelled one has nothing to offer.
+    candidates: list[PlanCandidate] = []
 
 
 def _plan_out(
     plan: PlannedTrade,
     attached_ids: Sequence[uuid.UUID] = (),
     disciplines: Sequence[PositionDisciplineOut] = (),
+    candidates: Sequence[PlanCandidate] = (),
 ) -> PlanOut:
     """Serialise a plan, converting Decimal to float at the boundary."""
     def num(value) -> Optional[float]:
@@ -2090,6 +2166,7 @@ def _plan_out(
         chart_bytes=plan.chart_bytes,
         chart_uploaded_at=plan.chart_uploaded_at,
         disciplines=list(disciplines),
+        candidates=list(candidates),
     )
 
 
@@ -2107,6 +2184,121 @@ async def _attached_ids_by_plan(
     out: dict[uuid.UUID, list[uuid.UUID]] = {}
     for plan_id, trade_id in rows:
         out.setdefault(plan_id, []).append(trade_id)
+    return out
+
+
+# A plan row has no space to explain itself, so a handful of candidates is the
+# useful number and twenty is a different problem than this feature solves.
+PLAN_CANDIDATES_PER_PLAN = 5
+
+
+async def _candidates_by_plan(
+    session: AsyncSession, plans: Sequence[PlannedTrade]
+) -> dict[uuid.UUID, list[PlanCandidate]]:
+    """Unlinked fills each open plan could claim, keyed by plan id.
+
+    Exists for the plan auto-attach declines and then never revisits: a plan
+    written 61 seconds after its own fill is refused by `_plan_can_claim` and
+    orphaned forever, since auto-attach only ever looks at the fills one sync
+    just created. This is the escape hatch -- it does not change who may
+    auto-attach, it surfaces who is left so a human can attach by hand via the
+    existing POST /api/trades/{trade_id}/attach-plan.
+
+    One query for every plan, grouped by ticker/side/market day -- the same
+    boundary `_opening_leg_fills` uses, so the leg offered here is exactly the
+    leg an attach would cover, and the count shown cannot disagree with what
+    happens on the click. `_plan_can_claim`'s grace window and age bound are
+    deliberately NOT re-applied: a plan orphaned by them is exactly the case
+    this exists to rescue, and manual attach has never enforced either.
+    """
+    # created_at is server_default=func.now(), so None only ever happens on an
+    # unflushed in-memory object -- excluded here because it has no age to
+    # measure and could never legitimately reach this function anyway.
+    open_plans = [
+        p for p in plans if p.status == PLAN_OPEN and p.created_at is not None
+    ]
+    if not open_plans:
+        return {}
+
+    tickers = {p.ticker for p in open_plans}
+    earliest_plan = min(p.created_at for p in open_plans)
+
+    rows = (
+        await session.execute(
+            select(
+                Trade.id,
+                Trade.ticker,
+                Trade.direction,
+                Trade.entry_date,
+                Trade.quantity,
+                Trade.actual_entry,
+            ).where(
+                Trade.ticker.in_(tickers),
+                Trade.plan_id.is_(None),
+                # A fill from before the oldest candidate plan cannot be a
+                # match for ANY plan in this batch -- every plan's own
+                # PLAN_ATTACH_MAX_AGE bound is tighter than this, so this is
+                # purely a query-size guard, not a second copy of that rule.
+                Trade.entry_date >= earliest_plan - PLAN_ATTACH_MAX_AGE,
+            )
+        )
+    ).all()
+    if not rows:
+        return {}
+
+    # Same grouping _opening_leg_fills and _auto_attach_plans both use: one
+    # entry, however many executions the broker split it into.
+    groups: dict[tuple[str, str, object], list] = {}
+    for row in rows:
+        day = row.entry_date.astimezone(MARKET_TZ).date()
+        groups.setdefault((row.ticker, row.direction, day), []).append(row)
+
+    anchors: list[PlanCandidate] = []
+    anchor_ticker_direction: list[tuple[str, str]] = []
+    for (ticker, direction, _day), leg in groups.items():
+        leg.sort(key=lambda r: r.entry_date)
+        # Numeric columns arrive as Decimal already; no re-parse needed.
+        total_qty: Decimal = sum((r.quantity for r in leg), Decimal("0"))
+        if total_qty == 0:
+            continue
+        weighted: Decimal = sum(
+            (r.quantity * r.actual_entry for r in leg), Decimal("0")
+        )
+        anchors.append(
+            PlanCandidate(
+                trade_id=leg[0].id,
+                entry_date=leg[0].entry_date,
+                fill_count=len(leg),
+                quantity=float(total_qty),
+                avg_entry=float(weighted / total_qty),
+            )
+        )
+        anchor_ticker_direction.append((ticker, direction))
+
+    out: dict[uuid.UUID, list[PlanCandidate]] = {}
+    for plan in open_plans:
+        matches = [
+            candidate
+            for candidate, (ticker, direction) in zip(anchors, anchor_ticker_direction)
+            if ticker == plan.ticker
+            and direction.upper() == (plan.direction or "").upper()
+        ]
+        # Newest fill first -- the one most likely to be the plan's own,
+        # rather than an older leg the trader has since moved past.
+        matches.sort(key=lambda c: c.entry_date, reverse=True)
+        if not matches:
+            continue
+        out[plan.id] = [
+            candidate.model_copy(
+                update={
+                    "minutes_from_fill_to_plan": (
+                        plan.created_at - candidate.entry_date
+                    ).total_seconds()
+                    / 60,
+                }
+            )
+            for candidate in matches[:PLAN_CANDIDATES_PER_PLAN]
+        ]
     return out
 
 
@@ -2142,8 +2334,11 @@ async def list_plans(
     plans = (await session.execute(stmt)).scalars().all()
     attached = await _attached_ids_by_plan(session, [p.id for p in plans])
     disciplines = await _disciplines_by_plan(session, [p.id for p in plans])
+    candidates = await _candidates_by_plan(session, plans)
     return [
-        _plan_out(p, attached.get(p.id, []), disciplines.get(p.id, []))
+        _plan_out(
+            p, attached.get(p.id, []), disciplines.get(p.id, []), candidates.get(p.id, [])
+        )
         for p in plans
     ]
 

@@ -464,6 +464,24 @@ export interface EquityCurve {
 export type PlanStatus = 'OPEN' | 'ATTACHED' | 'CANCELLED';
 
 /**
+ * An unplanned opening leg a plan could be attached to by hand.
+ *
+ * Exists because a plan auto-attach declined is indistinguishable, from the
+ * dock, from one whose fill simply has not arrived yet -- and the two want
+ * opposite actions from the user. One is a click; the other is patience.
+ */
+export interface PlanCandidate {
+  /** The fill to POST /api/trades/{trade_id}/attach-plan against. */
+  trade_id: string;
+  entry_date: string; // ISO 8601
+  fill_count: number;
+  quantity: number;
+  avg_entry: number;
+  /** Positive means the fill came before the plan was saved. */
+  minutes_from_fill_to_plan: number | null;
+}
+
+/**
  * A trade you intend to take, before the broker knows anything about it.
  *
  * Deliberately carries no fill price. `trades` deduplicates on the broker's
@@ -516,6 +534,11 @@ export interface TradePlan {
    * value only; never itself read by analytics.
    */
   disciplines: PositionDiscipline[];
+  /**
+   * Fills that match this plan but are not linked to it. Only ever populated
+   * for an OPEN plan — an attached or cancelled one has nothing to offer.
+   */
+  candidates: PlanCandidate[];
 }
 
 /** POST /api/plans. Every price is optional — a ticker and a bias is enough. */

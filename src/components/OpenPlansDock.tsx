@@ -5,14 +5,15 @@ import {
   AlertCircle,
   ChevronRight,
   ClipboardList,
+  Link2,
   Loader2,
   Trash2,
 } from 'lucide-react';
 
-import { useCancelPlan, usePlans } from '@/hooks/useTradeInbox';
+import { useAttachPlan, useCancelPlan, usePlans } from '@/hooks/useTradeInbox';
 import { PlanChartView } from '@/components/PlanChart';
 import { PlanModal } from '@/components/PlanModal';
-import type { TradePlan } from '@/types/api';
+import type { PlanCandidate, TradePlan } from '@/types/api';
 
 const when = new Intl.DateTimeFormat('en-US', {
   month: 'short',
@@ -33,6 +34,23 @@ const money = (n: number) =>
 /** Trailing zeros on a fractional size are noise; 0.25 should read as 0.25. */
 const qty = (n: number | null) =>
   n === null ? '—' : Number(n.toFixed(8)).toString();
+
+/**
+ * "Filled 10:12 ET — 1 min before this plan was saved."
+ *
+ * Puts the fill's own timestamp next to the plan's, in the same timezone the
+ * rest of the row already renders in — the two times sitting side by side is
+ * what turns "why won't this attach" into "oh, it's a minute late", instead
+ * of a gap the trader has to reconstruct by hand across two different clocks.
+ */
+function candidateContext(candidate: PlanCandidate): string {
+  const at = `${when.format(new Date(candidate.entry_date))} ET`;
+  const minutes = candidate.minutes_from_fill_to_plan;
+  if (minutes === null) return `Filled ${at}`;
+  const abs = Math.abs(minutes);
+  const span = abs < 1 ? 'under a minute' : `${Math.round(abs)} min`;
+  return `Filled ${at} — ${span} ${minutes >= 0 ? 'before' : 'after'} this plan was saved`;
+}
 
 /**
  * What the plan pays if the target is reached, in dollars.
@@ -92,10 +110,18 @@ function plannedRisk(plan: TradePlan): number | null {
  * the row) rather than an inline form -- the inline version could only touch
  * four price fields, leaving ticker, direction, strategy and thesis
  * uneditable once a plan was saved.
+ *
+ * A plan the sync could not auto-attach is not always still waiting -- the
+ * fill may already be sitting in the ledger, orphaned because it arrived a
+ * little outside `_plan_can_claim`'s window. `plan.candidates` is exactly
+ * that: unlinked fills the backend already knows could be this plan's, so the
+ * dock can offer the same manual attach the Journal exposes on a round trip,
+ * without the trader having to go find it there first.
  */
 export const OpenPlansDock: React.FC = () => {
   const { data: plans, isPending, isError, error } = usePlans('OPEN');
   const cancelMutation = useCancelPlan();
+  const attachMutation = useAttachPlan();
 
   const [editingPlan, setEditingPlan] = useState<TradePlan | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
@@ -153,10 +179,22 @@ export const OpenPlansDock: React.FC = () => {
                   {plan.direction === 'BUY' ? 'LONG' : 'SHORT'}
                 </span>
 
-                <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">
-                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-                  Pending · awaiting IBKR sync
-                </span>
+                {plan.candidates.length === 0 ? (
+                  <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">
+                    <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                    Pending · awaiting IBKR sync
+                  </span>
+                ) : (
+                  // Sky, not amber: an amber badge reads as "still waiting",
+                  // and this plan is not -- a fill it could belong to already
+                  // exists, and the only thing left is a click.
+                  <span className="inline-flex items-center gap-1 rounded bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">
+                    <Link2 className="h-3 w-3" />
+                    {plan.candidates.length === 1
+                      ? 'Unlinked fill found'
+                      : `${plan.candidates.length} unlinked fills`}
+                  </span>
+                )}
 
                 {plan.planned_r !== null && (
                   <span className="font-mono text-[11px] text-slate-300">
@@ -189,6 +227,49 @@ export const OpenPlansDock: React.FC = () => {
                   </span>
                 )}
               </div>
+
+              {plan.candidates.length > 0 && (
+                <div className="mt-2 space-y-1.5 rounded-lg border border-dashed border-sky-500/25 bg-sky-500/5 px-3 py-2">
+                  {plan.candidates.map((candidate) => {
+                    const attaching =
+                      attachMutation.isPending &&
+                      attachMutation.variables?.planId === plan.id &&
+                      attachMutation.variables?.tradeId === candidate.trade_id;
+
+                    return (
+                      <div
+                        key={candidate.trade_id}
+                        className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]"
+                      >
+                        <span className="text-sky-100">{candidateContext(candidate)}</span>
+                        <span className="font-mono text-[10px] text-obsidian-muted">
+                          {qty(candidate.quantity)} @ {price(candidate.avg_entry)}
+                          {candidate.fill_count > 1 ? ` · ${candidate.fill_count} fills` : ''}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setFailed(null);
+                            attachMutation.mutate(
+                              { tradeId: candidate.trade_id, planId: plan.id },
+                              { onError: (err) => setFailed(err.message) }
+                            );
+                          }}
+                          disabled={attaching}
+                          className="ml-auto inline-flex items-center gap-1 rounded border border-sky-500/30 px-2 py-0.5 text-[10px] text-sky-300 transition-colors hover:border-sky-500/60 hover:bg-sky-500/10 disabled:opacity-50"
+                        >
+                          {attaching ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <Link2 className="h-3 w-3" />
+                          )}
+                          Link to this fill
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
               <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-obsidian-muted">
                 <span>
