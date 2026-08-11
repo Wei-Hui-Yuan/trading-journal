@@ -239,15 +239,59 @@ def test_a_plan_written_before_the_fill_may_claim_it():
     assert main._plan_can_claim(plan, "PANW", "BUY", NOW)
 
 
-def test_a_plan_written_after_the_fill_may_not():
-    """A plan cannot describe a trade that already happened.
+def test_a_plan_written_just_after_the_fill_may_still_claim_it():
+    """Logging lag, not hindsight.
 
-    Without this, writing up a trade you just took would attach it to that
-    same trade and present a reconstruction as a prior commitment -- flattering
-    exactly the bias a journal exists to catch.
+    The ordinary case this exists for: click buy, then spend a minute writing
+    the plan up. 61 seconds is comfortably inside PLAN_ATTACH_GRACE and the
+    exit has not happened yet, so there is no outcome the plan could be
+    reacting to.
     """
-    plan = make_plan(created_at=NOW + timedelta(minutes=1))
+    plan = make_plan(created_at=NOW + timedelta(seconds=61))
+    assert main._plan_can_claim(plan, "PANW", "BUY", NOW)
+
+
+def test_a_plan_written_past_the_grace_window_may_not():
+    """Past PLAN_ATTACH_GRACE, a late plan cannot describe a trade that
+    already happened.
+
+    Without this bound, writing up a trade well after taking it would attach
+    it to that same trade and present a reconstruction as a prior commitment
+    -- flattering exactly the bias a journal exists to catch.
+    """
+    plan = make_plan(created_at=NOW + main.PLAN_ATTACH_GRACE + timedelta(minutes=1))
     assert not main._plan_can_claim(plan, "PANW", "BUY", NOW)
+
+
+def test_the_grace_window_never_reaches_past_the_exit():
+    """The grace window covers logging lag, not a trade that has resolved.
+
+    A plan written 30 minutes after entry is ordinarily within grace -- but
+    this position closed 5 minutes after entry, so by the time the plan was
+    written the outcome was already on the screen. Once that is true the
+    plan is a reconstruction, whatever the clock says about the grace window
+    alone.
+    """
+    plan = make_plan(created_at=NOW + timedelta(minutes=30))
+    assert not main._plan_can_claim(
+        plan, "PANW", "BUY", NOW, closed_at=NOW + timedelta(minutes=5)
+    )
+
+
+def test_an_open_position_has_no_exit_to_bound_the_grace():
+    """No closed_at means the position is still running -- nothing for a
+    plan written within grace to have seen."""
+    plan = make_plan(created_at=NOW + timedelta(minutes=30))
+    assert main._plan_can_claim(plan, "PANW", "BUY", NOW, closed_at=None)
+
+
+def test_a_plan_inside_the_grace_and_before_the_exit_claims_it():
+    """The full timeline this feature was built for: entered, planned 61
+    seconds later, closed hours after that."""
+    plan = make_plan(created_at=NOW + timedelta(seconds=61))
+    assert main._plan_can_claim(
+        plan, "PANW", "BUY", NOW, closed_at=NOW + timedelta(hours=3, minutes=46)
+    )
 
 
 def test_a_stale_plan_stops_competing():
