@@ -902,6 +902,54 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 
+class FlexFailureOut(BaseModel):
+    """One query that did not return, and what would make it return.
+
+    Exists because "the sync failed" is not actionable and every failure used
+    to read the same. A statement IBKR has not compiled yet, an expired token
+    and a deleted query all arrive as a failed query, and the three want
+    completely different responses -- wait, re-issue a credential, fix the
+    query. `category` is that difference, carried to the UI so it can say which
+    one this is instead of always advising a retry.
+    """
+
+    # IBKR's own words, unmodified: the interpretation below is ours, and the
+    # source of truth travels beside it so the two can be compared.
+    message: str
+    # None when the failure carried no IBKR code -- a network fault rather than
+    # a refusal.
+    code: Optional[str] = None
+    label: str
+    # wait | query | token | request -- see services/ibkr_client.FLEX_CODES.
+    category: str
+    # Empty when the label already says everything useful.
+    guidance: str = ""
+
+
+def _read_flex_failures(failures: Sequence[str]) -> list[FlexFailureOut]:
+    """Attach a reading to each raw failure message.
+
+    Pure string work over a list that is at most one entry per configured
+    query, so this costs nothing worth measuring and runs on the failure path
+    only.
+    """
+    from services import ibkr_client  # noqa: PLC0415 - import cycle
+
+    read = []
+    for message in failures:
+        diagnosis = ibkr_client.classify_failure(message)
+        read.append(
+            FlexFailureOut(
+                message=message,
+                code=diagnosis.code,
+                label=diagnosis.label,
+                category=diagnosis.category,
+                guidance=diagnosis.guidance,
+            )
+        )
+    return read
+
+
 class IngestResult(BaseModel):
     """Outcome of one ingest run, at each stage of the pipeline."""
 
@@ -954,7 +1002,16 @@ class IngestResult(BaseModel):
     # True when at least one failed query was throttled rather than rejected.
     # The distinction is the whole point of showing it: a throttle clears on
     # its own and is worth retrying in a few minutes, a bad token never is.
+    #
+    # SUPERSEDED by `flex_failures` below, which says which KIND of failure
+    # each query hit rather than collapsing every transient code into one
+    # boolean. Kept because the frontend and this API deploy independently --
+    # a browser running the previous bundle still reads this field.
     rate_limited: bool = False
+    # Each failed query, read: the IBKR code, what it means, and whether
+    # waiting can fix it. Sent alongside `queries_failed` rather than replacing
+    # it for the same deploy-ordering reason.
+    flex_failures: list[FlexFailureOut] = []
     # Pre-trade plans this sync matched to the fills that finally arrived.
     # Worth its own line because it is the moment the two halves of the
     # journal meet: the plan you wrote, and what the broker actually did.
@@ -1149,6 +1206,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
             rate_limited=any(
                 ibkr_client.is_transient_failure(f) for f in query_failures
             ),
+            flex_failures=_read_flex_failures(query_failures),
             stranded_fills=stranded_count,
             stranded_symbols=stranded_syms,
         )
@@ -1393,6 +1451,7 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         stranded_symbols=stranded_syms,
         queries_failed=query_failures,
         rate_limited=any(ibkr_client.is_transient_failure(f) for f in query_failures),
+        flex_failures=_read_flex_failures(query_failures),
         suppressed_skipped=resurrected,
         plans_attached=plans_attached,
         positions_removed=positions_removed,
@@ -7002,6 +7061,7 @@ async def sync_investment_transactions(session: AsyncSession = Depends(get_sessi
             "skipped": skipped,
             "holdings_created": [],
             "queries_failed": query_failures,
+            "flex_failures": _read_flex_failures(query_failures),
         }
 
     # Holdings first: a transaction references a ticker the book may not carry
@@ -7044,6 +7104,7 @@ async def sync_investment_transactions(session: AsyncSession = Depends(get_sessi
         "skipped": skipped,
         "holdings_created": created,
         "queries_failed": query_failures,
+        "flex_failures": _read_flex_failures(query_failures),
     }
 
 

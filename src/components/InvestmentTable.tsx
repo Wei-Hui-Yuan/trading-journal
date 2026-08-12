@@ -623,11 +623,23 @@ export const InvestmentTable: React.FC = () => {
                   clauses.push(`${r.skipped} skipped`);
                 }
                 if (r.queries_failed.length > 0) {
-                  clauses.push(
-                    `${r.queries_failed.length} quer${
-                      r.queries_failed.length === 1 ? 'y' : 'ies'
-                    } unavailable`
-                  );
+                  // Name the REASON, not just the count. "1 query unavailable"
+                  // is what sent a full day into retrying at an hour IBKR
+                  // could never have served the request at.
+                  const failures = r.flex_failures ?? [];
+                  const count = r.queries_failed.length;
+                  const noun = `quer${count === 1 ? 'y' : 'ies'}`;
+                  if (failures.length === 0) {
+                    clauses.push(`${count} ${noun} unavailable`);
+                  } else if (failures.every((f) => f.category === 'wait')) {
+                    clauses.push(
+                      `${count} ${noun} not ready at IBKR yet — worth retrying later in the day, not now`
+                    );
+                  } else {
+                    clauses.push(
+                      `${count} ${noun} will not recover without a fix — ${failures[0].label}`
+                    );
+                  }
                 }
                 setNotice(`Sync IBKR: ${clauses.join(', ')}.`);
               },

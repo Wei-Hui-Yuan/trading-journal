@@ -1,11 +1,20 @@
 /**
  * The long-term book. Deliberately a separate module from `types/api.ts`.
  *
- * Nothing here is shared with the trading journal, and that mirrors the
+ * No DOMAIN type here is shared with the trading journal, and that mirrors the
  * backend, where the investment endpoints are a self-contained section with
  * no reference in either direction. Keeping the types apart means a change to
  * one book cannot quietly alter the shape of the other.
+ *
+ * `FlexFailure` is the one deliberate exception, and it earns it by not being a
+ * domain type: both books sync through the SAME IBKR Flex client and the same
+ * classification table, so the backend serialises one `FlexFailureOut` for
+ * both. Mirroring that single source with two independent interfaces would let
+ * them drift from it -- which is the failure this module's separation exists to
+ * prevent, pointed the other way.
  */
+
+import type { FlexFailure } from './api';
 
 /** The user's own taxonomy from the portfolio sheet. */
 export type HoldingCategory = 'Growth' | 'Predictable' | 'ETF';
@@ -276,8 +285,9 @@ export interface PriceRefreshResult {
 /**
  * Outcome of pulling fills from the long-term book's own IBKR account (a
  * separate query from the trading journal's). `queries_failed` holds one
- * message per Flex query that did not return -- typically IBKR rate-limiting
- * report generation, which clears on its own.
+ * message per Flex query that did not return; `flex_failures` says what each
+ * one actually means -- not every refusal is rate-limiting, and only some of
+ * them clear on their own.
  */
 export interface SyncResult {
   fills_parsed: number;
@@ -286,6 +296,8 @@ export interface SyncResult {
   skipped: number;
   holdings_created: string[];
   queries_failed: string[];
+  /** Optional so a frontend deploy landing before the API one still renders. */
+  flex_failures?: FlexFailure[];
 }
 
 /** A manually-picked treemap color for one sector. Absent means "use the
