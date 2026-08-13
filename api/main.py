@@ -356,6 +356,57 @@ class SuppressedExecution(Base):
     executed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+# What set a sync off. Constrained in the database (migration 034) rather than
+# left as free text, so a typo is a write-time error instead of a value that
+# quietly matches no filter.
+SYNC_TRIGGER_MANUAL = "manual"
+SYNC_TRIGGER_CRON = "cron"
+
+# How it ended. `partial` is deliberately its own outcome: some Flex queries
+# did not return, so the ledger is short of fills that exist at the broker.
+# Folding it into `success` is how a half-empty sync comes to look complete.
+SYNC_OUTCOME_SUCCESS = "success"
+SYNC_OUTCOME_PARTIAL = "partial"
+SYNC_OUTCOME_ERROR = "error"
+
+
+class SyncRun(Base):
+    """One broker sync, recorded whether it worked or not (migration 034).
+
+    The header badge used to read `LastSyncState` out of the browser's query
+    cache, which meant it could only ever describe a sync that THIS tab
+    performed. A scheduled run was therefore invisible by construction, and an
+    unattended failure -- an expired token, say -- produced exactly what a
+    quiet market produces: no new fills and no signal.
+
+    Rows are written on every path including the failure ones, and in their own
+    transaction. A row written inside the ingest transaction is lost when that
+    transaction rolls back, which is the case it exists to document.
+    """
+
+    __tablename__ = "sync_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    # NULL means the run never reached its own recording step -- the process
+    # died mid-flight, which is not the same as a run that failed and said so.
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    trigger = Column(Text, nullable=False)
+    outcome = Column(Text, nullable=False)
+    executions_parsed = Column(Integer, nullable=False, default=0)
+    trades_created = Column(Integer, nullable=False, default=0)
+    positions_matched = Column(Integer, nullable=False, default=0)
+    plans_attached = Column(Integer, nullable=False, default=0)
+    # The whole IngestResult as the browser received it. JSONB rather than a
+    # column per figure: this is a record of what was reported, not something
+    # anything aggregates -- and the shape has already changed twice.
+    result = Column(JSONB, nullable=True)
+    # Only when the run raised. The detail the user would have seen, kept so a
+    # failure is still diagnosable days later.
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Trade(Base):
     __tablename__ = "trades"
 
@@ -1146,12 +1197,7 @@ async def _stranded_summary(session: AsyncSession) -> tuple[int, list[str]]:
     return len(rows), sorted(set(rows))
 
 
-@app.post(
-    "/api/ingest/ibkr",
-    response_model=IngestResult,
-    dependencies=[Depends(verify_clerk_token)],
-)
-async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
+async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
     """Fetch, stage, promote, and match IBKR executions.
 
     Pipeline, each step idempotent:
@@ -1161,6 +1207,11 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
          transaction_id) -- the absolute duplicate guard
       4. Promote only genuinely new rows into `trades`
       5. Re-run FIFO matching for each affected symbol
+
+    Not the endpoint itself: `ingest_ibkr` below wraps this so that every run,
+    including the ones that raise, leaves a `sync_runs` row behind. Keeping the
+    pipeline a plain function means the recording cannot accidentally swallow
+    an exception the endpoint is supposed to return as a status code.
     """
     from services import ibkr_client, ibkr_parser  # noqa: PLC0415 - import cycle
     from services.matching_engine import (  # noqa: PLC0415
@@ -1457,6 +1508,180 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
         positions_removed=positions_removed,
         reviews_discarded=reviews_discarded,
         symbols_recovered=recovered,
+    )
+
+
+async def _record_sync_run(
+    *,
+    started_at: datetime,
+    trigger: str,
+    outcome: str,
+    result: Optional[IngestResult] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Write one `sync_runs` row, in a session of its own.
+
+    ITS OWN SESSION, deliberately. The request's session is the one the ingest
+    ran in, and the row most worth keeping is the one describing a run that
+    failed -- which is exactly the run whose transaction is about to roll back
+    and take the record with it. A separate session commits independently of
+    whatever the pipeline did.
+
+    NEVER RAISES. A sync that worked must not be reported as a failure because
+    the bookkeeping afterwards hit a problem, and a sync that failed must
+    surface its own error rather than this one. A recording failure is logged
+    and swallowed; the worst case is a missing row, which is strictly better
+    than a misreported outcome.
+    """
+    try:
+        async with SessionLocal() as session:
+            session.add(
+                SyncRun(
+                    id=uuid.uuid4(),
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                    trigger=trigger,
+                    outcome=outcome,
+                    executions_parsed=result.executions_parsed if result else 0,
+                    trades_created=result.trades_created if result else 0,
+                    positions_matched=result.positions_matched if result else 0,
+                    plans_attached=(result.plans_attached or 0) if result else 0,
+                    # mode="json" so datetimes and UUIDs inside the payload
+                    # survive the trip into JSONB; the default mode leaves
+                    # objects asyncpg cannot serialise.
+                    result=result.model_dump(mode="json") if result else None,
+                    error=error,
+                )
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - see NEVER RAISES above
+        logger.error("Could not record the sync run: %s", exc)
+
+
+@app.post(
+    "/api/ingest/ibkr",
+    response_model=IngestResult,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
+    """Run the ingest, and leave a record that it happened.
+
+    The record is the point. `LastSyncState` lives in one browser tab's query
+    cache, so before this the app could not tell "the schedule ran and the
+    market was quiet" from "the schedule has not fired since the token
+    expired" -- both are zero new fills and no badge.
+
+    Every path writes a row, including both failure paths. An HTTPException is
+    re-raised untouched afterwards so the caller still gets its 502/503 with
+    the same detail: the recording observes the outcome, it does not change it.
+    """
+    started_at = datetime.now(timezone.utc)
+    # Always 'manual' today, because this endpoint still requires a Clerk
+    # session. Reading it from one place means turning the scheduler on is a
+    # one-line dependency swap (see verify_clerk_or_cron_token, which returns
+    # `cron: True`) rather than a change to how runs are recorded.
+    trigger = SYNC_TRIGGER_MANUAL
+
+    try:
+        result = await _run_ibkr_ingest(session)
+    except HTTPException as exc:
+        await _record_sync_run(
+            started_at=started_at,
+            trigger=trigger,
+            outcome=SYNC_OUTCOME_ERROR,
+            error=f"HTTP {exc.status_code}: {exc.detail}",
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised as-is
+        await _record_sync_run(
+            started_at=started_at,
+            trigger=trigger,
+            outcome=SYNC_OUTCOME_ERROR,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+
+    # A run that could not reach every query is NOT a success. It leaves the
+    # ledger short of fills that exist at the broker, and the staleness check
+    # reads this column to decide whether the data can be trusted as current.
+    await _record_sync_run(
+        started_at=started_at,
+        trigger=trigger,
+        outcome=(
+            SYNC_OUTCOME_PARTIAL if result.queries_failed else SYNC_OUTCOME_SUCCESS
+        ),
+        result=result,
+    )
+    return result
+
+
+class SyncRunOut(BaseModel):
+    """One recorded sync, as the header badge reads it."""
+
+    id: uuid.UUID
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    trigger: str
+    outcome: str
+    executions_parsed: int
+    trades_created: int
+    positions_matched: int
+    plans_attached: int
+    error: Optional[str] = None
+
+
+class SyncStatusOut(BaseModel):
+    """Everything the badge needs, in one request.
+
+    `last_success_at` is separate from `latest` on purpose. The newest run and
+    the newest run that WORKED are different questions, and only the second one
+    answers "is the ledger current". A week of nightly failures has a very
+    recent `latest` and a very old `last_success_at`, and reporting only the
+    first is how a broken schedule keeps looking busy.
+    """
+
+    latest: Optional[SyncRunOut] = None
+    last_success_at: Optional[datetime] = None
+    # Server-computed so the client is not doing arithmetic against a clock
+    # that may not agree with this one. Null when nothing has ever succeeded.
+    seconds_since_success: Optional[float] = None
+
+
+@app.get(
+    "/api/sync/runs/latest",
+    response_model=SyncStatusOut,
+    dependencies=[Depends(verify_clerk_token)],
+)
+async def latest_sync_run(session: AsyncSession = Depends(get_session)):
+    """The last sync, and the last one that succeeded.
+
+    Browser-only: the scheduler writes runs, it has no reason to read them.
+    """
+    latest = (
+        await session.execute(
+            select(SyncRun).order_by(SyncRun.started_at.desc()).limit(1)
+        )
+    ).scalars().first()
+
+    # A partial run is deliberately NOT a success here: it means some Flex
+    # queries did not return, so the ledger is knowingly short of fills.
+    last_success = (
+        await session.execute(
+            select(SyncRun.started_at)
+            .where(SyncRun.outcome == SYNC_OUTCOME_SUCCESS)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    return SyncStatusOut(
+        latest=SyncRunOut.model_validate(latest, from_attributes=True) if latest else None,
+        last_success_at=last_success,
+        seconds_since_success=(
+            (datetime.now(timezone.utc) - last_success).total_seconds()
+            if last_success
+            else None
+        ),
     )
 
 

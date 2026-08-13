@@ -32,7 +32,7 @@ report the permanently-stuck rows on their own, standing counters
 every sync rather than computed from what that sync's statement contained.
 
 The tests below that need a real database (marked `@requires_db`) drive the
-actual `main.ingest_ibkr` endpoint function through two simulated syncs, with
+actual `main._run_ibkr_ingest` pipeline through two simulated syncs, with
 `services.ibkr_client.fetch_statements` and `services.ibkr_parser.parse_statement`
 monkeypatched to hand it synthetic fills -- so they exercise the real staging
 insert, the real promotion filter, and the real processed-flag UPDATE, not a
@@ -222,7 +222,7 @@ def test_a_deleted_and_suppressed_fill_is_not_counted_as_stranded():
 
 
 def _patch_ibkr(monkeypatch, executions_by_call):
-    """Feed `ingest_ibkr` synthetic fills without touching the real IBKR API.
+    """Feed `_run_ibkr_ingest` synthetic fills without touching the real IBKR API.
 
     `executions_by_call` is consumed one list per call to `fetch_statements`,
     so the test can hand sync 1 and sync 2 different -- or, as here,
@@ -250,7 +250,7 @@ def _patch_ibkr(monkeypatch, executions_by_call):
 
 @requires_db
 def test_stranded_fills_survive_a_second_sync_without_polluting_recovered(monkeypatch):
-    """The full regression, end to end, through the real `ingest_ibkr`.
+    """The full regression, end to end, through the real `_run_ibkr_ingest`.
 
     Two symbols, four fills:
       sym1/clean         -- promotable, the control that proves the run works
@@ -305,7 +305,12 @@ def test_stranded_fills_survive_a_second_sync_without_polluting_recovered(monkey
             # --- sync 1 ---------------------------------------------------
             _patch_ibkr(monkeypatch, [fills()])
             session1 = db_session(conn)
-            result1 = await main.ingest_ibkr(session=session1)
+            # The pipeline, not the endpoint wrapper around it. The wrapper
+            # records a sync_runs row in a session of its OWN -- deliberately,
+            # so a failed run still leaves evidence -- which would escape this
+            # test's rollback and commit for real. What is under test here is
+            # the promotion behaviour, and that lives in _run_ibkr_ingest.
+            result1 = await main._run_ibkr_ingest(session=session1)
             await session1.close()
 
             assert result1.skipped_undated == 2   # undated + both_missing
@@ -337,7 +342,7 @@ def test_stranded_fills_survive_a_second_sync_without_polluting_recovered(monkey
             # --- sync 2: IBKR resends the same unresolved statement -------
             _patch_ibkr(monkeypatch, [fills()])
             session2 = db_session(conn)
-            result2 = await main.ingest_ibkr(session=session2)
+            result2 = await main._run_ibkr_ingest(session=session2)
             await session2.close()
 
             # All four transaction_ids already exist in staging, so nothing

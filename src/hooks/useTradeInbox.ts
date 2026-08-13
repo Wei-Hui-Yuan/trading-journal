@@ -41,6 +41,7 @@ import {
   getSettings,
   getStrategies,
   getSuppressedExecutions,
+  getSyncStatus,
   getTrades,
   httpStatusOf,
   ingestIBKR,
@@ -63,6 +64,7 @@ import type {
   LastSyncState,
   PositionDeleteImpact,
   PositionDeleteResult,
+  SyncStatus,
   ManualTradePayload,
   ManualTradeResult,
   PlanAttachResult,
@@ -153,6 +155,10 @@ export const queryKeys = {
   // Written by the sync mutation, read by the header badge. Not a fetched
   // resource — the cache is being used as the one place both can see.
   lastSync: ['lastSync'] as const,
+  // The DURABLE record, from the server. Distinct from `lastSync` above,
+  // which only ever knows about a sync this tab performed and therefore
+  // cannot see a scheduled run at all.
+  syncStatus: ['syncStatus'] as const,
   suppressed: ['suppressedExecutions'] as const,
   // Prefix, so invalidating plans clears every status filter at once — a
   // cancelled plan has to leave the OPEN list and appear in the ALL list, and
@@ -417,6 +423,9 @@ export function useSyncBroker() {
       queryClient.invalidateQueries({ queryKey: queryKeys.trades });
       queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
       queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      // The server just recorded this run, so the durable record the badge
+      // reads is now a version behind.
+      queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus });
 
       // A run where some Flex queries did not return is NOT a success. IBKR
       // rate-limits report generation per token, and its cooldown outlasts a
@@ -441,6 +450,9 @@ export function useSyncBroker() {
       });
     },
     onError: (error) => {
+      // The server records failed runs too, so the badge has something new to
+      // read even though nothing was imported.
+      queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus });
       queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, {
         at: new Date().toISOString(),
         outcome: 'error',
@@ -450,6 +462,24 @@ export function useSyncBroker() {
         acknowledged: false,
       });
     },
+  });
+}
+
+/**
+ * The last sync anyone performed, from the server rather than this tab.
+ *
+ * This is what makes a scheduled run visible: `useLastSync` below can only
+ * report syncs THIS browser session ran, so before this a nightly job that
+ * failed on an expired token produced the same silence as a quiet market.
+ *
+ * Not polled. A daily schedule does not warrant a timer on every mounted
+ * page, and the value refetches on mount and whenever a sync completes, which
+ * covers every moment it visibly changes.
+ */
+export function useSyncStatus() {
+  return useQuery<SyncStatus, Error>({
+    queryKey: queryKeys.syncStatus,
+    queryFn: getSyncStatus,
   });
 }
 
