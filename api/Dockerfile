@@ -51,4 +51,21 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "120", "main:app"]
+# --timeout MUST stay above services/ibkr_client.TOTAL_BUDGET_SECONDS, and
+# test_the_budget_is_below_the_worker_timeout reads this line to enforce it.
+#
+# It was 120 against a 240s budget: the sync was allowed to spend twice as long
+# as the process manager would tolerate. The budget already exists to bound the
+# handshake -- see the long comment on TOTAL_BUDGET_SECONDS -- and a worker
+# ceiling underneath it takes that decision away from the code that reasoned
+# about it, cutting a run off at an arbitrary point instead of the planned one.
+#
+# Under cron that gets worse rather than better. A run killed mid-ingest can
+# leave fills promoted into `trades` but never matched into round trips, which
+# is the state _symbols_awaiting_match exists to recover from -- and unattended,
+# nobody is watching it happen.
+#
+# 300 matches the browser's own ceiling in src/lib/api.ts, so the 240s budget is
+# once again the binding constraint on every path. Raising it is free: gunicorn
+# only acts on the timeout when a worker actually goes quiet for that long.
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "300", "main:app"]
