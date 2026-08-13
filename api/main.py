@@ -1561,9 +1561,11 @@ async def _record_sync_run(
 @app.post(
     "/api/ingest/ibkr",
     response_model=IngestResult,
-    dependencies=[Depends(verify_clerk_token)],
 )
-async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
+async def ingest_ibkr(
+    session: AsyncSession = Depends(get_session),
+    auth: dict = Depends(verify_clerk_or_cron_token),
+):
     """Run the ingest, and leave a record that it happened.
 
     The record is the point. `LastSyncState` lives in one browser tab's query
@@ -1574,13 +1576,17 @@ async def ingest_ibkr(session: AsyncSession = Depends(get_session)):
     Every path writes a row, including both failure paths. An HTTPException is
     re-raised untouched afterwards so the caller still gets its 502/503 with
     the same detail: the recording observes the outcome, it does not change it.
+
+    `verify_clerk_or_cron_token` accepts a Clerk session OR the scheduler's
+    shared secret, which is what made a Northflank Cron Job possible without
+    also leaving this open to an unauthenticated caller: unset CRON_SECRET
+    behaves exactly like the plain Clerk check this replaced. Its return value
+    is captured here rather than left as a bare `dependencies=[]` entry
+    specifically so `trigger` below does not have to guess which path
+    authenticated the request.
     """
     started_at = datetime.now(timezone.utc)
-    # Always 'manual' today, because this endpoint still requires a Clerk
-    # session. Reading it from one place means turning the scheduler on is a
-    # one-line dependency swap (see verify_clerk_or_cron_token, which returns
-    # `cron: True`) rather than a change to how runs are recorded.
-    trigger = SYNC_TRIGGER_MANUAL
+    trigger = SYNC_TRIGGER_CRON if auth.get("cron") else SYNC_TRIGGER_MANUAL
 
     try:
         result = await _run_ibkr_ingest(session)

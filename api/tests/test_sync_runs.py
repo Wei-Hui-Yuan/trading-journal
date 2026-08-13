@@ -78,7 +78,7 @@ def test_a_clean_run_is_recorded_as_success(monkeypatch):
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
     monkeypatch.setattr(main, "_record_sync_run", spy)
 
-    result = asyncio.run(main.ingest_ibkr(session=object()))
+    result = asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     assert result.trades_created == 3, "the caller still gets the real result"
     assert len(recorded) == 1
@@ -101,7 +101,7 @@ def test_a_run_with_a_failed_query_is_partial_not_success(monkeypatch):
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
     monkeypatch.setattr(main, "_record_sync_run", spy)
 
-    asyncio.run(main.ingest_ibkr(session=object()))
+    asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     assert recorded[0]["outcome"] == main.SYNC_OUTCOME_PARTIAL
 
@@ -124,7 +124,7 @@ def test_an_http_failure_is_still_recorded_and_still_raised(monkeypatch):
     monkeypatch.setattr(main, "_record_sync_run", spy)
 
     with pytest.raises(HTTPException) as caught:
-        asyncio.run(main.ingest_ibkr(session=object()))
+        asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     # Re-raised untouched: the recording observes the outcome, it does not
     # change what the caller sees.
@@ -150,7 +150,7 @@ def test_an_unexpected_exception_is_recorded_and_re_raised(monkeypatch):
     monkeypatch.setattr(main, "_record_sync_run", spy)
 
     with pytest.raises(RuntimeError):
-        asyncio.run(main.ingest_ibkr(session=object()))
+        asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     assert recorded[0]["outcome"] == main.SYNC_OUTCOME_ERROR
     assert "RuntimeError" in recorded[0]["error"]
@@ -168,7 +168,7 @@ def test_recording_never_turns_a_good_sync_into_a_failed_one(monkeypatch):
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
     monkeypatch.setattr(main, "SessionLocal", exploding_session)
 
-    result = asyncio.run(main.ingest_ibkr(session=object()))
+    result = asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     assert result.trades_created == 5, (
         "a failure inside _record_sync_run must be swallowed, not surfaced"
@@ -188,15 +188,15 @@ def test_a_failing_recorder_does_not_mask_the_real_error(monkeypatch):
     monkeypatch.setattr(main, "SessionLocal", exploding_session)
 
     with pytest.raises(HTTPException) as caught:
-        asyncio.run(main.ingest_ibkr(session=object()))
+        asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
     assert caught.value.detail == "the real problem"
 
 
-def test_the_trigger_is_manual_while_the_endpoint_requires_a_session(monkeypatch):
-    """Turning the scheduler on should be a dependency swap, not a change to
-    how runs are recorded -- so the trigger is read in one place and this
-    asserts what that place currently yields."""
+def test_a_clerk_session_is_recorded_as_manual(monkeypatch):
+    """`verify_clerk_or_cron_token` returns the ordinary Clerk claims dict for
+    a browser caller -- no `cron` key at all, not `cron: False`. The trigger
+    read must not assume the key is always present."""
     recorded: list[dict] = []
 
     async def fake_ingest(session):
@@ -208,9 +208,46 @@ def test_the_trigger_is_manual_while_the_endpoint_requires_a_session(monkeypatch
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
     monkeypatch.setattr(main, "_record_sync_run", spy)
 
-    asyncio.run(main.ingest_ibkr(session=object()))
+    asyncio.run(main.ingest_ibkr(session=object(), auth={"sub": "user_2vX...clerk"}))
 
     assert recorded[0]["trigger"] == main.SYNC_TRIGGER_MANUAL
+
+
+def test_the_cron_secret_is_recorded_as_cron(monkeypatch):
+    """The whole point of this change. `verify_clerk_or_cron_token` returns
+    `{"sub": "cron", "cron": True}` for the scheduler (see auth.py), and this
+    is where that stops being a fact about auth and becomes a fact about the
+    row in `sync_runs` -- which is what lets the badge say "scheduled"."""
+    recorded: list[dict] = []
+
+    async def fake_ingest(session):
+        return make_result()
+
+    async def spy(**kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
+    monkeypatch.setattr(main, "_record_sync_run", spy)
+
+    asyncio.run(
+        main.ingest_ibkr(session=object(), auth={"sub": "cron", "cron": True})
+    )
+
+    assert recorded[0]["trigger"] == main.SYNC_TRIGGER_CRON
+
+
+def test_the_endpoint_accepts_the_cron_secret_without_a_clerk_session():
+    """The manual button must keep working, and the scheduler must not need
+    one. Both halves of `verify_clerk_or_cron_token` are unit-tested in
+    test_auth.py; this is the one place that asserts /api/ingest/ibkr is
+    actually WIRED to that dependency rather than the plain Clerk check it
+    replaced -- a route-level regression neither of those tests can see."""
+    route = next(r for r in main.app.routes if r.path == "/api/ingest/ibkr")
+    called = {dep.call for dep in route.dependant.dependencies}
+    assert main.verify_clerk_or_cron_token in called
+    assert main.verify_clerk_token not in called, (
+        "the plain Clerk check would shut the scheduler out again"
+    )
 
 
 # ---------------------------------------------------------------------------
