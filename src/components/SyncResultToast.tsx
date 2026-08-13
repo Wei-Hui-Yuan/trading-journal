@@ -5,6 +5,140 @@ import { createPortal } from 'react-dom';
 import { AlertTriangle, Check, Clock, Wrench, X, XCircle } from 'lucide-react';
 
 import { useAcknowledgeSync, useLastSync } from '@/hooks/useTradeInbox';
+import type { FlexFailure, IngestResult } from '@/types/api';
+
+/**
+ * How each kind of Flex failure should be summed up, and whether waiting is
+ * the right response.
+ *
+ * Keyed by the backend's `category` (services/ibkr_client.FLEX_CODES), so the
+ * two cannot drift into telling the user different things.
+ */
+const FAILURE_COPY: Record<string, { headline: string; advice: string }> = {
+  wait: {
+    headline: 'IBKR could not produce the report yet',
+    advice:
+      'Nothing here is misconfigured — this one is on IBKR’s side and resolves without any action.',
+  },
+  query: {
+    headline: 'The Flex query itself needs fixing',
+    advice:
+      'Waiting will not help. Check the query in Reports → Flex Queries: its id, its account, its period, and that it is exposed to the Flex Web Service.',
+  },
+  token: {
+    headline: 'The Flex credential needs fixing',
+    advice:
+      'Waiting will not help. The token is expired, invalid, or restricted — reissue it and update IBKR_TOKEN.',
+  },
+  request: {
+    headline: 'IBKR rejected the request itself',
+    advice: 'This is a bug on our side rather than something you can configure.',
+  },
+};
+
+/**
+ * Which failures a run hit, and what to do about them.
+ *
+ * Grouped by category rather than listed flat: two queries refused for the
+ * same reason are one instruction, and two refused for different reasons must
+ * never be collapsed into one — that collapse is what turned a statement
+ * IBKR had not compiled yet into "try again in a few minutes" and cost a day
+ * of waiting for something that only clears at a different hour.
+ *
+ * Falls back to the old flat list when `flex_failures` is absent, which is the
+ * window where a browser is running a bundle newer than the API.
+ */
+const FailurePanel: React.FC<{ result: IngestResult }> = ({ result }) => {
+  const failures = result.flex_failures ?? [];
+
+  const grouped = React.useMemo(() => {
+    const byCategory = new Map<string, FlexFailure[]>();
+    for (const failure of failures) {
+      const key = failure.category || 'request';
+      if (!byCategory.has(key)) byCategory.set(key, []);
+      byCategory.get(key)!.push(failure);
+    }
+    return [...byCategory.entries()];
+  }, [failures]);
+
+  return (
+    <div className="mt-3 space-y-2">
+      {grouped.length === 0 ? (
+        // No reading available: say only what is certain rather than guessing
+        // a cause, which is the mistake this whole panel is correcting.
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-2.5 py-2">
+          <div className="flex items-start gap-1.5">
+            <Clock className="mt-px h-3 w-3 shrink-0 text-amber-400" />
+            <div className="text-[11px] leading-relaxed text-amber-200/90">
+              <span className="font-semibold">
+                {result.queries_failed.length} quer
+                {result.queries_failed.length === 1 ? 'y' : 'ies'} did not return.
+              </span>{' '}
+              Some fills may be missing.
+            </div>
+          </div>
+          <FailureList messages={result.queries_failed} />
+        </div>
+      ) : (
+        grouped.map(([category, group]) => {
+          const copy = FAILURE_COPY[category] ?? FAILURE_COPY.request;
+          const waiting = category === 'wait';
+          return (
+            <div
+              key={category}
+              className={`rounded-lg border px-2.5 py-2 ${
+                waiting
+                  ? 'border-amber-500/30 bg-amber-500/5'
+                  : 'border-loss/30 bg-loss/5'
+              }`}
+            >
+              <div className="flex items-start gap-1.5">
+                {waiting ? (
+                  <Clock className="mt-px h-3 w-3 shrink-0 text-amber-400" />
+                ) : (
+                  <Wrench className="mt-px h-3 w-3 shrink-0 text-loss" />
+                )}
+                <div
+                  className={`text-[11px] leading-relaxed ${
+                    waiting ? 'text-amber-200/90' : 'text-loss'
+                  }`}
+                >
+                  <span className="font-semibold">
+                    {group.length} quer{group.length === 1 ? 'y' : 'ies'}:{' '}
+                    {copy.headline}.
+                  </span>{' '}
+                  {copy.advice}
+                  {/* The per-code detail, which is what makes this specific
+                      rather than a category label. */}
+                  {group[0].guidance && (
+                    <span className="mt-1 block text-amber-200/70">
+                      {group[0].guidance}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <FailureList messages={group.map((f) => f.message)} />
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+};
+
+/** IBKR's own wording, kept verbatim so our reading can be checked against it. */
+const FailureList: React.FC<{ messages: string[] }> = ({ messages }) => (
+  <ul className="mt-1.5 space-y-0.5 pl-4.5">
+    {messages.map((message) => (
+      <li
+        key={message}
+        className="break-words font-mono text-[10px] text-amber-200/60"
+      >
+        {message}
+      </li>
+    ))}
+  </ul>
+);
 
 /**
  * What the last sync actually did, in full.
@@ -252,48 +386,12 @@ export const SyncResultToast: React.FC = () => {
             <p className="text-[11px] text-loss">{summary}</p>
           )}
 
-          {/* The actionable case. Throttling clears on its own, so the advice
-              is "wait", not "check your token" — and saying which it is, is the
-              entire reason the backend classifies the failure. */}
+          {/* The actionable case, and the one that has to say which KIND of
+              failure this is. "Try again shortly" is right for a statement
+              IBKR has not compiled yet and actively wrong for an expired
+              token, and this panel used to give the same advice for both. */}
           {result && result.queries_failed.length > 0 && (
-            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-2.5 py-2">
-              <div className="flex items-start gap-1.5">
-                <Clock className="mt-px h-3 w-3 shrink-0 text-amber-400" />
-                <div className="text-[11px] leading-relaxed text-amber-200/90">
-                  {result.rate_limited ? (
-                    <>
-                      <span className="font-semibold">
-                        {result.queries_failed.length} Flex quer
-                        {result.queries_failed.length === 1 ? 'y was' : 'ies were'}{' '}
-                        rate-limited by IBKR.
-                      </span>{' '}
-                      Try syncing again in a few minutes — this clears on its own.
-                      Some fills may be missing until then.
-                    </>
-                  ) : (
-                    <>
-                      <span className="font-semibold">
-                        {result.queries_failed.length} quer
-                        {result.queries_failed.length === 1 ? 'y' : 'ies'} did not
-                        return.
-                      </span>{' '}
-                      This will not fix itself — check the query id and token.
-                    </>
-                  )}
-                </div>
-              </div>
-              <ul className="mt-1.5 space-y-0.5 pl-4.5">
-                {result.queries_failed.map((failure) => (
-                  <li
-                    key={failure}
-                    className="truncate font-mono text-[10px] text-amber-200/60"
-                    title={failure}
-                  >
-                    {failure}
-                  </li>
-                ))}
-              </ul>
-            </div>
+            <FailurePanel result={result} />
           )}
         </div>
       </div>

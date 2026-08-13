@@ -253,6 +253,31 @@ export interface PositionReviewPayload {
 // ---------------------------------------------------------------------------
 
 /**
+ * What kind of thing you would have to change to stop a Flex query failing.
+ *
+ * The distinction the sync used to lose. A statement IBKR has not compiled
+ * yet, an expired token and a deleted query all arrive as "a query did not
+ * return", and advising a retry is right for exactly one of them.
+ */
+export type FlexFailureCategory = 'wait' | 'query' | 'token' | 'request';
+
+/**
+ * One failed Flex query, with IBKR's own message and this app's reading of it.
+ *
+ * `message` is IBKR's wording, unmodified, so the interpretation beside it can
+ * always be checked against the source.
+ */
+export interface FlexFailure {
+  message: string;
+  /** Null when the failure carried no IBKR code — a network fault, not a refusal. */
+  code: string | null;
+  label: string;
+  category: FlexFailureCategory | string;
+  /** Empty when the label already says everything useful. */
+  guidance: string;
+}
+
+/**
  * Result of POST /api/ingest/ibkr.
  *
  * Reports each stage of the pipeline separately, so a run that finds nothing
@@ -308,6 +333,15 @@ export interface IngestResult {
    * rather than letting a partial sync look complete.
    */
   queries_failed: string[];
+  /**
+   * The same failures, read: which IBKR code, what it means, and whether
+   * waiting can fix it. Prefer this over `queries_failed` + `rate_limited`
+   * when present — those collapse every cause into "retry shortly", which is
+   * actively wrong for an expired token or a deleted query.
+   *
+   * Optional so a frontend deploy landing before the API one still renders.
+   */
+  flex_failures?: FlexFailure[];
   /**
    * Broker fills re-sent that you had deliberately deleted, and ingest
    * skipped. A number that keeps climbing means the Flex query is still

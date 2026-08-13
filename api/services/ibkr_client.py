@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
@@ -51,6 +52,143 @@ def is_transient_failure(message: str) -> bool:
     that happens to read 1001 cannot be mistaken for a rate limit.
     """
     return any(f"code {code}" in message for code in NOT_READY_CODES)
+
+
+# ---------------------------------------------------------------------------
+# What IBKR actually said, and whether waiting can fix it
+# ---------------------------------------------------------------------------
+#
+# Deliberately SEPARATE from NOT_READY_CODES above, which is deliberately
+# minimal because it drives retry CONTROL FLOW. This table drives what a person
+# is told, and the two are different decisions: widening the retry set to every
+# code below would change when the app hammers IBKR, which is not the goal.
+#
+# Categories answer one question -- what would you have to change to make this
+# stop? A code that needs a new token and a code that needs a different time of
+# day are both "the sync failed", and telling them apart is the whole point:
+# reporting an expired token as "try again shortly" sends the user to wait for
+# something that will never happen on its own.
+FAILURE_WAIT = "wait"
+FAILURE_QUERY = "query"
+FAILURE_TOKEN = "token"
+FAILURE_REQUEST = "request"
+
+# code -> (what it means, category, what to do about it)
+#
+# IBKR's own ErrorMessage is always carried alongside these, so a label here
+# being less precise than IBKR's wording cannot mislead -- the source of truth
+# travels with the interpretation.
+FLEX_CODES: dict[str, tuple[str, str, str]] = {
+    "1001": (
+        "IBKR could not generate the statement at this time",
+        FAILURE_WAIT,
+        # Deliberately names no hour. Measured only that it fails in the ET
+        # small hours and works mid-morning ET; the boundary between those is
+        # unverified, and a confident wrong cutoff is worse than none.
+        "Activity statements are compiled on a daily cycle in New York time. "
+        "Asked for before that day's statement exists, this is the refusal you "
+        "get. It usually clears once the US morning is under way -- so this is "
+        "worth retrying later in the day, not in a few minutes.",
+    ),
+    "1003": (
+        "statement is not available",
+        FAILURE_QUERY,
+        "The account or period this query names has no statement to return.",
+    ),
+    "1004": ("statement is incomplete at this time", FAILURE_WAIT, ""),
+    "1005": ("settlement data is not ready", FAILURE_WAIT, ""),
+    "1006": ("FIFO P&L data is not ready", FAILURE_WAIT, ""),
+    "1007": ("MTM P&L data is not ready", FAILURE_WAIT, ""),
+    "1008": ("MTM and FIFO P&L data is not ready", FAILURE_WAIT, ""),
+    "1009": ("IBKR is under heavy load", FAILURE_WAIT, ""),
+    "1010": (
+        "legacy Flex query, no longer supported",
+        FAILURE_QUERY,
+        "Recreate it as an Activity Flex query.",
+    ),
+    "1011": ("the Flex service account is inactive", FAILURE_TOKEN, ""),
+    "1012": (
+        "the Flex token has expired",
+        FAILURE_TOKEN,
+        "Flex tokens expire. Generate a new one under Reports -> Flex Queries "
+        "-> Flex Web Service, then update IBKR_TOKEN wherever it is set.",
+    ),
+    "1013": (
+        "the token is IP-restricted",
+        FAILURE_TOKEN,
+        "This server's IP is not on the token's allow list, which is not the "
+        "same IP you browse from.",
+    ),
+    "1014": (
+        "the query id is invalid",
+        FAILURE_QUERY,
+        "Check the id exists and is exposed to the Flex Web Service, not "
+        "merely saved.",
+    ),
+    "1015": ("the token is invalid", FAILURE_TOKEN, ""),
+    "1016": (
+        "the account is invalid",
+        FAILURE_QUERY,
+        "The query points at an account this token cannot read.",
+    ),
+    "1017": ("the reference code was invalid or had expired", FAILURE_REQUEST, ""),
+    "1018": (
+        "too many requests from this token",
+        FAILURE_WAIT,
+        "A real throttle, measured in minutes. Asking again during the cooldown "
+        "can restart it.",
+    ),
+    "1019": ("statement generation in progress", FAILURE_WAIT, ""),
+    "1020": ("IBKR could not validate the request", FAILURE_REQUEST, ""),
+    "1021": ("statement could not be retrieved at this time", FAILURE_WAIT, ""),
+}
+
+
+@dataclass(frozen=True)
+class FlexDiagnosis:
+    """A failure message, read.
+
+    `code` is None when the failure carried no IBKR code at all -- a network or
+    transport fault rather than a Flex refusal, which is worth saying rather
+    than guessing a category for.
+    """
+
+    code: Optional[str]
+    label: str
+    category: str
+    guidance: str
+
+
+def classify_failure(message: str) -> FlexDiagnosis:
+    """Read one failure message into something explainable.
+
+    Reads the `code NNNN` fragment for the same reason `is_transient_failure`
+    does -- it is the one part of the message this module wrote itself, so it
+    is the only part safe to match on.
+    """
+    found = next(
+        (code for code in FLEX_CODES if f"code {code}" in message), None
+    )
+    if found is None:
+        transport = "code" not in message
+        return FlexDiagnosis(
+            code=None,
+            label=(
+                "the request never reached IBKR, or IBKR never answered"
+                if transport
+                else "IBKR returned a code this app does not recognise"
+            ),
+            category=FAILURE_WAIT if transport else FAILURE_REQUEST,
+            guidance=(
+                "A network or timeout fault rather than a refusal -- the sync "
+                "itself is fine to run again."
+                if transport
+                else "Not in this app's table; check IBKR's Flex Web Service docs."
+            ),
+        )
+
+    label, category, guidance = FLEX_CODES[found]
+    return FlexDiagnosis(code=found, label=label, category=category, guidance=guidance)
 
 
 MAX_POLL_ATTEMPTS = 5
