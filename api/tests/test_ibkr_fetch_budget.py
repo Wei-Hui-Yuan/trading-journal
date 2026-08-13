@@ -17,8 +17,10 @@ the next run because ingestion is idempotent.
 """
 
 import asyncio
+import json
 import os
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +49,44 @@ def test_the_budget_is_below_the_client_timeout():
     after the fetch."""
     assert ibkr_client.TOTAL_BUDGET_SECONDS < 300, "must answer before the browser gives up"
     assert ibkr_client.TOTAL_BUDGET_SECONDS >= 120, "must not undercut a legitimate compile"
+
+
+def _gunicorn_worker_timeout() -> float:
+    """The `--timeout` the container actually runs with.
+
+    Read out of the Dockerfile rather than restated here, because a number
+    copied into a test is a number that can agree with the test and disagree
+    with the deployment -- which is the exact failure being guarded against.
+    """
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+    cmd = next(
+        line for line in dockerfile.splitlines() if line.startswith("CMD [")
+    )
+    # A JSON array, so parse it as one instead of pattern-matching the flag out
+    # of a string: this fails loudly if the CMD is ever reshaped, rather than
+    # quietly matching nothing and passing.
+    argv = json.loads(cmd[len("CMD ") :])
+    return float(argv[argv.index("--timeout") + 1])
+
+
+def test_the_budget_is_below_the_worker_timeout():
+    """The BROWSER's patience is not the only ceiling -- gunicorn's is lower.
+
+    The test above bounds the budget against src/lib/api.ts's 300s and stopped
+    there, so nothing noticed the container running `--timeout 120` against a
+    240s budget: the sync was permitted to spend twice as long as the process
+    manager would tolerate. The budget exists precisely to decide where a slow
+    handshake gets cut off; a worker ceiling underneath it takes that decision
+    away and applies an arbitrary one instead.
+
+    It matters most where no one is watching. A worker killed mid-ingest can
+    leave fills promoted into `trades` but never matched into round trips --
+    the state `_symbols_awaiting_match` exists to recover -- and under a
+    schedule there is no user to notice the run died.
+    """
+    assert ibkr_client.TOTAL_BUDGET_SECONDS < _gunicorn_worker_timeout(), (
+        "the sync may not be allowed to outlive the worker running it"
+    )
 
 
 class TestCredentialResolution:
