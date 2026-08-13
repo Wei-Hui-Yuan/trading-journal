@@ -7,7 +7,7 @@ import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
 import { DataHealthModal } from './DataHealthModal';
-import { useLastSync } from '@/hooks/useTradeInbox';
+import { useLastSync, useSyncStatus } from '@/hooks/useTradeInbox';
 import { useLastAudit } from '@/hooks/useDataAudit';
 
 interface HeaderProps {
@@ -23,51 +23,126 @@ const syncTimeFormatter = new Intl.DateTimeFormat('en-US', {
 });
 
 /**
+ * How long the ledger may go without a SUCCESSFUL sync before the badge says
+ * so.
+ *
+ * Sized around the weekend, not around the schedule. A weekday-only job that
+ * last succeeded Friday morning is not due again until Monday morning -- 72
+ * hours later -- so anything tighter cries wolf every weekend, and an alert
+ * that is routinely wrong is one that stops being read. 80 hours clears that
+ * gap with slack for a late run.
+ *
+ * The cost is latency: a schedule that breaks on Monday is not flagged until
+ * Thursday. Worth tightening once the cron has a track record, but a false
+ * alarm every Saturday would train the warning away entirely.
+ */
+const SYNC_STALE_AFTER_SECONDS = 80 * 60 * 60;
+
+/**
  * What the last broker sync actually did.
  *
  * Replaces a hardcoded "CONNECTED" that was never derived from anything — it
  * showed green while the sync was silently duplicating fills, and would have
- * shown green with the API down. Before any sync runs this session it says so
- * rather than asserting a health it has not verified.
+ * shown green with the API down. Before any sync runs it says so rather than
+ * asserting a health it has not verified.
+ *
+ * Reads the SERVER's record first (`useSyncStatus`), falling back to this
+ * tab's in-memory one. That order is the point: `useLastSync` only ever knew
+ * about syncs this browser session performed, so a scheduled run was invisible
+ * and an unattended failure — an expired token, say — looked exactly like a
+ * quiet market. The in-memory value still wins when it is NEWER, because a
+ * sync that just finished should show instantly rather than after a refetch.
  */
 const SyncStatusBadge: React.FC = () => {
   const lastSync = useLastSync();
+  const { data: status } = useSyncStatus();
 
-  if (!lastSync) {
+  const persisted = status?.latest ?? null;
+
+  // Prefer whichever actually happened last. Normally that is the in-memory
+  // one during a session where you pressed the button, and the persisted one
+  // on a fresh page load or after the schedule ran.
+  const useMemory =
+    lastSync !== undefined &&
+    (persisted === null ||
+      new Date(lastSync.at).getTime() >= new Date(persisted.started_at).getTime());
+
+  if (!lastSync && !persisted) {
     return (
       <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-obsidian-border text-xs font-mono">
         <span className="h-2 w-2 rounded-full bg-slate-600" />
         <span className="text-slate-300">IBKR Sync:</span>
-        <span className="text-obsidian-muted">not run yet</span>
+        <span className="text-obsidian-muted">never</span>
       </div>
     );
   }
 
-  const tone =
-    lastSync.outcome === 'success'
+  const outcome = useMemory ? lastSync!.outcome : persisted!.outcome;
+  const at = useMemory ? lastSync!.at : persisted!.started_at;
+  const summary = useMemory
+    ? lastSync!.summary
+    : persisted!.error ??
+      (persisted!.trades_created > 0
+        ? `${persisted!.trades_created} new`
+        : `${persisted!.executions_parsed} returned`);
+
+  // Stale beats fresh-but-red: a run that failed five minutes ago and a ledger
+  // that has been un-synced for four days are different problems, and the
+  // second is the one a schedule is supposed to prevent. Only a genuine
+  // success clears it — a partial run leaves fills at the broker that never
+  // reached the ledger.
+  const stale =
+    status !== undefined &&
+    (status.seconds_since_success === null ||
+      status.seconds_since_success > SYNC_STALE_AFTER_SECONDS);
+
+  const tone = stale
+    ? { dot: 'bg-amber-400', text: 'text-amber-300', border: 'border-amber-500/60' }
+    : outcome === 'success'
       ? { dot: 'bg-win', text: 'text-win', border: 'border-obsidian-border' }
-      : lastSync.outcome === 'partial'
+      : outcome === 'partial'
         ? { dot: 'bg-amber-400', text: 'text-amber-300', border: 'border-amber-500/40' }
         : { dot: 'bg-loss', text: 'text-loss', border: 'border-loss/40' };
 
-  const at = syncTimeFormatter.format(new Date(lastSync.at));
-  // The status code only means something when the server answered. A failure
-  // with no response is a different problem and must not read as "HTTP null".
-  const code = lastSync.status !== null ? ` · ${lastSync.status}` : ' · no response';
+  const clock = syncTimeFormatter.format(new Date(at));
+  // The status code only means something when the server answered, and only
+  // this tab ever has one — a run read back from the record has no HTTP
+  // response attached to it.
+  const code = useMemory
+    ? lastSync!.status !== null
+      ? ` · ${lastSync!.status}`
+      : ' · no response'
+    : '';
+  // Saying which is not cosmetic: "the schedule ran and found nothing" and
+  // "nothing has run since you last pressed the button" are the two states
+  // this badge exists to separate.
+  const source = !useMemory && persisted!.trigger === 'cron' ? ' · scheduled' : '';
+
+  const days =
+    status?.seconds_since_success != null
+      ? Math.floor(status.seconds_since_success / 86_400)
+      : null;
 
   return (
     <div
       className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border ${tone.border} text-xs font-mono`}
-      title={`${lastSync.summary}${
-        lastSync.status !== null ? ` (HTTP ${lastSync.status})` : ' (no response)'
-      } — ${new Date(lastSync.at).toLocaleString()}`}
+      title={
+        (stale
+          ? days === null
+            ? 'No sync has ever completed successfully. '
+            : `No successful sync for ${days} day${days === 1 ? '' : 's'}. `
+          : '') + `${summary} — ${new Date(at).toLocaleString()}`
+      }
     >
       <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
       <span className="text-slate-300">IBKR Sync:</span>
       <span className={`${tone.text} font-semibold`}>
-        {at} ET{code}
+        {clock} ET{code}
+        {source}
       </span>
-      <span className="text-obsidian-muted">{lastSync.summary}</span>
+      <span className="text-obsidian-muted">
+        {stale ? (days === null ? 'never succeeded' : `stale · ${days}d`) : summary}
+      </span>
     </div>
   );
 };

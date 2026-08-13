@@ -705,13 +705,59 @@ export interface ManualTradePayload {
   thesis?: string | null;
 }
 
+/** What set a sync off. Constrained in the database (migration 034). */
+export type SyncTrigger = 'manual' | 'cron';
+
 /**
- * Outcome of the most recent broker sync attempt.
+ * How a sync ended. `partial` is its own outcome, not a flavour of success:
+ * some Flex queries did not return, so the ledger is short of fills that exist
+ * at the broker.
+ */
+export type SyncOutcome = 'success' | 'partial' | 'error';
+
+/** One recorded sync run (GET /api/sync/runs/latest). */
+export interface SyncRun {
+  id: string;
+  started_at: string; // ISO 8601
+  finished_at: string | null;
+  trigger: SyncTrigger | string;
+  outcome: SyncOutcome | string;
+  executions_parsed: number;
+  trades_created: number;
+  positions_matched: number;
+  plans_attached: number;
+  /** Only set when the run raised. */
+  error: string | null;
+}
+
+/**
+ * The server's view of syncing, which is the only one that can see a run this
+ * browser did not perform.
+ *
+ * `last_success_at` is deliberately separate from `latest`: the newest run and
+ * the newest run that WORKED are different questions, and only the second
+ * answers "is the ledger current". A week of failing nightly runs has a very
+ * recent `latest`, which is exactly how a broken schedule keeps looking busy.
+ */
+export interface SyncStatus {
+  latest: SyncRun | null;
+  last_success_at: string | null;
+  /** Computed server-side, so the client is not trusting its own clock. */
+  seconds_since_success: number | null;
+}
+
+/**
+ * Outcome of the most recent broker sync attempt, as performed BY THIS TAB.
  *
  * Held in the React Query cache rather than component state so the header
  * badge and the sync button read the same fact. Local state in the button
  * could not be seen by the badge, which is why the badge used to claim
  * "CONNECTED" unconditionally — a status that was never checked.
+ *
+ * In-memory and per-session by nature, which is its limit: it cannot see a
+ * scheduled run, or one performed in another tab. `SyncStatus` above is the
+ * durable record; this remains the source for the detail toast, because it
+ * carries the full `IngestResult` the moment the run returns.
  */
 export interface LastSyncState {
   /** ISO timestamp of the attempt, successful or not. */

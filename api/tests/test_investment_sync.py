@@ -257,25 +257,38 @@ def test_the_sync_never_writes_a_trading_table():
 
 def test_the_trading_ingest_does_not_know_this_exists():
     """The other direction, and the one that would actually break the journal:
-    ingest_ibkr must be unable to reach investment code."""
+    the trading ingest must be unable to reach investment code.
+
+    BOTH halves are checked. The endpoint was split in two when sync runs
+    started being recorded -- `ingest_ibkr` is now a wrapper and
+    `_run_ibkr_ingest` holds the pipeline -- and checking only the name the
+    route is registered under would leave this passing on a thirty-line
+    function while the six hundred lines it delegates to went unexamined. A
+    guardrail that survives a refactor by no longer guarding anything is worse
+    than one that fails.
+    """
     import ast
     import inspect
 
     import main
 
     tree = ast.parse(inspect.getsource(main))
-    ingest = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "ingest_ibkr"
-    )
-
-    referenced = {
-        n.id for n in ast.walk(ingest) if isinstance(n, ast.Name)
-    } | {
-        n.attr for n in ast.walk(ingest) if isinstance(n, ast.Attribute)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
     }
-    for forbidden in ("InvestmentTransaction", "InvestmentHolding",
-                      "investment_sync", "sync_investment_transactions"):
-        assert forbidden not in referenced, (
-            f"ingest_ibkr must not reference {forbidden}"
-        )
+
+    for name in ("ingest_ibkr", "_run_ibkr_ingest"):
+        assert name in functions, f"{name} has been renamed; update this test"
+        node = functions[name]
+        referenced = {
+            n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+        } | {
+            n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)
+        }
+        for forbidden in ("InvestmentTransaction", "InvestmentHolding",
+                          "investment_sync", "sync_investment_transactions"):
+            assert forbidden not in referenced, (
+                f"{name} must not reference {forbidden}"
+            )

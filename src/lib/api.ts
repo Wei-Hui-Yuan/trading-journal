@@ -31,6 +31,7 @@ import type {
   StrategyCreatePayload,
   StrategyDeleteResult,
   StrategyUpdatePayload,
+  SyncStatus,
   Trade,
   TradeDeleteResult,
   TradeAnnotationPayload,
@@ -625,6 +626,17 @@ export async function ingestIBKR(): Promise<IngestResult> {
     // time does not belong in a synchronous round trip.
     timeout: 300_000,
   });
+  return data;
+}
+
+/**
+ * GET /api/sync/runs/latest — the last sync, and the last one that worked.
+ *
+ * The durable counterpart to `LastSyncState`, which only ever knew about syncs
+ * this tab performed and so could not see a scheduled run at all.
+ */
+export async function getSyncStatus(): Promise<SyncStatus> {
+  const { data } = await apiClient.get<SyncStatus>('/sync/runs/latest');
   return data;
 }
 
