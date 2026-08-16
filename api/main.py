@@ -945,6 +945,26 @@ app.add_middleware(
     # present on the wire and invisible to the page, which turns any attempt to
     # debug a caching problem from the client into guesswork.
     expose_headers=["ETag"],
+    # Starlette's default is 600, and this deployment cannot afford it. Every
+    # request the app makes carries Authorization and a JSON content type, both
+    # non-simple, so EVERY endpoint URL is preflighted -- and the preflight is a
+    # full round trip that must complete before the real request is even sent.
+    # The API runs in us-central1 against a browser in Singapore, measured at
+    # ~218ms one way, so each expiry costs roughly half a second of nothing
+    # happening, per endpoint, on a tab left open for ten minutes.
+    #
+    # A day is the ceiling Firefox honours; Chrome clamps to 7200 and Safari
+    # lower still. Asking for more than a browser allows is not an error, it is
+    # simply clamped -- so this reads as "cache it for as long as you are
+    # willing" rather than as a literal 24 hours.
+    #
+    # What staleness buys: a preflight decision, not a response and not an
+    # authorisation. An origin dropped from CORS_ALLOW_ORIGINS keeps working in
+    # an already-open tab until its cached decision expires. Every route still
+    # demands a valid Clerk JWT on the actual request, which no preflight cache
+    # touches, so the exposure is one already-loaded page continuing to reach an
+    # API that would still refuse it without credentials.
+    max_age=86400,
 )
 
 

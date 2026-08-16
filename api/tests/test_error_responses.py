@@ -70,6 +70,37 @@ def test_cors_middleware_is_outermost():
     )
 
 
+def test_preflights_are_cached_for_longer_than_the_default(client):
+    """Every request here is preflighted, and each one is a full round trip.
+
+    Authorization plus a JSON content type are both non-simple headers, so no
+    request the app makes qualifies for the simple-request exemption -- the
+    browser asks permission for every endpoint URL before sending anything.
+    Starlette's 600s default means a tab open for ten minutes pays that again,
+    per endpoint, across a link measured at ~218ms each way.
+
+    Asserted as "above the default" rather than as the literal number, because
+    the value is a ceiling browsers clamp to their own maximum anyway (Chrome
+    7200, Firefox 86400). Pinning the exact figure would fail on a deliberate
+    retune; this fails only if the setting is dropped and the default returns.
+    """
+    response = client.options(
+        "/api/round-trips",
+        headers={
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert response.status_code == 200
+    max_age = response.headers.get("access-control-max-age")
+    assert max_age is not None, "preflight carried no Access-Control-Max-Age"
+    assert int(max_age) > 600, (
+        f"preflight cache is {max_age}s -- Starlette's default is 600 and the "
+        "explicit max_age has been lost"
+    )
+
+
 def test_health_reports_the_database_failure_class():
     """`unreachable` alone does not say why. The exception class does.
 
