@@ -104,6 +104,58 @@ const EditableNumber: React.FC<{
   );
 };
 
+/**
+ * The ticker field, committing on blur for the same reasons as the numbers.
+ *
+ * This was bound straight to server state and PATCHed on every `onChange`,
+ * which made typing genuinely lossy rather than merely chatty. Each keystroke
+ * fired a mutation whose success invalidated the list, so React re-rendered
+ * with the ticker the server still had and reset the input to it — the
+ * character just typed vanished until the round trip landed, and the next one
+ * was typed into a field that was about to be overwritten again. Four letters
+ * cost eight requests and rarely produced the four letters.
+ *
+ * Normalising on commit rather than per keystroke matters too: `.trim()` on
+ * every change meant a space could never be typed at all, and upper-casing
+ * mid-edit fought the caret. The CSS already renders the field uppercase, so
+ * what is shown never changes — only what is stored, and when.
+ */
+const EditableTicker: React.FC<{
+  value: string;
+  onCommit: (next: string) => void;
+  maxLength?: number;
+  className?: string;
+}> = ({ value, onCommit, maxLength, className }) => {
+  const [text, setText] = useState(value);
+
+  useEffect(() => {
+    setText(value);
+  }, [value]);
+
+  const commit = () => {
+    const next = text.trim().toUpperCase();
+    // Show what was actually saved, not the keystrokes that produced it.
+    setText(next);
+    if (next !== value) onCommit(next);
+  };
+
+  return (
+    <input
+      type="text"
+      value={text}
+      maxLength={maxLength}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        // Enter is the other "I am done here" signal a text field gets for
+        // free; blurring routes it through the one commit path.
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+      className={className}
+    />
+  );
+};
+
 /** What one saved note computes to, using the exact same library the Plan
  * modal does — the scratchpad and a real plan must never disagree about
  * what a given entry/stop/quantity means. */
@@ -166,12 +218,9 @@ const ScratchpadRow: React.FC<{ entry: SizingScratchpadEntry }> = ({ entry }) =>
   return (
     <div className="rounded-lg border border-obsidian-border bg-obsidian-bg/40 p-3">
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
-        <input
-          type="text"
+        <EditableTicker
           value={entry.ticker}
-          onChange={(e) =>
-            patch({ ticker: e.target.value.trim().toUpperCase() })
-          }
+          onCommit={(ticker) => patch({ ticker })}
           maxLength={10}
           className={`${inputClass} font-sans font-semibold uppercase`}
         />
