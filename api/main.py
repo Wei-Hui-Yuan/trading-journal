@@ -7495,6 +7495,27 @@ async def clear_valuation_override(
 # ---------------------------------------------------------------------------
 
 
+# How many quotes to ask FMP for at once.
+#
+# The refresh was strictly sequential, which at this book's size is 25 round
+# trips end to end -- 5 to 12 seconds of somebody watching a spinner for work
+# that has no ordering constraint whatsoever.
+#
+# Bounded rather than unbounded, for one specific reason. The 429 this can earn
+# is documented in market_data._get as a spent DAILY allowance, and concurrency
+# cannot change that: the same 25 calls get made either way. What a wide fan-out
+# could newly trip is a per-second ceiling that 25 paced calls never approach.
+# Four in flight is no more than a browser opens to a single host, and it is
+# worth 3x here: 25 holdings at a 300ms call measure 8.2s sequentially against
+# 2.7s at this limit. Four is also the ceiling on the speedup, which is the
+# trade being made -- a larger number buys progressively less and risks more.
+#
+# This is NOT the throttle in services/growth.py. That one is sequential on
+# purpose because Finviz blocks the IP -- a different provider with a different
+# failure mode, and its comment says so.
+PRICE_REFRESH_CONCURRENCY = 4
+
+
 @app.post(
     "/api/investments/refresh-prices",
     dependencies=[Depends(verify_clerk_token)],
@@ -7505,6 +7526,10 @@ async def refresh_prices(session: AsyncSession = Depends(get_session)):
     Separate from the fundamentals refresh because the two go stale at
     completely different rates, and folding them together would spend four
     calls per holding to learn a price.
+
+    Fetched concurrently, applied sequentially. The split is deliberate: an
+    AsyncSession is not safe under concurrent use, so the ORM objects are
+    touched only after every network call has landed, in holding order.
     """
     from services import market_data  # noqa: PLC0415 - network at request time
 
@@ -7520,25 +7545,56 @@ async def refresh_prices(session: AsyncSession = Depends(get_session)):
 
     import httpx  # noqa: PLC0415
 
-    async with httpx.AsyncClient(timeout=market_data.TIMEOUT) as client:
-        for holding in holdings:
+    limit = asyncio.Semaphore(PRICE_REFRESH_CONCURRENCY)
+    # Mirrors `finviz_open` in services/growth.py. Once the provider says the
+    # allowance is gone, every symbol still queued would earn an identical 429,
+    # so they stop asking instead of each collecting the same failure. This is
+    # what the `break` used to do, and the flag is how that intent survives the
+    # calls no longer being sequential -- checked after acquiring the semaphore,
+    # so at most PRICE_REFRESH_CONCURRENCY - 1 calls are already in flight when
+    # the limit is discovered.
+    allowance_open = True
+
+    async def quote_for(ticker: str, client: httpx.AsyncClient):
+        """A Quote, the error that explains its absence, or None for skipped.
+
+        Never raises: one dead symbol must not cost the others their prices.
+        """
+        nonlocal allowance_open
+        async with limit:
+            if not allowance_open:
+                return None
             try:
-                quote = await market_data.fetch_quote(holding.ticker, client=client)
+                return await market_data.fetch_quote(ticker, client=client)
             except market_data.MarketDataError as exc:
-                # One dead symbol must not cost the other thirteen their
-                # prices, so this is collected rather than raised.
-                failures.append({"ticker": holding.ticker, "detail": str(exc)})
                 if exc.status == 429:
-                    break
-                continue
-            holding.current_price = quote.price
-            holding.price_updated_at = now
-            # Only overwritten when the provider actually sent one, so a
-            # response missing the field leaves the last known move in place
-            # rather than blanking a populated column.
-            if quote.day_change_pct is not None:
-                holding.day_change_pct = quote.day_change_pct
-            updated += 1
+                    allowance_open = False
+                return exc
+
+    async with httpx.AsyncClient(timeout=market_data.TIMEOUT) as client:
+        # gather preserves input order, so zipping back onto `holdings` below
+        # pairs every outcome with the symbol that produced it.
+        outcomes = await asyncio.gather(
+            *(quote_for(h.ticker, client) for h in holdings)
+        )
+
+    for holding, outcome in zip(holdings, outcomes):
+        if outcome is None:
+            # Never asked -- the allowance was already spent. Deliberately
+            # counted as neither updated nor failed, exactly as the sequential
+            # `break` left the symbols it never reached.
+            continue
+        if isinstance(outcome, market_data.MarketDataError):
+            failures.append({"ticker": holding.ticker, "detail": str(outcome)})
+            continue
+        holding.current_price = outcome.price
+        holding.price_updated_at = now
+        # Only overwritten when the provider actually sent one, so a
+        # response missing the field leaves the last known move in place
+        # rather than blanking a populated column.
+        if outcome.day_change_pct is not None:
+            holding.day_change_pct = outcome.day_change_pct
+        updated += 1
 
     await session.commit()
     return {"updated": updated, "failed": len(failures), "failures": failures}
