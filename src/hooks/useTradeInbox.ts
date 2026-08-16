@@ -226,6 +226,15 @@ export function useRoundTrips(filters: RoundTripFilters) {
         limit: ROUND_TRIP_PAGE_SIZE,
         offset: pageParam,
       }),
+    // Every filter and every debounced search term is its own cache key, so
+    // without this each one starts empty and `isLoading` flips true — which
+    // unmounts the whole ledger, including the search box being typed into.
+    // The caret went with it, so the second character of a ticker landed
+    // nowhere. Holding the previous rows keeps the controls mounted and makes
+    // filtering a swap rather than a blank screen.
+    //
+    // Same guard, and same reason, as useDashboardStats below.
+    placeholderData: (previous) => previous,
     initialPageParam: 0,
     getNextPageParam: (lastPage, _all, lastOffset) => {
       // Counted over CLOSED rows only. The first page also carries open

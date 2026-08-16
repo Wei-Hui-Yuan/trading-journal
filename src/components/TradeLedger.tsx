@@ -730,6 +730,11 @@ export const TradeLedger: React.FC = () => {
     hasNextPage,
     fetchNextPage,
     isFetchingNextPage,
+    // True exactly while the rows on screen belong to the PREVIOUS filter.
+    // The ledger no longer blanks between filters, which means without a
+    // signal here it would show stale rows as though they were results — and
+    // a round trip to the API is slow enough to read one and believe it.
+    isPlaceholderData: isSwappingFilter,
   } = useRoundTrips(filters);
   // Independent of the filter above — see the hook.
   const openCount = useOpenRoundTripCount();
@@ -857,8 +862,14 @@ export const TradeLedger: React.FC = () => {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter by ticker…"
-            className={`${fieldClass} pl-8`}
+            className={`${fieldClass} pl-8 pr-8`}
           />
+          {isSwappingFilter && (
+            <Loader2
+              aria-hidden
+              className="absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin text-obsidian-muted"
+            />
+          )}
         </div>
         <div className="flex overflow-hidden rounded-lg border border-obsidian-border">
           {(['all', 'open', 'closed'] as const).map((f) => (
@@ -913,7 +924,12 @@ export const TradeLedger: React.FC = () => {
           No trades match this filter.
         </p>
       ) : (
-        <div className="space-y-2">
+        <div
+          aria-busy={isSwappingFilter}
+          className={`space-y-2 transition-opacity duration-150 ${
+            isSwappingFilter ? 'opacity-40' : 'opacity-100'
+          }`}
+        >
           {visible.map((rt) => {
             const isExpanded = expanded === rt.key;
             // Built once per render rather than per row. `strategies.find()`
