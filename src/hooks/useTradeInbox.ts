@@ -441,17 +441,57 @@ export function useSyncBroker() {
   return useMutation<IngestResult, Error, void>({
     mutationFn: ingestIBKR,
     onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
-      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
-      // A sync promotes fills into trades and re-runs FIFO matching, so the
-      // ledger and every analytics card built on it go stale the same way an
-      // annotation or a manual entry already does.
-      queryClient.invalidateQueries({ queryKey: queryKeys.trades });
-      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
-      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
-      // The server just recorded this run, so the durable record the badge
-      // reads is now a version behind.
+      // Unconditional: the server wrote a sync_runs row on every path, so the
+      // durable record the header badge reads is a version behind whatever
+      // else did or did not happen.
       queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus });
+
+      // Everything below is derived from the ledger, and the common sync
+      // changes none of it. IBKR's rolling window re-reports fills already
+      // imported, so the ordinary run -- and every scheduled one on a day
+      // without trading -- promotes nothing and matches nothing, while still
+      // refetching the app's most expensive queries. `roundTrips` is an
+      // infinite query, so invalidating it refetches EVERY loaded page in
+      // sequence; `dashboardStats` and `advancedMetrics` are prefixes over one
+      // entry per timeframe window visited.
+      //
+      // Each clause is a distinct way the ledger can move, listed separately
+      // rather than collapsed because the reasoning differs:
+      //
+      //   symbols_touched      -- positions, fills and legs rebuilt for these
+      //                           tickers. Covers new fills AND recovered ones.
+      //   trades_created       -- new rows in the ledger itself.
+      //   plans_attached       -- a plan bound to a fill; implied by the above
+      //                           today, kept because that is an implication
+      //                           rather than a guarantee.
+      //   positions_removed    -- a backdated fill re-partitioned the FIFO
+      //                           queue and a round trip stopped existing.
+      //   broker figures       -- the one that is NOT implied by any of them:
+      //                           refreshed cost basis moves open exposure via
+      //                           _acquisition_premium in list_round_trips
+      //                           with every counter above still zero.
+      //
+      // Absent `broker_figures_refreshed` means an API older than the field,
+      // and the honest reading of "I do not know" is "assume it did" -- which
+      // is the previous behaviour, so a browser deployed ahead of the API
+      // stays correct rather than quietly skipping a refresh.
+      const ledgerMayHaveChanged =
+        result.symbols_touched.length > 0 ||
+        result.trades_created > 0 ||
+        (result.plans_attached ?? 0) > 0 ||
+        (result.positions_removed ?? 0) > 0 ||
+        result.broker_figures_refreshed !== false;
+
+      if (ledgerMayHaveChanged) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.pendingPositions });
+        queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+        // A sync promotes fills into trades and re-runs FIFO matching, so the
+        // ledger and every analytics card built on it go stale the same way an
+        // annotation or a manual entry already does.
+        queryClient.invalidateQueries({ queryKey: queryKeys.trades });
+        queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+        queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      }
 
       // A run where some Flex queries did not return is NOT a success. IBKR
       // rate-limits report generation per token, and its cooldown outlasts a

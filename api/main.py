@@ -1087,6 +1087,17 @@ class IngestResult(BaseModel):
     # Worth its own line because it is the moment the two halves of the
     # journal meet: the plan you wrote, and what the broker actually did.
     plans_attached: int = 0
+    # True when step 3b actually wrote refreshed broker figures onto the
+    # ledger. Reported because it is the ONE write in this pipeline that can
+    # move a displayed number while every fill counter stays zero and
+    # `symbols_touched` stays empty: `broker_cost_basis` feeds
+    # `_acquisition_premium`, and list_round_trips uses that for open exposure.
+    #
+    # A caller deciding whether a sync changed anything -- the browser's cache
+    # invalidation does exactly this -- would otherwise be right on every run
+    # except the one where IBKR re-lots, which is precisely the run where being
+    # wrong shows a stale figure.
+    broker_figures_refreshed: bool = False
     # Round trips that existed before this sync and no longer survive
     # re-matching, because a fill arrived dated earlier than ones already
     # stored and re-partitioned the FIFO queue. Nearly always zero; when it is
@@ -1308,6 +1319,14 @@ async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
     # 023, or before the Flex query exposed the field, acquire their broker
     # figure the next time a statement covers them. IBKR also re-lots
     # occasionally, so the value is refreshed rather than written once.
+    # Reported on the result so the browser can tell a sync that changed
+    # something from one that did not. This is the ONLY write in the pipeline
+    # that can move a displayed figure while leaving `symbols_touched` empty:
+    # `broker_cost_basis` feeds `_acquisition_premium`, which list_round_trips
+    # uses for open exposure. Inferring "nothing changed" from the fill counts
+    # alone would therefore be wrong on exactly the run where IBKR re-lots.
+    broker_figures_refreshed = False
+
     broker_pnl = [
         {"tid": e.transaction_id, "pnl": e.fifo_pnl_realized, "cost": e.broker_cost}
         for e in executions
@@ -1411,6 +1430,7 @@ async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
         ).first() is not None
 
         if stale_row_exists:
+            broker_figures_refreshed = True
             await session.execute(
                 update(Trade.__table__)
                 .where(matches_its_fill, broker_sent_a_figure, ledger_disagrees)
@@ -1599,6 +1619,7 @@ async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
         flex_failures=_read_flex_failures(query_failures),
         suppressed_skipped=resurrected,
         plans_attached=plans_attached,
+        broker_figures_refreshed=broker_figures_refreshed,
         positions_removed=positions_removed,
         reviews_discarded=reviews_discarded,
         symbols_recovered=recovered,
