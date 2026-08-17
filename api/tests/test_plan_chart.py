@@ -218,3 +218,79 @@ def test_the_round_trip_says_whether_its_plan_has_a_chart():
     of requesting it for every planned trade and taking a 404 to find out."""
     assert "plan_has_chart" in main.RoundTripOut.model_fields
     assert main.RoundTripOut.model_fields["plan_has_chart"].default is False
+
+
+# ---------------------------------------------------------------------------
+# The HTTP client the bucket is reached through
+# ---------------------------------------------------------------------------
+
+
+def test_every_call_shares_one_http_client():
+    """The point of the change: a chart fetch must not renegotiate TLS.
+
+    Each of upload/download/delete used to build its own AsyncClient and close
+    it again, so every chart byte paid DNS + TCP + TLS to Supabase Storage
+    first. That is several round trips, and on this deployment they cross the
+    Pacific -- the API runs in us-central1 and the bucket is in
+    ap-southeast-1.
+    """
+    storage._client = None
+    first = storage._http()
+    second = storage._http()
+
+    assert first is second, (
+        "storage built a second client, so the connection and its TLS session "
+        "are not being reused between calls"
+    )
+    assert not first.is_closed
+
+
+def test_no_function_builds_its_own_client_any_more():
+    """Stated against the source, because a reintroduced `AsyncClient(` in one
+    of the three would silently restore the per-call handshake while this
+    module's other tests all still passed."""
+    for name in ("upload", "download", "delete"):
+        source = inspect.getsource(getattr(storage, name))
+        assert "AsyncClient(" not in source, (
+            f"storage.{name} constructs its own client instead of using _http()"
+        )
+        assert "_http()" in source, f"storage.{name} does not use the shared client"
+
+
+def test_a_closed_client_is_replaced_rather_than_reused():
+    """`aclose` runs in the app's lifespan shutdown. Anything that reaches
+    storage afterwards -- a test suite, a reload -- must get a working client
+    rather than a ClosedError from a client nobody can reopen."""
+    import asyncio
+
+    async def scenario():
+        storage._client = None
+        first = storage._http()
+        await storage.aclose()
+        assert storage._client is None
+        replacement = storage._http()
+        assert replacement is not first
+        assert not replacement.is_closed
+        await storage.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_closing_a_client_that_was_never_built_is_harmless():
+    """A deployment with no Storage credentials never calls _http(), and
+    lifespan shutdown must not care."""
+    import asyncio
+
+    storage._client = None
+    asyncio.run(storage.aclose())
+    assert storage._client is None
+
+
+def test_the_app_closes_the_client_on_shutdown():
+    """Otherwise the pooled connection outlives the process that owned it, and
+    the leak is invisible until a container runs long enough to notice."""
+    source = inspect.getsource(main.lifespan)
+    assert "storage.aclose()" in source, (
+        "lifespan does not release the storage client, so its pooled "
+        "connections are never closed"
+    )

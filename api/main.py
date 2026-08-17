@@ -903,6 +903,15 @@ async def lifespan(app: FastAPI):
     await _warm_connection_pool()
     yield
     await engine.dispose()
+    # The chart bucket's HTTP client is shared for the life of the process, for
+    # the same reason the database pool is: a fresh TLS handshake to Supabase per
+    # call is the dominant cost of serving a chart from us-central1. Imported
+    # here rather than at module scope so a deployment with no Storage
+    # credentials still boots -- services.storage reads them per call, never at
+    # import, and closing a client that was never built is a no-op.
+    from services import storage  # noqa: PLC0415
+
+    await storage.aclose()
 
 
 app = FastAPI(title="Trading Journal API", lifespan=lifespan)
