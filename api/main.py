@@ -1330,21 +1330,95 @@ async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
         )
         # And onto the ledger, for rows that already existed. New rows carry it
         # from the promotion below; this catches everything older.
-        await session.execute(
-            update(Trade.__table__)
-            .where(
-                Trade.__table__.c.ibkr_exec_id
-                == "IBKR-" + IBKRExecution.__table__.c.transaction_id,
-                or_(
-                    IBKRExecution.__table__.c.fifo_pnl_realized.is_not(None),
-                    IBKRExecution.__table__.c.broker_cost.is_not(None),
-                ),
-            )
-            .values(
-                broker_realized_pnl=IBKRExecution.__table__.c.fifo_pnl_realized,
-                broker_cost_basis=IBKRExecution.__table__.c.broker_cost,
-            )
+        #
+        # Issued only when it would actually change something, and the check is
+        # a SELECT rather than a narrower UPDATE because of how the invalidation
+        # it triggers works. `trades` carries the statement-level
+        # trades_bump_data_version trigger from migration 030, and a
+        # statement-level trigger in Postgres fires once per STATEMENT whether
+        # it touched a thousand rows or none -- verified against this database:
+        # `UPDATE trades ... WHERE 1=0` reports `UPDATE 0` and still increments
+        # the counter. So adding the IS DISTINCT FROM guard below to the UPDATE
+        # alone would write fewer rows and invalidate exactly as much; the
+        # statement has to not be ISSUED. Reads fire no trigger, hence the
+        # SELECT.
+        #
+        # What that counter costs when it moves: it is the ETag validator for
+        # list_round_trips, /api/analytics/dashboard and /api/analytics/advanced,
+        # so bumping it throws away every browser-cached analytics payload and
+        # forces the next request to rebuild from a full table scan. An
+        # unchanged sync -- the common case, and every scheduled one on a quiet
+        # day -- was doing exactly that, daily.
+        #
+        # The three predicates are built once and shared by both statements on
+        # purpose. If the SELECT and the UPDATE could drift apart, the guard
+        # would start answering a different question than the one the write
+        # asks, and the failure would be silent in both directions.
+        matches_its_fill = (
+            Trade.__table__.c.ibkr_exec_id
+            == "IBKR-" + IBKRExecution.__table__.c.transaction_id
         )
+        broker_sent_a_figure = or_(
+            IBKRExecution.__table__.c.fifo_pnl_realized.is_not(None),
+            IBKRExecution.__table__.c.broker_cost.is_not(None),
+        )
+        # IS DISTINCT FROM rather than != because both sides are nullable, and
+        # `NULL != NULL` is NULL, not true -- a plain inequality would treat
+        # "both absent" as a difference and rewrite the row forever.
+        #
+        # Compared at the LEDGER's scale, which is the part that is easy to get
+        # wrong and silently ineffective. The two sides are not the same type:
+        # fifo_pnl_realized is NUMERIC(14,6) and broker_realized_pnl is
+        # NUMERIC(12,4), so assigning one to the other ROUNDS it. Comparing the
+        # raw values therefore reports a difference on every row that has ever
+        # been written -- the ledger holds -7.4052 because it rounded staging's
+        # -7.405154, and will round it again to the same value next time. On
+        # this database that was 175 of 348 rows disagreeing permanently, which
+        # would have made the guard below fire on every single sync while
+        # looking entirely correct.
+        #
+        # Rounding to the destination's own scale asks the question that
+        # actually matters: would writing this change what is stored? The scale
+        # is read off the column rather than written as a literal, so a schema
+        # change cannot leave this comparison behind.
+        def _as_stored(source, destination):
+            scale = destination.type.scale
+            return source if scale is None else func.round(source, scale)
+
+        ledger_disagrees = or_(
+            Trade.__table__.c.broker_realized_pnl.is_distinct_from(
+                _as_stored(
+                    IBKRExecution.__table__.c.fifo_pnl_realized,
+                    Trade.__table__.c.broker_realized_pnl,
+                )
+            ),
+            Trade.__table__.c.broker_cost_basis.is_distinct_from(
+                _as_stored(
+                    IBKRExecution.__table__.c.broker_cost,
+                    Trade.__table__.c.broker_cost_basis,
+                )
+            ),
+        )
+
+        stale_row_exists = (
+            await session.execute(
+                select(1)
+                .select_from(Trade.__table__)
+                .join(IBKRExecution.__table__, matches_its_fill)
+                .where(broker_sent_a_figure, ledger_disagrees)
+                .limit(1)
+            )
+        ).first() is not None
+
+        if stale_row_exists:
+            await session.execute(
+                update(Trade.__table__)
+                .where(matches_its_fill, broker_sent_a_figure, ledger_disagrees)
+                .values(
+                    broker_realized_pnl=IBKRExecution.__table__.c.fifo_pnl_realized,
+                    broker_cost_basis=IBKRExecution.__table__.c.broker_cost,
+                )
+            )
 
     # --- 4: promote into the trades ledger --------------------------------
     #
