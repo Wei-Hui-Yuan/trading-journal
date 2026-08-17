@@ -29,10 +29,14 @@ export const sizingKeys = {
 /**
  * Every note from the last three days, newest first.
  *
- * `staleTime: 0` (the default) is deliberate here, unlike most of this app's
- * reads: a note is worth re-fetching on every focus, because the whole point
- * of this list is that it is being edited across several quick visits while a
- * price is watched, not read once and left.
+ * Inherits the app-wide defaults from QueryProvider — `staleTime: 30_000` and
+ * `refetchOnWindowFocus: false`. This comment used to claim the opposite, that
+ * `staleTime: 0` was deliberate so a note would re-fetch on every focus;
+ * neither half was true, and the behaviour it described is the slower one.
+ *
+ * The defaults are right for this list anyway. It is edited from one tab at a
+ * time, and every mutation below invalidates the root, so a commit refreshes
+ * what changed without every window focus paying for a round trip.
  */
 export function useSizingScratchpad() {
   return useQuery<SizingScratchpadEntry[], Error>({
