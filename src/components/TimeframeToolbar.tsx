@@ -12,7 +12,7 @@ import {
   useUpdateTimeframe,
 } from '@/hooks/useTradeInbox';
 import type {
-  DashboardWindow,
+  ToolbarWindow,
   TimeframePreset,
   TimeframePresetName,
   TimeframeSelection,
@@ -233,8 +233,14 @@ const TimeframeEditor: React.FC<EditorProps> = ({
 interface TimeframeToolbarProps {
   selection: TimeframeSelection;
   onSelect: (selection: TimeframeSelection) => void;
-  /** Echoed back by the API — what the figures on screen actually cover. */
-  window?: DashboardWindow;
+  /**
+   * Echoed back by the API — what the figures on screen actually cover.
+   *
+   * Typed as the narrow `ToolbarWindow` rather than `DashboardWindow` so the
+   * analytics page can pass its own window too. The dashboard's satisfies this
+   * structurally, so nothing there changes.
+   */
+  window?: ToolbarWindow;
   /** True while a window switch is in flight, so the pills can say so. */
   isFetching?: boolean;
 }

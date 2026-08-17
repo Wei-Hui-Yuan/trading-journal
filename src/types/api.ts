@@ -433,6 +433,21 @@ export type TimeframeSelection =
   | { kind: 'custom'; id: string; start_date: string; end_date: string };
 
 /**
+ * What the timeframe toolbar needs in order to label itself.
+ *
+ * Kept to exactly the fields it renders so that any windowed payload can
+ * satisfy it — the dashboard's fuller `DashboardWindow` does structurally,
+ * and the advanced-metrics payload provides these and nothing more rather
+ * than padding out curve-specific fields it has no answer for.
+ */
+export interface ToolbarWindow {
+  start_date: string | null;
+  end_date: string | null;
+  closed_trades_in_window: number;
+  closed_trades_total: number;
+}
+
+/**
  * The span a dashboard payload actually covers, echoed back by the API.
  *
  * Read rather than assumed: the client names a preset, the server decides what
@@ -1249,6 +1264,15 @@ export interface AdvancedMetrics {
   discipline_breakdown: DisciplineBreakdown[];
   compliance_buckets: ComplianceBucket[];
   strategy_breakdown: StrategyBreakdown[];
+  /**
+   * The span this payload covers, echoed back by the server.
+   *
+   * Narrower than `DashboardWindow` on purpose: `truncated` and `max_days`
+   * describe the equity curve's clamp, and there is no curve on this payload.
+   * Optional because an in-process caller may ask for the metrics with no
+   * window at all.
+   */
+  window?: ToolbarWindow;
 }
 
 /**

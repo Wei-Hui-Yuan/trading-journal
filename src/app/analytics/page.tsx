@@ -19,7 +19,15 @@ import {
   usePendingPositions,
   useReviewPosition,
 } from '@/hooks/useTradeInbox';
-import type { AdvancedMetrics, Position } from '@/types/api';
+import {
+  DEFAULT_SELECTION,
+  TimeframeToolbar,
+} from '@/components/TimeframeToolbar';
+import type {
+  AdvancedMetrics,
+  Position,
+  TimeframeSelection,
+} from '@/types/api';
 
 /** Common behavioural tags, offered as chips. Free text is also allowed. */
 const MISTAKE_TAGS = [
@@ -623,8 +631,19 @@ function ReviewDrawer({
 }
 
 export default function AnalyticsPage() {
-  const metricsQuery = useAdvancedMetrics();
+  // This page's OWN selection, deliberately not shared with the dashboard.
+  // The two answer different questions and get read at different times --
+  // narrowing the dashboard to YTD to check the year so far should not
+  // silently re-scope an R-distribution being studied over the last month.
+  // Local state is what keeps them independent; nothing here is persisted,
+  // for the same reason the dashboard's is not.
+  const [timeframe, setTimeframe] = useState<TimeframeSelection>(DEFAULT_SELECTION);
+
+  const metricsQuery = useAdvancedMetrics(timeframe);
   // Same hook the dashboard Trade Inbox uses -- one queue, one lifecycle.
+  // Deliberately NOT windowed: the queue is a work list, and one that hid an
+  // older unreviewed trade because of a filter set for a statistic would be
+  // worse than a long one.
   const queueQuery = usePendingPositions();
   const [selected, setSelected] = useState<Position | null>(null);
 
@@ -659,6 +678,19 @@ export default function AnalyticsPage() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+        {/* Above the KPI cards for the same reason it is on the dashboard:
+            this governs every figure below it, and a control that scopes the
+            whole page should not sit inside one panel of it. The review queue
+            at the bottom is the one thing it does not reach. */}
+        <section>
+          <TimeframeToolbar
+            selection={timeframe}
+            onSelect={setTimeframe}
+            window={m?.window}
+            isFetching={metricsQuery.isFetching}
+          />
+        </section>
+
         {/* KPI cards */}
         {metricsQuery.isPending ? (
           <div className="flex items-center justify-center py-12 text-obsidian-muted">

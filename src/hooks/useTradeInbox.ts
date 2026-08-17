@@ -150,7 +150,20 @@ export const queryKeys = {
         : (selection?.preset ?? '1Y'),
     ] as const,
   timeframes: ['timeframes'] as const,
+  // Prefix, exactly like dashboardStats above. Every window is its own entry
+  // beneath it, so the mutations that invalidate this one key still refresh
+  // all of them.
   advancedMetrics: ['advancedMetrics'] as const,
+  advancedMetricsFor: (selection?: TimeframeSelection) =>
+    [
+      'advancedMetrics',
+      selection?.kind === 'custom'
+        ? // Keyed by the dates rather than the preset id, for the same reason
+          // dashboardStatsFor is: renaming a saved window does not change what
+          // it selects, and two presets covering one range can share an entry.
+          `${selection.start_date}..${selection.end_date}`
+        : (selection?.preset ?? '1Y'),
+    ] as const,
   settings: ['settings'] as const,
   // Written by the sync mutation, read by the header badge. Not a fetched
   // resource — the cache is being used as the one place both can see.
@@ -402,10 +415,14 @@ export function useDeleteTimeframe() {
 }
 
 /** R-multiple, slippage and expectancy metrics for the Analytics tab. */
-export function useAdvancedMetrics() {
+export function useAdvancedMetrics(selection?: TimeframeSelection) {
   return useQuery<AdvancedMetrics>({
-    queryKey: queryKeys.advancedMetrics,
-    queryFn: getAdvancedMetrics,
+    queryKey: queryKeys.advancedMetricsFor(selection),
+    queryFn: () => getAdvancedMetrics(selection),
+    // A window already fetched is worth keeping on screen while another loads,
+    // so switching pills does not blank the page. Same guard, same reason, as
+    // useDashboardStats.
+    placeholderData: (previous) => previous,
   });
 }
 
