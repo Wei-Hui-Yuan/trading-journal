@@ -359,6 +359,20 @@ export interface IngestResult {
    */
   plans_attached?: number;
   /**
+   * True when the sync wrote refreshed broker figures onto existing ledger
+   * rows.
+   *
+   * The one write that can move a displayed number while every fill counter
+   * stays zero and `symbols_touched` stays empty — `broker_cost_basis` feeds
+   * the open-exposure figures on `/api/round-trips`. Anything deciding whether
+   * a sync changed something has to read this, or it will be right on every
+   * run except the one where IBKR re-lots.
+   *
+   * Optional so a browser running ahead of the API still type-checks; absent
+   * must be read as "assume it did", never as false.
+   */
+  broker_figures_refreshed?: boolean;
+  /**
    * Round trips that existed before this sync and no longer survive
    * re-matching, because a fill arrived dated earlier than ones already stored
    * and re-partitioned the FIFO queue.

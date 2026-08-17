@@ -263,6 +263,59 @@ def test_a_pnl_that_does_not_fit_the_ledger_still_settles(monkeypatch):
 
 
 @requires_db
+def test_the_result_reports_whether_broker_figures_were_written(monkeypatch):
+    """The browser gates its cache invalidation on this, so it has to be exact.
+
+    Refreshed broker figures are the only write in the pipeline that can move a
+    displayed number while every fill counter stays zero and `symbols_touched`
+    stays empty -- `broker_cost_basis` feeds `_acquisition_premium`, which
+    list_round_trips uses for open exposure. A caller inferring "nothing
+    changed" from the counts alone would be right on every run except the one
+    where IBKR re-lots.
+    """
+    async def scenario():
+        async with db_transaction() as conn:
+            now = main.datetime.now(main.timezone.utc)
+            sym = f"FLAG{uuid.uuid4().hex[:4].upper()}"
+            tid = f"cv-{uuid.uuid4().hex[:12]}"
+
+            first = [_fill(tid, sym, pnl=Decimal("10.00"), cost=Decimal("500.00"),
+                           when=now - timedelta(days=2))]
+            # Byte-identical: nothing to write.
+            same = [_fill(tid, sym, pnl=Decimal("10.00"), cost=Decimal("500.00"),
+                          when=now - timedelta(days=2))]
+            # Re-lotted: the ledger genuinely moves.
+            relotted = [_fill(tid, sym, pnl=Decimal("77.77"), cost=Decimal("501.50"),
+                              when=now - timedelta(days=2))]
+
+            _patch_ibkr(monkeypatch, [first, same, relotted])
+
+            await main._run_ibkr_ingest(session=db_session(conn))
+
+            unchanged = await main._run_ibkr_ingest(session=db_session(conn))
+            assert unchanged.broker_figures_refreshed is False, (
+                "a sync that wrote no broker figures claimed it did, so the "
+                "browser will refetch everything on every quiet day"
+            )
+            # The case the flag exists for: nothing else moved.
+            assert unchanged.symbols_touched == []
+            assert unchanged.trades_created == 0
+
+            rewritten = await main._run_ibkr_ingest(session=db_session(conn))
+            assert rewritten.broker_figures_refreshed is True, (
+                "the ledger's cost basis changed and the result did not say "
+                "so -- open exposure will render stale until something else "
+                "happens to invalidate it"
+            )
+            assert rewritten.symbols_touched == [], (
+                "precondition for this test being meaningful: no other signal "
+                "was available to notice the change"
+            )
+
+    asyncio.run(scenario())
+
+
+@requires_db
 def test_a_zero_row_update_still_fires_the_trigger():
     """The premise the guard rests on, asserted rather than assumed.
 
