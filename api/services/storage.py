@@ -104,6 +104,45 @@ def _object_url(base: str, path: str) -> str:
     return f"{base}/storage/v1/object/{BUCKET}/{path}"
 
 
+# One client for the process rather than one per call.
+#
+# All three functions below used to build an AsyncClient and tear it down again,
+# so every chart byte paid a full DNS + TCP + TLS handshake to Supabase Storage
+# before anything moved. This deployment makes that expensive twice over: the API
+# runs in us-central1 while the bucket is in ap-southeast-1, so the handshake is
+# several round trips across the Pacific -- and the image then crosses it a
+# second time reaching a browser that is also in Singapore.
+#
+# The same reasoning `_warm_connection_pool` applies to Postgres in main.py, for
+# the same reason, against the same latency.
+_client: Optional[httpx.AsyncClient] = None
+
+
+def _http() -> httpx.AsyncClient:
+    """The shared client, built on first use.
+
+    Lazily rather than at import. This module is imported while the app boots,
+    and a client constructed there would bind to whatever event loop happened to
+    be current then rather than the one that ends up serving requests.
+
+    Rebuilt if it has been closed, so a shutdown followed by more work -- which
+    is the shape of a test suite, not of production -- gets a working client
+    instead of a ClosedError.
+    """
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=TIMEOUT)
+    return _client
+
+
+async def aclose() -> None:
+    """Release the shared client. Called from the app's lifespan shutdown."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+
+
 async def upload(path: str, data: bytes, content_type: str) -> None:
     """Write bytes to `path`, replacing whatever was there.
 
@@ -115,17 +154,16 @@ async def upload(path: str, data: bytes, content_type: str) -> None:
     """
     base, key = _config()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.post(
-                _object_url(base, path),
-                content=data,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": content_type,
-                    "x-upsert": "true",
-                    "Cache-Control": "max-age=31536000",
-                },
-            )
+        response = await _http().post(
+            _object_url(base, path),
+            content=data,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": content_type,
+                "x-upsert": "true",
+                "Cache-Control": "max-age=31536000",
+            },
+        )
     except httpx.HTTPError as exc:
         raise StorageError(f"Could not reach Supabase Storage: {exc}") from exc
 
@@ -151,11 +189,10 @@ async def download(path: str) -> StoredObject:
     """Read the object back, for the API to serve to the browser."""
     base, key = _config()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.get(
-                _object_url(base, path),
-                headers={"Authorization": f"Bearer {key}"},
-            )
+        response = await _http().get(
+            _object_url(base, path),
+            headers={"Authorization": f"Bearer {key}"},
+        )
     except httpx.HTTPError as exc:
         raise StorageError(f"Could not reach Supabase Storage: {exc}") from exc
 
@@ -183,11 +220,10 @@ async def delete(path: str) -> None:
     """
     base, key = _config()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.delete(
-                _object_url(base, path),
-                headers={"Authorization": f"Bearer {key}"},
-            )
+        response = await _http().delete(
+            _object_url(base, path),
+            headers={"Authorization": f"Bearer {key}"},
+        )
     except httpx.HTTPError as exc:
         raise StorageError(f"Could not reach Supabase Storage: {exc}") from exc
 
