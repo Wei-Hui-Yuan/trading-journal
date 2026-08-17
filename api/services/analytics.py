@@ -993,6 +993,12 @@ class ReviewedTrade:
     # is itself worth seeing.
     strategy: Optional[str] = None
     entry_time: Optional[datetime] = None
+    # What the timeframe filter dates this trade by. Exit rather than entry, so
+    # a window means the same set of trades here as it does on the dashboard --
+    # `filter_by_exit_window` selects round trips the same way, and two pages
+    # disagreeing about which trades a window contains is the confusion this
+    # field exists to prevent.
+    exit_time: Optional[datetime] = None
 
 
 def compute_r_multiple(trade: ReviewedTrade) -> Optional[float]:
@@ -1347,6 +1353,38 @@ def compute_strategy_breakdown(
     return out
 
 
+def filter_trades_by_exit_window(
+    trades: Iterable[ReviewedTrade], window: Window
+) -> list[ReviewedTrade]:
+    """Keep trades that CLOSED inside the window.
+
+    The ReviewedTrade counterpart to `filter_by_exit_window`, and deliberately
+    the same rule: dated by exit, compared as a MARKET-time calendar date. The
+    analytics page and the dashboard have to mean the same thing by "1Y" or the
+    two win rates diverge again -- for a third reason, and one nothing on screen
+    would explain.
+
+    A trade that cannot be placed in time is dropped from a BOUNDED window
+    rather than kept: not knowing when it closed is not evidence that it closed
+    inside the span. `positions.exit_time` is NOT NULL and this loader only
+    reads closed positions, so that branch is defensive rather than expected.
+
+    Filtered in Python for the same reason the sibling is -- the boundary is a
+    market-time date, which no index covers -- and over a list already in
+    memory.
+    """
+    if window.is_unbounded:
+        return list(trades)
+
+    kept: list[ReviewedTrade] = []
+    for trade in trades:
+        if trade.exit_time is None:
+            continue
+        if window.contains(trade.exit_time.astimezone(MARKET_TZ).date()):
+            kept.append(trade)
+    return kept
+
+
 def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
     """R-multiples, slippage, expectancy, and per-mistake breakdown."""
     scored: list[tuple[ReviewedTrade, float]] = []
@@ -1521,12 +1559,47 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                     or (opening.strategy_id if opening is not None else None)
                 ),
                 entry_time=position.entry_time,
+                exit_time=position.exit_time,
             )
         )
     return reviewed
 
 
-async def build_advanced_analytics(session: AsyncSession) -> dict[str, Any]:
-    """Advanced metrics payload for the Analytics & Review tab."""
+async def build_advanced_analytics(
+    session: AsyncSession, window: Optional[Window] = None
+) -> dict[str, Any]:
+    """Advanced metrics payload for the Analytics & Review tab.
+
+    `window` governs the whole payload -- R distribution, expectancy, slippage,
+    the strategy ranking and both discipline tables -- for the reason
+    build_dashboard's docstring gives: a 1Y figure beside an all-time one on a
+    single screen, with nothing saying they cover different spans, is worse than
+    either alone.
+
+    Defaults to None (everything) rather than to 1Y, so a caller that has no
+    opinion still gets the old behaviour. The ENDPOINT defaults to 1Y, matching
+    the dashboard; the difference is deliberate, because a bare in-process call
+    asking for "the advanced metrics" has not asked to be narrowed.
+
+    The window is NOT applied to the pending-review queue, which this does not
+    build. That queue is a work list rather than a statistic, and one that
+    silently hid an older unreviewed trade would be worse than a long one.
+    """
     trades = await load_reviewed_trades(session)
-    return compute_advanced_metrics(trades)
+    if window is None:
+        return compute_advanced_metrics(trades)
+
+    in_window = filter_trades_by_exit_window(trades, window)
+    payload = compute_advanced_metrics(in_window)
+    # Only the fields the toolbar actually renders. Deliberately NOT the
+    # dashboard's full window block: `truncated` and `max_days` describe the
+    # equity curve's clamp and there is no curve here, so reporting them would
+    # be inventing an answer to a question this payload never asks.
+    payload["window"] = {
+        "preset": window.preset,
+        "start_date": window.start.isoformat() if window.start else None,
+        "end_date": window.end.isoformat() if window.end else None,
+        "closed_trades_in_window": len(in_window),
+        "closed_trades_total": len(trades),
+    }
+    return payload

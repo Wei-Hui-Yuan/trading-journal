@@ -641,8 +641,23 @@ export async function getSyncStatus(): Promise<SyncStatus> {
 }
 
 /** GET /api/analytics/advanced - R-multiples, slippage, expectancy. */
-export async function getAdvancedMetrics(): Promise<AdvancedMetrics> {
-  const { data } = await apiClient.get<AdvancedMetrics>('/analytics/advanced');
+export async function getAdvancedMetrics(
+  selection?: TimeframeSelection
+): Promise<AdvancedMetrics> {
+  // Same shape the dashboard sends, because the endpoint takes the same three
+  // parameters with the same precedence. Omitted entirely when there is no
+  // selection, which lets the server apply its own default rather than the
+  // browser holding a second opinion about what "1Y" means.
+  const params =
+    selection?.kind === 'custom'
+      ? { start_date: selection.start_date, end_date: selection.end_date }
+      : selection
+        ? { preset: selection.preset }
+        : undefined;
+
+  const { data } = await apiClient.get<AdvancedMetrics>('/analytics/advanced', {
+    params,
+  });
   return data;
 }
 

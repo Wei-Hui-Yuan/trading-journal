@@ -51,7 +51,7 @@ def client(monkeypatch):
         calls["dashboard"] += 1
         return {"summary": {"net_pnl": 1.0}, "points": []}
 
-    async def _fake_advanced(session):
+    async def _fake_advanced(session, window=None):
         calls["advanced"] += 1
         return {"expectancy": 0.5}
 

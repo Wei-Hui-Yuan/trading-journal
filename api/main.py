@@ -6415,6 +6415,9 @@ async def analytics_dashboard(
 async def analytics_advanced(
     request: Request,
     response: Response,
+    preset: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     session: AsyncSession = Depends(get_session),
 ):
     """R-multiples, slippage, expectancy, and the per-mistake breakdown.
@@ -6422,16 +6425,41 @@ async def analytics_advanced(
     Sourced from `trades` rather than `positions`: R-multiple and slippage
     need the plan (stop_loss, planned_entry), which only the ledger carries.
 
-    Takes no parameters, so the version alone identifies the payload.
-    """
-    from services.analytics import build_advanced_analytics
+    Windowed exactly like /api/analytics/dashboard -- same three ways to ask,
+    same precedence, same 1Y default, and trades selected by when they CLOSED.
+    That last point is the whole reason this takes a window at all: the two
+    pages both showed a figure called "win rate" over different populations,
+    and once the ledger passes a year of history an unwindowed advanced payload
+    would have diverged from the dashboard again with nothing on screen saying
+    why.
 
+    The two selections are independent by design. Each page holds its own, so
+    narrowing the dashboard to YTD leaves this alone -- they answer different
+    questions and are read at different times.
+    """
+    from services.analytics import build_advanced_analytics, resolve_window
+
+    try:
+        window = resolve_window(preset, start_date, end_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Keyed on the RESOLVED window, for the reason spelled out on the dashboard
+    # endpoint above -- and here it is also a correctness fix rather than a
+    # refinement. This ETag used to be `_etag("advanced", version)`, correct
+    # only while the payload took no parameters. Adding the window without
+    # adding it here would serve a cached 1Y payload for an ALL request, and
+    # keep doing so until something unrelated bumped the version.
     version = await _journal_version(session)
-    etag = None if version is None else _etag("advanced", version)
+    etag = (
+        None
+        if version is None
+        else _etag("advanced", version, window.start, window.end)
+    )
     if (cached := _conditional(request, etag)) is not None:
         return cached
 
-    payload = await build_advanced_analytics(session)
+    payload = await build_advanced_analytics(session, window)
     response.headers.update(_cache_headers(etag))
     return payload
 
