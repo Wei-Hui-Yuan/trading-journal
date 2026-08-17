@@ -7,7 +7,11 @@ import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
 import { DataHealthModal } from './DataHealthModal';
-import { useLastSync, useSyncStatus } from '@/hooks/useTradeInbox';
+import {
+  useLastSync,
+  useSyncRunWatcher,
+  useSyncStatus,
+} from '@/hooks/useTradeInbox';
 import { useLastAudit } from '@/hooks/useDataAudit';
 
 interface HeaderProps {
@@ -73,6 +77,29 @@ const SyncStatusBadge: React.FC = () => {
         <span className="h-2 w-2 rounded-full bg-slate-600" />
         <span className="text-slate-300">IBKR Sync:</span>
         <span className="text-obsidian-muted">never</span>
+      </div>
+    );
+  }
+
+  // A run in flight outranks both sources. It is the newest thing that has
+  // happened by definition, and while it is happening neither the in-memory
+  // record nor the previous row describes the current state of the ledger.
+  //
+  // `latest_looks_abandoned` is excluded deliberately: a run whose worker went
+  // away is not still running, and rendering it as "syncing" would leave a
+  // spinner up until somebody pressed the button again.
+  const running =
+    persisted?.outcome === 'running' && !status?.latest_looks_abandoned;
+
+  if (running) {
+    return (
+      <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-slate-600 text-xs font-mono">
+        <span className="h-2 w-2 rounded-full bg-slate-300 animate-pulse" />
+        <span className="text-slate-300">IBKR Sync:</span>
+        <span className="text-slate-300">
+          syncing
+          {persisted!.trigger === 'cron' ? ' · scheduled' : ''}
+        </span>
       </div>
     );
   }
@@ -197,6 +224,14 @@ const DataHealthBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
 export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   const [isPlanOpen, setIsPlanOpen] = useState(false);
   const [isHealthOpen, setIsHealthOpen] = useState(false);
+
+  // MOUNTED HERE, AND NOWHERE ELSE. A sync now finishes in the background, so
+  // something has to notice and do what the mutation's onSuccess used to:
+  // refresh what the run changed, and raise the toast. This hook performs those
+  // side effects, so a second copy would double them -- and the Header is the
+  // one component guaranteed to be mounted on every page, which is what makes a
+  // run started here still get reported after navigating away.
+  useSyncRunWatcher();
 
   // Nav links, in one place so the two rows below cannot list them in a
   // different order from each other. `plain` marks a Link needing no

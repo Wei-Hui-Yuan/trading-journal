@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   useInfiniteQuery,
   useMutation,
@@ -61,6 +61,7 @@ import type {
   ExecutionUpdatePayload,
   ExecutionUpdateResult,
   IngestResult,
+  IngestStarted,
   LastSyncState,
   PositionDeleteImpact,
   PositionDeleteResult,
@@ -427,26 +428,46 @@ export function useAdvancedMetrics(selection?: TimeframeSelection) {
 }
 
 /**
- * Pull executions from IBKR via the idempotent ingest pipeline.
+ * A stored run's result, made safe to render.
  *
- * Invalidation lives here rather than in the button so any caller gets a
- * correct cache refresh: the ingest promotes staged fills into `trades` and
- * re-runs FIFO matching, so new positions can appear in the inbox, shift
- * every dashboard figure, and change what a mounted Trade Ledger or
- * analytics card is already showing.
+ * `sync_runs.result` is a snapshot of whatever IngestResult looked like when the
+ * row was written, so a run recorded before a field existed simply lacks it. The
+ * toast reads sixteen fields and indexes into three arrays, so handing it a
+ * partial directly would throw on exactly the historical rows this exists to
+ * surface. Stored values win; the defaults only fill genuine absences.
  */
-export function useSyncBroker() {
-  const queryClient = useQueryClient();
+function completeResult(
+  stored: Partial<IngestResult> | null | undefined
+): IngestResult | null {
+  if (!stored) return null;
+  return {
+    executions_parsed: 0,
+    staged_new: 0,
+    staged_duplicates: 0,
+    trades_created: 0,
+    trades_duplicates: 0,
+    positions_matched: 0,
+    symbols_touched: [],
+    skipped_non_tradeable: 0,
+    queries_failed: [],
+    ...stored,
+  };
+}
 
-  return useMutation<IngestResult, Error, void>({
-    mutationFn: ingestIBKR,
-    onSuccess: (result) => {
-      // Unconditional: the server wrote a sync_runs row on every path, so the
-      // durable record the header badge reads is a version behind whatever
-      // else did or did not happen.
-      queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus });
-
-      // Everything below is derived from the ledger, and the common sync
+/**
+ * React to a sync that has finished: refresh what it changed, and report it.
+ *
+ * Shared by two callers that used to be one. A browser is now handed a 202 and
+ * the outcome arrives later through the polled `sync_runs` row, so this runs
+ * from the watcher — but the endpoint still answers synchronously when it could
+ * not record a slot row, and that path lands here directly. Both have to behave
+ * identically or the fallback would quietly stop invalidating.
+ */
+function applyFinishedSync(
+  queryClient: ReturnType<typeof useQueryClient>,
+  result: IngestResult
+) {
+  // Everything below is derived from the ledger, and the common sync
       // changes none of it. IBKR's rolling window re-reports fills already
       // imported, so the ordinary run -- and every scheduled one on a day
       // without trading -- promotes nothing and matches nothing, while still
@@ -514,6 +535,40 @@ export function useSyncBroker() {
         result,
         acknowledged: false,
       });
+}
+
+/**
+ * Start a broker sync, without waiting for IBKR to finish compiling it.
+ *
+ * The server answers a browser with 202 and a run id: the Flex handshake takes
+ * 15 to 240 seconds, and holding the button hostage for that was the worst
+ * interaction in the app. The outcome arrives through `useSyncRunWatcher` below,
+ * which follows the recorded row.
+ *
+ * Invalidation still lives out here rather than in the button so every caller
+ * gets a correct refresh — it has just moved to where the run actually ends.
+ */
+export function useSyncBroker() {
+  const queryClient = useQueryClient();
+
+  return useMutation<IngestStarted, Error, void>({
+    mutationFn: ingestIBKR,
+    onSuccess: (started) => {
+      // Always, and this is also what STARTS the poll: refetching syncStatus is
+      // how the new `running` row is first observed, and `useSyncStatus` only
+      // arms its timer once it has seen one.
+      queryClient.invalidateQueries({ queryKey: queryKeys.syncStatus });
+
+      // A handed-off run has changed nothing yet, so there is nothing to
+      // invalidate and nothing to report. Deliberately no `lastSync` write
+      // either: the badge prefers whichever source is newer, and leaving this
+      // one alone lets it read the server's `running` row instead of a local
+      // placeholder that would have to be kept in step with it.
+      if (started.kind === 'started') return;
+
+      // The synchronous fallback -- the server could not record a slot row and
+      // ran the ingest inline, so the outcome is already in hand.
+      applyFinishedSync(queryClient, started.result);
     },
     onError: (error) => {
       // The server records failed runs too, so the badge has something new to
@@ -531,6 +586,9 @@ export function useSyncBroker() {
   });
 }
 
+/** How often to ask about a run that is in flight. */
+const SYNC_POLL_MS = 3_000;
+
 /**
  * The last sync anyone performed, from the server rather than this tab.
  *
@@ -538,15 +596,127 @@ export function useSyncBroker() {
  * report syncs THIS browser session ran, so before this a nightly job that
  * failed on an expired token produced the same silence as a quiet market.
  *
- * Not polled. A daily schedule does not warrant a timer on every mounted
- * page, and the value refetches on mount and whenever a sync completes, which
- * covers every moment it visibly changes.
+ * Polled ONLY while a run is actually in flight, which is the whole mechanism
+ * behind the sync button no longer blocking. A browser is handed a 202 and this
+ * query follows the row until it reaches a terminal outcome, then stops. When
+ * nothing is running there is no timer at all — a daily schedule does not
+ * warrant one on every mounted page, and mount plus post-sync invalidation
+ * already covers every moment the value visibly changes.
+ *
+ * `latest_looks_abandoned` is what stops the timer running forever. The server
+ * only reaps stranded runs when a sync is STARTED, since a GET has no business
+ * writing rows, so a run whose worker was recycled stays `running` in the table
+ * until someone syncs again. Polling that would be an eternal 3s timer against
+ * a row nobody will ever finish.
  */
 export function useSyncStatus() {
   return useQuery<SyncStatus, Error>({
     queryKey: queryKeys.syncStatus,
     queryFn: getSyncStatus,
+    refetchInterval: (query) => {
+      const status = query.state.data;
+      if (!status?.latest) return false;
+      if (status.latest.outcome !== 'running') return false;
+      return status.latest_looks_abandoned ? false : SYNC_POLL_MS;
+    },
+    // A run continues on the server whether or not this tab is in front, and
+    // coming back to a stale "syncing" badge would be exactly the confusion
+    // this endpoint exists to remove.
+    refetchIntervalInBackground: true,
   });
+}
+
+/**
+ * Whether a sync is running right now, anywhere.
+ *
+ * Reads the server's record rather than this tab's mutation state, so a run
+ * started in another tab — or by the scheduler at 9pm — disables the button
+ * here too. A per-tab `isPending` could not see either, and two tabs each
+ * starting a sync is precisely what the 409 exists to refuse.
+ */
+export function useSyncInFlight(): boolean {
+  const { data } = useSyncStatus();
+  return (
+    data?.latest?.outcome === 'running' && !data.latest_looks_abandoned
+  );
+}
+
+/**
+ * Notice when an in-flight sync finishes, and do what its mutation used to.
+ *
+ * MOUNT THIS EXACTLY ONCE. It performs side effects — cache invalidation and
+ * the toast — so a second copy would double them. `Header` is the right home:
+ * it renders on every page and already owns the badge that reads this.
+ *
+ * Only fires on a run it watched go from `running` to finished. That distinction
+ * is the whole correctness of this hook: on first mount `latest` is almost
+ * always some already-terminal run from yesterday, and acting on that would
+ * invalidate every query and pop a toast for a sync nobody just performed. So it
+ * arms only after seeing `running`, which means it equally catches a run started
+ * by the scheduler or in another tab — those are worth reacting to for exactly
+ * the same reasons this tab's own run is.
+ *
+ * Keying on the row id would not work: the id does not change when the run
+ * finishes, only the outcome does.
+ */
+export function useSyncRunWatcher() {
+  const queryClient = useQueryClient();
+  const { data } = useSyncStatus();
+  const wasRunning = useRef(false);
+
+  const latest = data?.latest ?? null;
+  const abandoned = data?.latest_looks_abandoned ?? false;
+
+  useEffect(() => {
+    if (!latest) return;
+
+    if (latest.outcome === 'running' && !abandoned) {
+      wasRunning.current = true;
+      return;
+    }
+
+    if (!wasRunning.current) return;
+    wasRunning.current = false;
+
+    if (abandoned) {
+      // The worker went away mid-run. Say so rather than reporting a failure
+      // the ingest never produced -- and rather than leaving the badge spinning.
+      queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, {
+        at: latest.started_at,
+        outcome: 'error',
+        status: null,
+        summary: 'sync stopped reporting',
+        result: null,
+        acknowledged: false,
+      });
+      return;
+    }
+
+    if (latest.outcome === 'error') {
+      queryClient.setQueryData<LastSyncState>(queryKeys.lastSync, {
+        at: latest.finished_at ?? latest.started_at,
+        outcome: 'error',
+        status: null,
+        summary: latest.error ?? 'The sync failed.',
+        result: null,
+        acknowledged: false,
+      });
+      return;
+    }
+
+    const result = completeResult(latest.result);
+    if (!result) {
+      // Finished, but with no stored payload to report. Nothing to invalidate
+      // on either -- without the result there is no way to tell whether the
+      // ledger moved, and guessing in the direction of "it did" is the safe one.
+      queryClient.invalidateQueries({ queryKey: queryKeys.roundTrips });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboardStats });
+      queryClient.invalidateQueries({ queryKey: queryKeys.advancedMetrics });
+      return;
+    }
+
+    applyFinishedSync(queryClient, result);
+  }, [latest, abandoned, queryClient]);
 }
 
 /**

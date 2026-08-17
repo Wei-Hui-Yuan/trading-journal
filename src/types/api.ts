@@ -742,7 +742,31 @@ export type SyncTrigger = 'manual' | 'cron';
  * some Flex queries did not return, so the ledger is short of fills that exist
  * at the broker.
  */
-export type SyncOutcome = 'success' | 'partial' | 'error';
+export type SyncOutcome = 'running' | 'success' | 'partial' | 'error';
+
+/**
+ * What POST /api/ingest/ibkr answers a browser with: the run was started.
+ *
+ * The IBKR Flex handshake takes 15 to 240 seconds, so the browser is handed a
+ * run id and follows the row rather than holding a request open for it.
+ */
+export interface IngestAccepted {
+  run_id: string;
+  outcome: 'running' | string;
+  detail: string;
+}
+
+/**
+ * Either answer the ingest endpoint can give.
+ *
+ * A browser normally gets `started`. `finished` is the synchronous fallback the
+ * server takes when it could not record a slot row — handing out a run id
+ * nobody can observe would be worse than making the caller wait — so both have
+ * to be representable rather than one being assumed.
+ */
+export type IngestStarted =
+  | { kind: 'started'; runId: string }
+  | { kind: 'finished'; result: IngestResult };
 
 /** One recorded sync run (GET /api/sync/runs/latest). */
 export interface SyncRun {
@@ -757,6 +781,19 @@ export interface SyncRun {
   plans_attached: number;
   /** Only set when the run raised. */
   error: string | null;
+  /**
+   * The IngestResult this run produced, as stored.
+   *
+   * Carried so the toast can be rendered from a run this tab did not perform.
+   * A browser now hands the sync off and follows the row, so the result is no
+   * longer a mutation's return value — and for a scheduled run, or one started
+   * in another tab, it never was.
+   *
+   * Partial rather than the full type: it is a snapshot of whatever
+   * IngestResult looked like when the row was written, so a run recorded before
+   * a field existed simply will not have it.
+   */
+  result: Partial<IngestResult> | null;
 }
 
 /**
@@ -773,6 +810,17 @@ export interface SyncStatus {
   last_success_at: string | null;
   /** Computed server-side, so the client is not trusting its own clock. */
   seconds_since_success: number | null;
+  /**
+   * True when `latest` is still `running` but has been for longer than a run
+   * can legitimately take.
+   *
+   * The server reaps stranded runs when a sync is STARTED, because a GET has no
+   * business writing rows — so without this flag the browser would poll a dead
+   * run forever and the badge would read "syncing" until someone pressed Sync.
+   * Computed server-side so the threshold lives in one place rather than being
+   * duplicated here and left to drift.
+   */
+  latest_looks_abandoned: boolean;
 }
 
 /**

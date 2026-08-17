@@ -31,6 +31,7 @@ test is the wrapper's bookkeeping.
 """
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,27 @@ def make_result(**overrides) -> main.IngestResult:
     return main.IngestResult(**base)
 
 
+def _record_through(monkeypatch, spy):
+    """Watch the outcome recording, and keep the endpoint on its inline path.
+
+    Two stubs, and the second is the load-bearing one. `_claim_sync_slot`
+    returning no id is the endpoint's DEGRADED path: the slot row could not be
+    written, so it runs the ingest inline and records the outcome anyway rather
+    than handing out a 202 pointing at a run nobody can observe. That is the
+    shape these tests want -- they assert what gets RECORDED, and the transport
+    split has its own tests further down.
+
+    Without it, a manual caller would be handed a 202 and the ingest would run
+    in a background task, so `asyncio.run` would return before the spy saw
+    anything.
+    """
+    async def no_slot(**_kwargs):
+        return None, None
+
+    monkeypatch.setattr(main, "_claim_sync_slot", no_slot)
+    monkeypatch.setattr(main, "_finish_sync_run", spy)
+
+
 # ---------------------------------------------------------------------------
 # The outcome recorded is the outcome that happened
 # ---------------------------------------------------------------------------
@@ -76,7 +98,7 @@ def test_a_clean_run_is_recorded_as_success(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     result = asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
@@ -99,7 +121,7 @@ def test_a_run_with_a_failed_query_is_partial_not_success(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     asyncio.run(main.ingest_ibkr(session=object(), auth={}))
 
@@ -121,7 +143,7 @@ def test_an_http_failure_is_still_recorded_and_still_raised(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     with pytest.raises(HTTPException) as caught:
         asyncio.run(main.ingest_ibkr(session=object(), auth={}))
@@ -147,7 +169,7 @@ def test_an_unexpected_exception_is_recorded_and_re_raised(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     with pytest.raises(RuntimeError):
         asyncio.run(main.ingest_ibkr(session=object(), auth={}))
@@ -206,7 +228,7 @@ def test_a_clerk_session_is_recorded_as_manual(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     asyncio.run(main.ingest_ibkr(session=object(), auth={"sub": "user_2vX...clerk"}))
 
@@ -227,7 +249,7 @@ def test_the_cron_secret_is_recorded_as_cron(monkeypatch):
         recorded.append(kwargs)
 
     monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
-    monkeypatch.setattr(main, "_record_sync_run", spy)
+    _record_through(monkeypatch, spy)
 
     asyncio.run(
         main.ingest_ibkr(session=object(), auth={"sub": "cron", "cron": True})
@@ -257,7 +279,7 @@ def test_the_endpoint_accepts_the_cron_secret_without_a_clerk_session():
 
 @requires_db
 def test_the_record_survives_the_ingest_transaction_rolling_back():
-    """The reason `_record_sync_run` opens its own session.
+    """The reason `_finish_sync_run` opens its own session.
 
     Written into the request's session, the row describing a failed run would
     be rolled back along with the failure it documents -- losing exactly the
@@ -268,7 +290,8 @@ def test_the_record_survives_the_ingest_transaction_rolling_back():
             session = db_session(conn)
             started = datetime.now(timezone.utc)
 
-            await main._record_sync_run(
+            await main._finish_sync_run(
+                run_id=None,
                 started_at=started,
                 trigger=main.SYNC_TRIGGER_MANUAL,
                 outcome=main.SYNC_OUTCOME_ERROR,
@@ -366,3 +389,190 @@ def test_a_partial_run_does_not_count_as_a_successful_sync():
             )
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Who waits, and who is handed a run id (migration 035)
+# ---------------------------------------------------------------------------
+
+
+def _claims_slot(monkeypatch, run_id):
+    """Stub the slot claim so it succeeds, without touching a database."""
+    async def claim(**_kwargs):
+        return run_id, None
+
+    monkeypatch.setattr(main, "_claim_sync_slot", claim)
+
+
+def test_the_scheduler_waits_and_gets_the_full_result(monkeypatch):
+    """The cron job's exit code is the only signal Northflank has.
+
+    Answering 202 there would make every scheduled run look successful the
+    moment it could reach the API -- which is exactly the confusion `sync_runs`
+    was added to end, and the reason the split is by caller rather than global.
+    """
+    ran: list[bool] = []
+
+    async def fake_ingest(session):
+        ran.append(True)
+        return make_result(trades_created=4)
+
+    async def finish(**_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
+    monkeypatch.setattr(main, "_finish_sync_run", finish)
+    _claims_slot(monkeypatch, uuid.uuid4())
+
+    result = asyncio.run(
+        main.ingest_ibkr(session=object(), auth={"sub": "cron", "cron": True})
+    )
+
+    assert ran, "the scheduler's request returned without running the ingest"
+    assert isinstance(result, main.IngestResult)
+    assert result.trades_created == 4, (
+        "the cron caller must still receive the real result, unchanged"
+    )
+
+
+def test_a_browser_is_handed_a_run_id_without_waiting(monkeypatch):
+    """The point of the change: 202 now, outcome later via the badge."""
+    run_id = uuid.uuid4()
+    started = asyncio.Event()
+
+    async def slow_ingest(session):
+        started.set()
+        await asyncio.sleep(0.05)
+        return make_result()
+
+    async def finish(**_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "_run_ibkr_ingest", slow_ingest)
+    monkeypatch.setattr(main, "_finish_sync_run", finish)
+    _claims_slot(monkeypatch, run_id)
+
+    async def scenario():
+        response = await main.ingest_ibkr(session=object(), auth={"sub": "user_2vX"})
+        # Let the handed-off task actually begin before the loop closes.
+        await asyncio.wait_for(started.wait(), timeout=1)
+        return response
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["run_id"] == str(run_id)
+    assert body["outcome"] == main.SYNC_OUTCOME_RUNNING
+
+
+def test_the_background_task_is_held_so_it_cannot_be_collected(monkeypatch):
+    """asyncio keeps only a WEAK reference to a bare create_task.
+
+    A collected task stops silently, leaving a `running` row nothing will finish
+    and no traceback to explain it. The strong-reference set is what prevents
+    that, and it is invisible in behaviour until it bites.
+    """
+    async def slow_ingest(session):
+        await asyncio.sleep(0.05)
+        return make_result()
+
+    async def finish(**_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "_run_ibkr_ingest", slow_ingest)
+    monkeypatch.setattr(main, "_finish_sync_run", finish)
+    _claims_slot(monkeypatch, uuid.uuid4())
+
+    async def scenario():
+        await main.ingest_ibkr(session=object(), auth={"sub": "user_2vX"})
+        held = len(main._BACKGROUND_SYNCS)
+        # Drain it, so the suite does not leave a task pending on a dead loop.
+        await asyncio.gather(*list(main._BACKGROUND_SYNCS))
+        return held, len(main._BACKGROUND_SYNCS)
+
+    while_running, after = asyncio.run(scenario())
+
+    assert while_running == 1, "the task was not retained while it ran"
+    assert after == 0, "the done-callback did not release the task"
+
+
+def test_a_second_sync_while_one_runs_is_refused(monkeypatch):
+    """409 rather than a second ingest.
+
+    Two concurrent runs are safe at the data layer -- ticker advisory locks, ON
+    CONFLICT on transaction_id -- so this is about not showing two runs in a UI
+    with room for one, and not spending IBKR's per-token rate limit twice on the
+    same fills.
+    """
+    blocker = main.SyncRun(
+        id=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=30),
+        trigger=main.SYNC_TRIGGER_MANUAL,
+        outcome=main.SYNC_OUTCOME_RUNNING,
+    )
+
+    async def claim(**_kwargs):
+        return None, blocker
+
+    async def fake_ingest(session):  # pragma: no cover - must not run
+        raise AssertionError("a second ingest was started while one was running")
+
+    monkeypatch.setattr(main, "_claim_sync_slot", claim)
+    monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(main.ingest_ibkr(session=object(), auth={"sub": "user_2vX"}))
+
+    assert caught.value.status_code == 409
+    assert "still running" in caught.value.detail
+
+
+def test_an_unrecordable_slot_falls_back_to_waiting(monkeypatch):
+    """A 202 pointing at a run nobody can observe is worse than a slow one.
+
+    `_claim_sync_slot` yielding no id means the database would not take the row,
+    so the endpoint degrades to the old synchronous behaviour rather than
+    promising a record that does not exist.
+    """
+    async def fake_ingest(session):
+        return make_result(trades_created=2)
+
+    async def finish(**_kwargs):
+        return None
+
+    async def no_slot(**_kwargs):
+        return None, None
+
+    monkeypatch.setattr(main, "_run_ibkr_ingest", fake_ingest)
+    monkeypatch.setattr(main, "_finish_sync_run", finish)
+    monkeypatch.setattr(main, "_claim_sync_slot", no_slot)
+
+    result = asyncio.run(main.ingest_ibkr(session=object(), auth={"sub": "user_2vX"}))
+
+    assert isinstance(result, main.IngestResult), (
+        "the caller was handed a 202 despite the run being unrecordable"
+    )
+    assert result.trades_created == 2
+
+
+def test_the_reaper_waits_longer_than_the_fetch_budget():
+    """Reaping a run that is merely slow would mark a LIVE ingest failed and let
+    a second start beside it.
+
+    Enforced against the real constant rather than a copy, because
+    SYNC_RUN_ABANDONED_AFTER is written as a literal in main.py -- everything in
+    `services` is imported locally there to keep that module out of an import
+    cycle, so it cannot be derived. Same approach
+    test_the_budget_is_below_the_worker_timeout takes to the Dockerfile.
+    """
+    from services import ibkr_client
+
+    assert (
+        main.SYNC_RUN_ABANDONED_AFTER.total_seconds()
+        > ibkr_client.TOTAL_BUDGET_SECONDS
+    ), (
+        f"the reaper fires after {main.SYNC_RUN_ABANDONED_AFTER.total_seconds()}s "
+        f"but the ingest is allowed {ibkr_client.TOTAL_BUDGET_SECONDS}s just for "
+        "the Flex handshake, so a healthy run would be reaped mid-flight"
+    )
