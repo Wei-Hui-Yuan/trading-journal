@@ -369,6 +369,46 @@ SYNC_OUTCOME_SUCCESS = "success"
 SYNC_OUTCOME_PARTIAL = "partial"
 SYNC_OUTCOME_ERROR = "error"
 
+# Not an ending at all (migration 035). Written when a run starts so an
+# in-flight sync is visible rather than inferred, and replaced when it ends.
+#
+# Neither a success nor a failure, and nothing that measures the ledger may
+# read it as either. The staleness warning looks at the most recent SUCCESSFUL
+# run, so a run stuck here can never make the journal look fresher than it is.
+SYNC_OUTCOME_RUNNING = "running"
+
+# How long a `running` row is believed before it is treated as abandoned.
+#
+# A worker recycled mid-ingest -- a redeploy, an OOM, a dropped container --
+# leaves `running` behind with nobody left to finish it, and that row would
+# otherwise refuse every future sync forever via the in-flight guard below.
+#
+# Sized off the ingest's own ceiling rather than picked. services.ibkr_client's
+# TOTAL_BUDGET_SECONDS (240) bounds the Flex handshake and the pipeline's
+# remaining DB work is seconds on top, so a run still 'running' six minutes in
+# is not slow, it is gone.
+#
+# Written as a literal rather than derived, because everything in `services` is
+# imported locally inside functions here to keep this module out of an import
+# cycle, and a module-level constant cannot honour that. The relationship is
+# enforced by test_the_reaper_waits_longer_than_the_fetch_budget instead, which
+# reads the real value -- the same approach
+# test_the_budget_is_below_the_worker_timeout takes to the Dockerfile.
+#
+# The margin is generous because the cost of being wrong is asymmetric: reaping
+# too early marks a LIVE run failed and lets a second start beside it, while
+# reaping too late only delays the next manual sync by a few minutes.
+SYNC_RUN_ABANDONED_AFTER = timedelta(seconds=360)
+
+# Strong references to in-flight background syncs.
+#
+# asyncio keeps only a WEAK reference to a task created by `create_task`, so a
+# bare call can be garbage collected mid-run. It then stops silently, leaving a
+# `running` row that nothing will ever finish and no traceback to explain it --
+# the hardest possible version of this bug. Holding the task here until its own
+# done-callback removes it is the documented way to avoid that.
+_BACKGROUND_SYNCS: set[asyncio.Task] = set()
+
 
 class SyncRun(Base):
     """One broker sync, recorded whether it worked or not (migration 034).
@@ -1626,15 +1666,21 @@ async def _run_ibkr_ingest(session: AsyncSession) -> IngestResult:
     )
 
 
-async def _record_sync_run(
+async def _finish_sync_run(
     *,
+    run_id: Optional[uuid.UUID],
     started_at: datetime,
     trigger: str,
     outcome: str,
     result: Optional[IngestResult] = None,
     error: Optional[str] = None,
 ) -> None:
-    """Write one `sync_runs` row, in a session of its own.
+    """Record how a run ended, in a session of its own.
+
+    Updates the row `_claim_sync_slot` opened. Falls back to INSERTing one when
+    `run_id` is None or the row has gone -- a record of the outcome matters more
+    than which statement produced it, and an outcome with no row at all is the
+    one thing this function exists to prevent.
 
     ITS OWN SESSION, deliberately. The request's session is the one the ingest
     ran in, and the row most worth keeping is the one describing a run that
@@ -1646,86 +1692,193 @@ async def _record_sync_run(
     the bookkeeping afterwards hit a problem, and a sync that failed must
     surface its own error rather than this one. A recording failure is logged
     and swallowed; the worst case is a missing row, which is strictly better
-    than a misreported outcome.
+    than a misreported outcome. This holds doubly now that the caller may be a
+    background task with nobody left to return an error to.
     """
+    finished_at = datetime.now(timezone.utc)
+    counters = {
+        "executions_parsed": result.executions_parsed if result else 0,
+        "trades_created": result.trades_created if result else 0,
+        "positions_matched": result.positions_matched if result else 0,
+        "plans_attached": (result.plans_attached or 0) if result else 0,
+        # mode="json" so datetimes and UUIDs inside the payload survive the trip
+        # into JSONB; the default mode leaves objects asyncpg cannot serialise.
+        "result": result.model_dump(mode="json") if result else None,
+        "error": error,
+    }
     try:
         async with SessionLocal() as session:
-            session.add(
-                SyncRun(
-                    id=uuid.uuid4(),
-                    started_at=started_at,
-                    finished_at=datetime.now(timezone.utc),
-                    trigger=trigger,
-                    outcome=outcome,
-                    executions_parsed=result.executions_parsed if result else 0,
-                    trades_created=result.trades_created if result else 0,
-                    positions_matched=result.positions_matched if result else 0,
-                    plans_attached=(result.plans_attached or 0) if result else 0,
-                    # mode="json" so datetimes and UUIDs inside the payload
-                    # survive the trip into JSONB; the default mode leaves
-                    # objects asyncpg cannot serialise.
-                    result=result.model_dump(mode="json") if result else None,
-                    error=error,
+            updated = 0
+            if run_id is not None:
+                updated = (
+                    await session.execute(
+                        update(SyncRun.__table__)
+                        .where(SyncRun.__table__.c.id == run_id)
+                        .values(
+                            finished_at=finished_at,
+                            outcome=outcome,
+                            **counters,
+                        )
+                    )
+                ).rowcount or 0
+
+            if not updated:
+                session.add(
+                    SyncRun(
+                        id=run_id or uuid.uuid4(),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        trigger=trigger,
+                        outcome=outcome,
+                        **counters,
+                    )
                 )
-            )
             await session.commit()
     except Exception as exc:  # noqa: BLE001 - see NEVER RAISES above
         logger.error("Could not record the sync run: %s", exc)
 
 
-@app.post(
-    "/api/ingest/ibkr",
-    response_model=IngestResult,
-)
-async def ingest_ibkr(
-    session: AsyncSession = Depends(get_session),
-    auth: dict = Depends(verify_clerk_or_cron_token),
-):
-    """Run the ingest, and leave a record that it happened.
+async def _claim_sync_slot(
+    *, started_at: datetime, trigger: str
+) -> tuple[Optional[uuid.UUID], Optional[SyncRun]]:
+    """Reap abandoned runs, then take the slot if nothing live holds it.
 
-    The record is the point. `LastSyncState` lives in one browser tab's query
-    cache, so before this the app could not tell "the schedule ran and the
-    market was quiet" from "the schedule has not fired since the token
-    expired" -- both are zero new fills and no badge.
+    Returns `(run_id, None)` when the slot was taken, or `(None, blocker)` when
+    a genuine run is already in flight -- the endpoint turns the second into a
+    409 rather than starting a second ingest beside the first.
 
-    Every path writes a row, including both failure paths. An HTTPException is
-    re-raised untouched afterwards so the caller still gets its 502/503 with
-    the same detail: the recording observes the outcome, it does not change it.
+    THE REAP HAS TO HAPPEN FIRST, and it is the whole reason this is one
+    function rather than two. A worker recycled mid-ingest leaves 'running'
+    behind with nobody to finish it, and a guard that trusted that row would
+    refuse every future sync forever -- turning a transient container restart
+    into a permanently broken Sync button that only a database edit could clear.
 
-    `verify_clerk_or_cron_token` accepts a Clerk session OR the scheduler's
-    shared secret, which is what made a Northflank Cron Job possible without
-    also leaving this open to an unauthenticated caller: unset CRON_SECRET
-    behaves exactly like the plain Clerk check this replaced. Its return value
-    is captured here rather than left as a bare `dependencies=[]` entry
-    specifically so `trigger` below does not have to guess which path
-    authenticated the request.
+    Concurrency here is not fully closed, and deliberately so. Two requests
+    arriving in the same instant could both see an empty slot; the ingest itself
+    is safe under that (ticker advisory locks, ON CONFLICT on transaction_id --
+    see run_matching_for_ticker), so the cost is a duplicated fetch rather than
+    a corrupted ledger. Closing it properly means an advisory lock or a unique
+    partial index held across the whole run, which is a lot of machinery for a
+    single-user journal whose realistic double-press is two clicks a second
+    apart -- and those the guard does catch.
     """
-    started_at = datetime.now(timezone.utc)
-    trigger = SYNC_TRIGGER_CRON if auth.get("cron") else SYNC_TRIGGER_MANUAL
-
+    cutoff = datetime.now(timezone.utc) - SYNC_RUN_ABANDONED_AFTER
     try:
-        result = await _run_ibkr_ingest(session)
-    except HTTPException as exc:
-        await _record_sync_run(
-            started_at=started_at,
-            trigger=trigger,
-            outcome=SYNC_OUTCOME_ERROR,
-            error=f"HTTP {exc.status_code}: {exc.detail}",
-        )
-        raise
-    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised as-is
-        await _record_sync_run(
-            started_at=started_at,
-            trigger=trigger,
-            outcome=SYNC_OUTCOME_ERROR,
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        raise
+        async with SessionLocal() as session:
+            abandoned = (
+                await session.execute(
+                    update(SyncRun.__table__)
+                    .where(
+                        SyncRun.__table__.c.outcome == SYNC_OUTCOME_RUNNING,
+                        SyncRun.__table__.c.started_at < cutoff,
+                    )
+                    .values(
+                        outcome=SYNC_OUTCOME_ERROR,
+                        finished_at=datetime.now(timezone.utc),
+                        error=(
+                            "The run stopped reporting and was assumed "
+                            "abandoned -- most likely the container was "
+                            "restarted mid-sync. Any fills it had already "
+                            "promoted are picked up by the next run."
+                        ),
+                    )
+                )
+            ).rowcount or 0
+            if abandoned:
+                logger.warning(
+                    "Reaped %d abandoned sync run(s) older than %s",
+                    abandoned,
+                    SYNC_RUN_ABANDONED_AFTER,
+                )
+
+            blocker = (
+                await session.execute(
+                    select(SyncRun)
+                    .where(SyncRun.outcome == SYNC_OUTCOME_RUNNING)
+                    .order_by(SyncRun.started_at.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+
+            if blocker is not None:
+                await session.commit()  # keep the reap even though we refuse
+                return None, blocker
+
+            run_id = uuid.uuid4()
+            session.add(
+                SyncRun(
+                    id=run_id,
+                    started_at=started_at,
+                    # Left NULL on purpose. `finished_at IS NULL` and
+                    # `outcome = 'running'` say the same thing, and the one that
+                    # is constrained is the one worth reading.
+                    finished_at=None,
+                    trigger=trigger,
+                    outcome=SYNC_OUTCOME_RUNNING,
+                )
+            )
+            await session.commit()
+            return run_id, None
+    except Exception as exc:  # noqa: BLE001 - degrade to "no slot claimed"
+        # Reported as "took the slot with no id". The endpoint then runs inline
+        # and `_finish_sync_run` INSERTs the outcome, so a database hiccup here
+        # costs the 202 and the guard, not the sync.
+        logger.error("Could not claim a sync run slot: %s", exc)
+        return None, None
+
+
+async def _ingest_and_record(
+    *,
+    run_id: Optional[uuid.UUID],
+    started_at: datetime,
+    trigger: str,
+    session: Optional[AsyncSession] = None,
+) -> IngestResult:
+    """Run the pipeline and record how it ended, whatever that turns out to be.
+
+    Pass `session` to borrow the request's; omit it and one is opened here, which
+    is what the background path needs -- a request's session is closed the moment
+    its response is returned, so a task that outlived the response and kept using
+    it would fail on its first query.
+
+    Both failure paths record and then re-raise untouched, so an inline caller
+    still gets its 502/503 with the same detail: the recording observes the
+    outcome, it does not change it. The background caller has nobody to raise to,
+    which is exactly why the row is the point.
+    """
+    async def run(active: AsyncSession) -> IngestResult:
+        try:
+            return await _run_ibkr_ingest(active)
+        except HTTPException as exc:
+            await _finish_sync_run(
+                run_id=run_id,
+                started_at=started_at,
+                trigger=trigger,
+                outcome=SYNC_OUTCOME_ERROR,
+                error=f"HTTP {exc.status_code}: {exc.detail}",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised as-is
+            await _finish_sync_run(
+                run_id=run_id,
+                started_at=started_at,
+                trigger=trigger,
+                outcome=SYNC_OUTCOME_ERROR,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+    if session is not None:
+        result = await run(session)
+    else:
+        async with SessionLocal() as owned:
+            result = await run(owned)
 
     # A run that could not reach every query is NOT a success. It leaves the
     # ledger short of fills that exist at the broker, and the staleness check
     # reads this column to decide whether the data can be trusted as current.
-    await _record_sync_run(
+    await _finish_sync_run(
+        run_id=run_id,
         started_at=started_at,
         trigger=trigger,
         outcome=(
@@ -1734,6 +1887,103 @@ async def ingest_ibkr(
         result=result,
     )
     return result
+
+
+class IngestAccepted(BaseModel):
+    """A run that has been started, for a caller that is not going to wait."""
+
+    run_id: str
+    outcome: str = SYNC_OUTCOME_RUNNING
+    detail: str = (
+        "The sync is running. Its outcome will appear on the header badge."
+    )
+
+
+@app.post("/api/ingest/ibkr", response_model=None)
+async def ingest_ibkr(
+    session: AsyncSession = Depends(get_session),
+    auth: dict = Depends(verify_clerk_or_cron_token),
+):
+    """Start a broker sync. Waits for it if the scheduler asked, not if a browser did.
+
+    THE SPLIT, because it looks like an inconsistency and is the opposite:
+
+      * A BROWSER gets 202 and a run id. The IBKR Flex handshake takes 15 to 240
+        seconds -- the broker compiles the statement on its own schedule and the
+        client polls for it -- and freezing the button for that long, with no
+        progress and no way to navigate away, was the worst interaction in the
+        app. The browser follows the run through /api/sync/runs/latest instead.
+
+      * The SCHEDULER waits, and gets the full IngestResult exactly as before.
+        Nobody is watching a spinner on a cron run, and its exit code is the only
+        signal Northflank has: answering 202 would make every scheduled run look
+        successful the moment it could reach the API, which is precisely the
+        confusion `sync_runs` was added to end. It also means the Northflank job
+        command needs no change.
+
+    Both paths write the same rows through the same code. The only difference is
+    who awaits `_ingest_and_record`.
+
+    A second Sync while one is in flight is a 409 rather than a second ingest.
+    Two concurrent runs are safe at the data layer -- ticker advisory locks and
+    ON CONFLICT on transaction_id -- so this is about not showing two runs in a
+    UI with room for one, and about not spending IBKR's per-token rate limit
+    twice for the same fills.
+
+    `verify_clerk_or_cron_token` accepts a Clerk session OR the scheduler's
+    shared secret, which is what made a Northflank Cron Job possible without
+    also leaving this open to an unauthenticated caller: unset CRON_SECRET
+    behaves exactly like the plain Clerk check it replaced. Its return value is
+    captured here rather than left as a bare `dependencies=[]` entry specifically
+    so `trigger` does not have to guess which path authenticated the request --
+    and now so this handler knows whether anyone is waiting.
+    """
+    started_at = datetime.now(timezone.utc)
+    is_cron = bool(auth.get("cron"))
+    trigger = SYNC_TRIGGER_CRON if is_cron else SYNC_TRIGGER_MANUAL
+
+    run_id, blocker = await _claim_sync_slot(started_at=started_at, trigger=trigger)
+
+    if blocker is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A sync started "
+                f"{blocker.started_at.isoformat()} is still running. Wait for "
+                "it to finish -- its outcome will appear on the header badge."
+            ),
+        )
+
+    # The scheduler waits. So does a browser whose slot could not be recorded:
+    # `_claim_sync_slot` returning no id means the database would not take the
+    # row, and handing out a 202 pointing at a run nobody can observe is worse
+    # than making the caller wait. Degrading to the old behaviour is the safe
+    # direction.
+    if is_cron or run_id is None:
+        return await _ingest_and_record(
+            run_id=run_id,
+            started_at=started_at,
+            trigger=trigger,
+            session=session,
+        )
+
+    # Deliberately NOT given the request's session: it is closed as soon as this
+    # response is returned, and the task outlives that. `_ingest_and_record`
+    # opens its own.
+    #
+    # The reference is kept so the task is not garbage collected mid-flight --
+    # asyncio holds only a weak reference to a bare create_task, and a collected
+    # task stops silently, which is the hardest possible version of this bug.
+    task = asyncio.create_task(
+        _ingest_and_record(run_id=run_id, started_at=started_at, trigger=trigger)
+    )
+    _BACKGROUND_SYNCS.add(task)
+    task.add_done_callback(_BACKGROUND_SYNCS.discard)
+
+    return JSONResponse(
+        status_code=202,
+        content=IngestAccepted(run_id=str(run_id)).model_dump(),
+    )
 
 
 class SyncRunOut(BaseModel):
@@ -1749,6 +1999,18 @@ class SyncRunOut(BaseModel):
     positions_matched: int
     plans_attached: int
     error: Optional[str] = None
+    # The full IngestResult this run produced, as stored in JSONB.
+    #
+    # Carried so the toast can be rendered from a run the tab did not perform.
+    # A browser now hands the sync off and follows the row, so the result is no
+    # longer available as a mutation's return value -- and a run started in
+    # another tab, or by the scheduler, never was.
+    #
+    # Typed loosely on purpose: it is a snapshot of whatever IngestResult looked
+    # like when the row was written, and re-validating an old row against
+    # today's model would fail on a run recorded before a field was added. The
+    # frontend reads it as a partial and tolerates absence.
+    result: Optional[dict] = None
 
 
 class SyncStatusOut(BaseModel):
@@ -1766,6 +2028,16 @@ class SyncStatusOut(BaseModel):
     # Server-computed so the client is not doing arithmetic against a clock
     # that may not agree with this one. Null when nothing has ever succeeded.
     seconds_since_success: Optional[float] = None
+    # True when `latest` is still 'running' but has been for longer than a run
+    # can legitimately take.
+    #
+    # The reaper only runs when a sync is STARTED, because a GET has no business
+    # writing rows. Without this flag the browser would poll a stranded run
+    # forever and the badge would read "syncing" until someone happened to press
+    # Sync. Reported rather than left to the client so the threshold lives in one
+    # place -- SYNC_RUN_ABANDONED_AFTER -- instead of being duplicated in
+    # TypeScript and left to drift.
+    latest_looks_abandoned: bool = False
 
 
 @app.get(
@@ -1795,13 +2067,17 @@ async def latest_sync_run(session: AsyncSession = Depends(get_session)):
         )
     ).scalars().first()
 
+    now = datetime.now(timezone.utc)
     return SyncStatusOut(
         latest=SyncRunOut.model_validate(latest, from_attributes=True) if latest else None,
         last_success_at=last_success,
         seconds_since_success=(
-            (datetime.now(timezone.utc) - last_success).total_seconds()
-            if last_success
-            else None
+            (now - last_success).total_seconds() if last_success else None
+        ),
+        latest_looks_abandoned=(
+            latest is not None
+            and latest.outcome == SYNC_OUTCOME_RUNNING
+            and latest.started_at < now - SYNC_RUN_ABANDONED_AFTER
         ),
     )
 

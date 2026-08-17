@@ -14,7 +14,9 @@ import type {
   UnsuppressResult,
   Discipline,
   DisciplineCreatePayload,
+  IngestAccepted,
   IngestResult,
+  IngestStarted,
   ManualTradePayload,
   ManualTradeResult,
   PlanAttachResult,
@@ -596,8 +598,8 @@ export async function createManualTrade(
  * keyed by the broker's transaction id before promotion, so re-running over an
  * overlapping date range is a no-op rather than a duplicate.
  */
-export async function ingestIBKR(): Promise<IngestResult> {
-  const { data } = await apiClient.post<IngestResult>('/ingest/ibkr', null, {
+export async function ingestIBKR(): Promise<IngestStarted> {
+  const response = await apiClient.post<IngestResult | IngestAccepted>('/ingest/ibkr', null, {
     // The 30s default cannot work here, and not marginally: IBKR compiles a
     // Flex report on demand, so the backend SENDS a request and then POLLS for
     // the payload. Its own budget for a single query is up to 3 send attempts
@@ -621,12 +623,25 @@ export async function ingestIBKR(): Promise<IngestResult> {
     // renders. Keep the 60s of slack: it covers the staging, promotion and
     // FIFO matching that run after the fetch.
     //
-    // The real fix is still for ingest to return 202 with a job id and be
-    // polled -- a request whose duration is bounded by a third party's compile
-    // time does not belong in a synchronous round trip.
+    // KEPT, even though a browser is now answered 202 in well under a second.
+    // The server still runs the ingest inline when it could not record a slot
+    // row -- a 202 pointing at a run nobody can observe is worse than a slow
+    // one -- so this path can still legitimately take minutes. A tighter
+    // timeout here would report that degraded-but-working sync as a failure.
     timeout: 300_000,
   });
-  return data;
+
+  // 202 is the normal answer for a browser: the run was started and is being
+  // followed through /api/sync/runs/latest. Anything else is the synchronous
+  // fallback above, which returns the finished result exactly as it always did.
+  //
+  // Branched on the STATUS rather than by sniffing the body, so a future field
+  // named `run_id` on IngestResult could not make a completed run look pending.
+  if (response.status === 202) {
+    const accepted = response.data as IngestAccepted;
+    return { kind: 'started', runId: accepted.run_id };
+  }
+  return { kind: 'finished', result: response.data as IngestResult };
 }
 
 /**
