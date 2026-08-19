@@ -993,7 +993,12 @@ app.add_middleware(
     # ETag is for JavaScript that wants to read it: without it the header is
     # present on the wire and invisible to the page, which turns any attempt to
     # debug a caching problem from the client into guesswork.
-    expose_headers=["ETag"],
+    #
+    # Content-Disposition carries the filename of a CSV export. It is not a
+    # CORS-safelisted response header either, so without this line the browser
+    # strips it and the download lands under a name the page had to guess --
+    # which is how an export of the trading book saves itself as "blob".
+    expose_headers=["ETag", "Content-Disposition"],
     # Starlette's default is 600, and this deployment cannot afford it. Every
     # request the app makes carries Authorization and a JSON content type, both
     # non-simple, so EVERY endpoint URL is preflighted -- and the preflight is a
@@ -8383,3 +8388,444 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
         "total_dividends": sum(r["dividends"] for r in rows),
         "as_of": datetime.now(timezone.utc),
     }
+
+
+# ---------------------------------------------------------------------------
+# THE CSV EXPORTS
+# ---------------------------------------------------------------------------
+#
+# A THIRD region of this file, belonging to neither book. Everything above the
+# "THE INVESTMENT BOOK" marker is the journal and everything below it is the
+# investment book, and test_investments.py enforces in both directions that
+# they never reference each other -- that separation is what lets one of them
+# break without taking the other with it.
+#
+# This section reads both on purpose, which is why it sits outside both rather
+# than inside either. It is READ-ONLY and additive: it defines no table, writes
+# nothing, and no endpoint in either book calls into it. Nothing here may ever
+# be imported the other way, or the separation those tests protect would be
+# routed around by way of an export.
+#
+# Keep this LAST in the file. The guardrail tests treat its marker as the end
+# of the investment section, so anything appended after it escapes the check.
+#
+# Two grains per book, because they answer different questions and neither
+# substitutes for the other.
+#
+# The ANALYSIS grain is the unit each half of the app is about -- a round trip,
+# a holding -- carrying the derived figures the pages show. That is the file to
+# pivot in a spreadsheet.
+#
+# The LEDGER grain is the rows as stored: every fill, every transaction. Those
+# are the records that cannot be recomputed from anything else if the database
+# is lost, and they carry no derived column at all. Supabase's free tier takes
+# no automated backups, which is most of why this exists.
+#
+# No cycle to break here -- csv_export imports nothing from this module -- so
+# this follows the `valuation_engine` precedent above rather than the lazy
+# imports the analytics module needs.
+from services import csv_export as fmt  # noqa: E402
+
+
+class ExportDataset(str, Enum):
+    """The four exports. A str Enum so FastAPI validates the path itself."""
+
+    ROUND_TRIPS = "round-trips"
+    EXECUTIONS = "executions"
+    INVESTMENT_HOLDINGS = "investment-holdings"
+    INVESTMENT_TRANSACTIONS = "investment-transactions"
+
+
+def _headerless_request() -> Request:
+    """A Request carrying no headers, for calling an endpoint from inside one.
+
+    `list_round_trips` honours If-None-Match. Handing it the browser's real
+    request would let a validator the browser holds for the JOURNAL turn this
+    export into a 304, and a 304 rendered as CSV is a header row with no trades
+    under it -- indistinguishable from an account that never traded. With no
+    headers there is nothing to match against.
+    """
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/round-trips",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+
+async def _strategy_names(session: AsyncSession) -> dict[uuid.UUID, str]:
+    """id -> name, so an export names the playbook entry a human recognises.
+
+    Column-only select: two fields are all that is wanted, and loading whole
+    Strategy entities to read `name` off them is the pattern the analytics
+    loaders were deliberately narrowed away from.
+    """
+    result = await session.execute(select(Strategy.id, Strategy.name))
+    return {row.id: row.name for row in result}
+
+
+async def _export_round_trips(session: AsyncSession):
+    """The journal at round-trip grain: plan, outcome, score and review.
+
+    Calls `list_round_trips` rather than querying for itself. Open-exposure
+    reconstruction and R scoring both live in there, and a second copy is how an
+    export comes to disagree with the page it claims to export -- the same
+    reason `_score_r` delegates to analytics instead of restating the formula.
+
+    Figures arrive as floats because RoundTripOut declares them that way, so
+    this file agrees with the journal to the digit rather than with the database.
+    The ledger-grain exports read their columns directly and keep full NUMERIC
+    precision; between the two nothing is lost.
+
+    Open positions are included. They have no exit, no P&L and no review, and
+    every one of those columns is empty for them -- but dropping them would make
+    the export the only surface in the app that pretends live exposure is not
+    there, which is the bug `/api/round-trips` was built to fix.
+    """
+    from services.analytics import MARKET_TZ  # noqa: PLC0415 - avoids a cycle
+
+    rows = await list_round_trips(
+        request=_headerless_request(),
+        response=Response(),
+        limit=None,
+        offset=0,
+        session=session,
+    )
+    names = await _strategy_names(session)
+
+    header = [
+        "kind", "symbol", "direction", "quantity",
+        "entry_time", "exit_time", "exit_date",
+        "entry_price", "exit_price",
+        "realized_pnl", "gross_pnl", "commission",
+        "r_multiple", "planned_r_multiple",
+        "planned_entry", "stop_loss", "actual_stop_loss", "target",
+        "risk_percent", "risk_amount", "conviction",
+        "strategy", "emotional_state", "thesis",
+        "execution_count", "entry_slippage",
+        "has_hand_added_fills", "from_plan",
+        "review_status", "trade_grade", "exit_reason", "mistakes",
+        "notes", "review_went_well", "review_went_wrong", "review_lessons",
+        "ideal_entry", "ideal_stop", "ideal_target",
+        "revised_entry", "revised_stop", "revised_target",
+        "position_id",
+    ]
+
+    out = []
+    for r in rows:
+        # Market-time close date, matching how the dashboard buckets days. A UTC
+        # date would file a late-session close on the far side of midnight from
+        # the heatmap cell it belongs to.
+        exit_day = r.exit_time.astimezone(MARKET_TZ).date() if r.exit_time else None
+        out.append([
+            fmt.text(r.kind),
+            fmt.text(r.symbol),
+            fmt.text(r.direction),
+            fmt.number(r.quantity),
+            fmt.timestamp(r.entry_time),
+            fmt.timestamp(r.exit_time),
+            fmt.day(exit_day),
+            fmt.number(r.entry_price),
+            fmt.number(r.exit_price),
+            fmt.number(r.realized_pnl),
+            fmt.number(r.gross_pnl),
+            fmt.number(r.commission),
+            fmt.number(r.r_multiple),
+            fmt.number(r.planned_r_multiple),
+            fmt.number(r.planned_entry),
+            fmt.number(r.stop_loss),
+            fmt.number(r.actual_stop_loss),
+            fmt.number(r.target),
+            fmt.number(r.risk_percent),
+            fmt.number(r.risk_amount),
+            fmt.number(r.conviction),
+            fmt.text(names.get(r.strategy_id, "")),
+            fmt.text(r.emotional_state),
+            fmt.text(r.thesis),
+            fmt.number(r.execution_count),
+            fmt.number(r.entry_slippage),
+            fmt.flag(r.has_hand_added_fills),
+            fmt.flag(r.plan_id is not None),
+            fmt.text(r.review_status),
+            fmt.text(r.trade_grade),
+            fmt.text(r.exit_reason),
+            fmt.joined(r.mistakes),
+            fmt.text(r.notes),
+            fmt.text(r.review_went_well),
+            fmt.text(r.review_went_wrong),
+            fmt.text(r.review_lessons),
+            fmt.number(r.ideal_entry),
+            fmt.number(r.ideal_stop),
+            fmt.number(r.ideal_target),
+            fmt.number(r.revised_entry),
+            fmt.number(r.revised_stop),
+            fmt.number(r.revised_target),
+            fmt.text(r.position_id or ""),
+        ])
+    return header, out
+
+
+async def _export_executions(session: AsyncSession):
+    """Every execution as stored: the ledger everything else is derived from.
+
+    Column-only select, and every scalar column on `trades` except
+    `broker_original` -- the JSONB snapshot of what the broker said before the
+    first hand edit. It is left out because a JSON document inside a CSV cell is
+    how a CSV stops being readable by the thing it was exported for. It stays in
+    the database, and `edited_at` beside it is what tells you a row has one.
+
+    Decimals are written at the scale the columns hold, so this file reproduces
+    the ledger exactly rather than to float precision.
+    """
+    result = await session.execute(
+        select(
+            Trade.entry_date, Trade.ticker, Trade.direction, Trade.quantity,
+            Trade.actual_entry, Trade.exit_date, Trade.exit_price,
+            Trade.commission, Trade.broker_realized_pnl, Trade.broker_cost_basis,
+            Trade.style, Trade.source_tag, Trade.ibkr_exec_id,
+            Trade.strategy_id, Trade.planned_entry, Trade.stop_loss,
+            Trade.actual_stop_loss, Trade.target, Trade.risk_percent,
+            Trade.risk_amount, Trade.conviction, Trade.emotional_state,
+            Trade.thesis, Trade.grade, Trade.market_regime,
+            Trade.hard_sl_set, Trade.waited_retest, Trade.followed_plan,
+            Trade.screenshot_url, Trade.edited_at, Trade.created_at,
+            Trade.id, Trade.plan_id,
+        )
+        # id breaks the tie so two fills stamped the same second export in a
+        # stable order -- a diff between two exports should show what changed,
+        # not how the database felt about ordering that day.
+        .order_by(Trade.entry_date, Trade.id)
+    )
+    names = await _strategy_names(session)
+
+    header = [
+        "executed_at", "ticker", "direction", "quantity", "price",
+        "exit_date", "exit_price",
+        "commission", "broker_realized_pnl", "broker_cost_basis",
+        "style", "source", "ibkr_exec_id", "strategy",
+        "planned_entry", "stop_loss", "actual_stop_loss", "target",
+        "risk_percent", "risk_amount", "conviction", "emotional_state",
+        "thesis", "grade", "market_regime",
+        "hard_sl_set", "waited_retest", "followed_plan",
+        "screenshot_url", "edited_at", "created_at",
+        "trade_id", "plan_id",
+    ]
+
+    out = [
+        [
+            fmt.timestamp(t.entry_date),
+            fmt.text(t.ticker),
+            fmt.text(t.direction),
+            fmt.number(t.quantity),
+            fmt.number(t.actual_entry),
+            fmt.timestamp(t.exit_date),
+            fmt.number(t.exit_price),
+            fmt.number(t.commission),
+            fmt.number(t.broker_realized_pnl),
+            fmt.number(t.broker_cost_basis),
+            fmt.text(t.style),
+            fmt.text(t.source_tag),
+            fmt.text(t.ibkr_exec_id),
+            fmt.text(names.get(t.strategy_id, "")),
+            fmt.number(t.planned_entry),
+            fmt.number(t.stop_loss),
+            fmt.number(t.actual_stop_loss),
+            fmt.number(t.target),
+            fmt.number(t.risk_percent),
+            fmt.number(t.risk_amount),
+            fmt.number(t.conviction),
+            fmt.text(t.emotional_state),
+            fmt.text(t.thesis),
+            fmt.text(t.grade),
+            fmt.text(t.market_regime),
+            fmt.flag(t.hard_sl_set),
+            fmt.flag(t.waited_retest),
+            fmt.flag(t.followed_plan),
+            fmt.text(t.screenshot_url),
+            fmt.timestamp(t.edited_at),
+            fmt.timestamp(t.created_at),
+            fmt.text(t.id),
+            fmt.text(t.plan_id or ""),
+        ]
+        for t in result
+    ]
+    return header, out
+
+
+async def _export_investment_holdings(session: AsyncSession):
+    """The investment book at holding grain, as the portfolio page computes it.
+
+    Calls `get_portfolio` for the same reason the round-trip export calls
+    `list_round_trips`: portfolio weight cannot be computed for one row without
+    the total across every other one, and the valuation inputs exist in two
+    variants that combine only on read. Reimplementing either here would be a
+    second answer to a question the app has already answered once.
+    """
+    payload = await get_portfolio(session=session)
+
+    header = [
+        "ticker", "name", "sector", "category", "holding_type", "country",
+        "listed_currency", "exchange_rate",
+        "quantity", "average_cost", "cost_basis",
+        "current_price", "price_is_manual", "price_updated_at",
+        "day_change_pct",
+        "market_value", "unrealized_pnl", "unrealized_pnl_pct",
+        "realized_pnl", "dividends", "portfolio_weight_pct",
+        "planned_allocation", "transaction_count", "first_acquired",
+        "is_valuable", "valuation_available",
+        "intrinsic_value_base", "intrinsic_value_conservative",
+        "intrinsic_value_average", "premium_pct", "discount_rate",
+    ]
+
+    out = []
+    for row in payload["holdings"]:
+        # Absent for an ETF (is_valuable False) and for anything missing a DCF
+        # input. An empty valuation column means the model had nothing to say,
+        # which is not the same as a value of zero -- see _value_holding.
+        valuation = row.get("valuation") or {}
+        base = valuation.get("base") or {}
+        conservative = valuation.get("conservative") or {}
+        out.append([
+            fmt.text(row["ticker"]),
+            fmt.text(row["name"]),
+            fmt.text(row["sector"]),
+            fmt.text(row["category"]),
+            fmt.text(row["holding_type"]),
+            fmt.text(row["country"]),
+            fmt.text(row["listed_currency"]),
+            fmt.number(row["exchange_rate"]),
+            fmt.number(row["quantity"]),
+            fmt.number(row["average_cost"]),
+            fmt.number(row["cost_basis"]),
+            fmt.number(row["current_price"]),
+            fmt.flag(row["price_is_manual"]),
+            fmt.timestamp(row["price_updated_at"]),
+            fmt.number(row["day_change_pct"]),
+            fmt.number(row["market_value"]),
+            fmt.number(row["unrealized_pnl"]),
+            fmt.number(row["unrealized_pnl_pct"]),
+            fmt.number(row["realized_pnl"]),
+            fmt.number(row["dividends"]),
+            fmt.number(row["portfolio_weight_pct"]),
+            fmt.number(row["planned_allocation"]),
+            fmt.number(row["transaction_count"]),
+            fmt.timestamp(row["first_acquired"]),
+            fmt.flag(row["is_valuable"]),
+            fmt.flag(valuation.get("available")),
+            fmt.number(base.get("intrinsic_value")),
+            fmt.number(conservative.get("intrinsic_value")),
+            fmt.number(valuation.get("average_intrinsic_value")),
+            fmt.number(valuation.get("premium_pct")),
+            fmt.number(valuation.get("discount_rate")),
+        ])
+    return header, out
+
+
+async def _export_investment_transactions(session: AsyncSession):
+    """Every investment transaction as stored: the book's own ledger.
+
+    The whole investment side is derived from these rows -- quantity, average
+    cost, realised P&L and dividends are all replayed from them on every read
+    (see `_derive_position`). Nothing else in the app can reconstruct them.
+    """
+    result = await session.execute(
+        select(
+            InvestmentTransaction.transaction_date,
+            InvestmentTransaction.ticker,
+            InvestmentTransaction.transaction_type,
+            InvestmentTransaction.quantity,
+            InvestmentTransaction.price,
+            InvestmentTransaction.total_amount,
+            InvestmentTransaction.fees,
+            InvestmentTransaction.listed_currency,
+            InvestmentTransaction.exchange_rate,
+            InvestmentTransaction.source,
+            InvestmentTransaction.external_id,
+            InvestmentTransaction.note,
+            InvestmentTransaction.created_at,
+            InvestmentTransaction.id,
+        ).order_by(InvestmentTransaction.transaction_date, InvestmentTransaction.id)
+    )
+
+    header = [
+        "transaction_date", "ticker", "transaction_type", "quantity", "price",
+        "total_amount", "fees", "listed_currency", "exchange_rate",
+        "source", "external_id", "note", "created_at", "transaction_id",
+    ]
+
+    out = [
+        [
+            fmt.timestamp(t.transaction_date),
+            fmt.text(t.ticker),
+            fmt.text(t.transaction_type),
+            fmt.number(t.quantity),
+            fmt.number(t.price),
+            fmt.number(t.total_amount),
+            fmt.number(t.fees),
+            fmt.text(t.listed_currency),
+            fmt.number(t.exchange_rate),
+            fmt.text(t.source),
+            fmt.text(t.external_id),
+            fmt.text(t.note),
+            fmt.timestamp(t.created_at),
+            fmt.text(t.id),
+        ]
+        for t in result
+    ]
+    return header, out
+
+
+# One endpoint over a registry rather than four near-identical endpoints: the
+# auth dependency, the response shape and the filename logic are the same for
+# all of them, so a fifth export should be a line here instead of another copy.
+_EXPORTS = {
+    ExportDataset.ROUND_TRIPS: (_export_round_trips, "trading-round-trips"),
+    ExportDataset.EXECUTIONS: (_export_executions, "trading-executions"),
+    ExportDataset.INVESTMENT_HOLDINGS: (
+        _export_investment_holdings, "investment-holdings",
+    ),
+    ExportDataset.INVESTMENT_TRANSACTIONS: (
+        _export_investment_transactions, "investment-transactions",
+    ),
+}
+
+
+@app.get(
+    "/api/export/{dataset}.csv",
+    dependencies=[Depends(verify_clerk_token)],
+    responses={200: {"content": {"text/csv": {}}}},
+)
+async def export_csv(
+    dataset: ExportDataset,
+    session: AsyncSession = Depends(get_session),
+):
+    """Download one dataset as CSV.
+
+    Deliberately NOT ETagged and NOT cacheable. Every other read endpoint here
+    revalidates against `data_version`, and that is right for a page which
+    should show what is current. An export is different: it is a snapshot
+    someone asked for by name, and a cache handing back a copy from earlier
+    would produce a file that silently predates the data it claims to hold --
+    the one failure a backup must not have.
+    """
+    from services.analytics import market_today  # noqa: PLC0415 - avoids a cycle
+
+    build, stem = _EXPORTS[dataset]
+    header, rows = await build(session)
+
+    # Market date, not the server's. An export taken at breakfast in Singapore
+    # is still the previous session in New York, and naming it with the UTC date
+    # would file it a day ahead of the trades inside it.
+    filename = f"{stem}-{market_today().isoformat()}.csv"
+
+    return Response(
+        content=fmt.render(header, rows).encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )

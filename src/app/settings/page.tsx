@@ -6,6 +6,9 @@ import {
   AlertCircle,
   ArrowLeft,
   Check,
+  Database,
+  Download,
+  FileSpreadsheet,
   GhostIcon,
   Loader2,
   SlidersHorizontal,
@@ -17,7 +20,9 @@ import {
   useSuppressedExecutions,
   useUpdateSettings,
 } from '@/hooks/useTradeInbox';
+import { useExportCsv } from '@/hooks/useCsvExport';
 import { SuppressedFillsModal } from '@/components/SuppressedFillsModal';
+import type { ExportDataset } from '@/types/api';
 
 /**
  * Held as strings for the same reason the trade form does: a controlled number
@@ -39,6 +44,46 @@ const toNullableNumber = (raw: string): number | null => {
 const money = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 
+/**
+ * The four exports, in the order they are offered.
+ *
+ * Analysis grain first in each pair, because that is the one wanted most of the
+ * time. The ledger grain is described as the irreplaceable one rather than the
+ * detailed one -- "every fill" undersells why it matters, which is that nothing
+ * else in the system can reconstruct those rows.
+ */
+const EXPORTS: {
+  dataset: ExportDataset;
+  label: string;
+  detail: string;
+  ledger: boolean;
+}[] = [
+  {
+    dataset: 'round-trips',
+    label: 'Trading — round trips',
+    detail: 'One row per trade idea: plan, outcome, R, grade and review.',
+    ledger: false,
+  },
+  {
+    dataset: 'executions',
+    label: 'Trading — executions',
+    detail: 'Every fill exactly as stored. Cannot be rebuilt from anything else.',
+    ledger: true,
+  },
+  {
+    dataset: 'investment-holdings',
+    label: 'Investing — holdings',
+    detail: 'One row per holding: cost, price, value, weight and intrinsic value.',
+    ledger: false,
+  },
+  {
+    dataset: 'investment-transactions',
+    label: 'Investing — transactions',
+    detail: 'Every transaction as stored. The whole book is derived from these.',
+    ledger: true,
+  },
+];
+
 export default function SettingsPage() {
   const settingsQuery = useSettings();
   const saveMutation = useUpdateSettings();
@@ -56,6 +101,11 @@ export default function SettingsPage() {
   // non-zero badge is the only hint that anything is being skipped at all.
   const suppressedQuery = useSuppressedExecutions();
   const suppressedCount = suppressedQuery.data?.length ?? 0;
+
+  // One mutation behind four buttons. `variables` names the dataset in flight,
+  // so only the button that was clicked shows a spinner.
+  const exportMutation = useExportCsv();
+  const exporting = exportMutation.isPending ? exportMutation.variables : null;
 
   const settings = settingsQuery.data;
 
@@ -299,6 +349,68 @@ export default function SettingsPage() {
               </span>
             )}
           </button>
+        </section>
+
+        {/* Sits in Settings because it is about the data as a whole rather than
+            about any one trade -- and because a backup is a housekeeping act,
+            not part of the journalling loop. */}
+        <section className="mt-6 rounded-xl border border-obsidian-border bg-obsidian-card p-5">
+          <div className="mb-1 flex items-center gap-2">
+            <Download className="h-4 w-4 text-sky-400" />
+            <h2 className="text-sm font-semibold tracking-wide text-slate-200">
+              EXPORT YOUR DATA
+            </h2>
+          </div>
+          <p className="mb-4 max-w-2xl text-xs text-obsidian-muted">
+            Two files per book. The first of each pair is for analysis — the rows
+            the pages show, ready to pivot in a spreadsheet. The second is the
+            ledger exactly as stored, which is the one worth keeping somewhere
+            else: nothing in this app can rebuild those rows if the database is
+            lost.
+          </p>
+
+          <div className="grid gap-2 sm:grid-cols-2">
+            {EXPORTS.map(({ dataset, label, detail, ledger }) => {
+              const busy = exporting === dataset;
+              return (
+                <button
+                  key={dataset}
+                  type="button"
+                  onClick={() => exportMutation.mutate(dataset)}
+                  disabled={exportMutation.isPending}
+                  aria-busy={busy}
+                  className="group flex items-start gap-3 rounded-lg border border-obsidian-border bg-obsidian-bg p-3 text-left transition-colors hover:border-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <span className="mt-0.5 shrink-0 text-obsidian-muted group-hover:text-slate-200">
+                    {busy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : ledger ? (
+                      <Database className="h-4 w-4" />
+                    ) : (
+                      <FileSpreadsheet className="h-4 w-4" />
+                    )}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-xs font-medium text-slate-200">
+                      {label}
+                    </span>
+                    <span className="mt-0.5 block text-[11px] leading-snug text-obsidian-muted">
+                      {busy ? 'Preparing…' : detail}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Shown rather than swallowed. A download that silently does nothing
+              is indistinguishable from one the browser blocked. */}
+          {exportMutation.isError && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-loss-border bg-loss-glow px-3 py-2 text-xs text-loss">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{exportMutation.error.message}</span>
+            </div>
+          )}
         </section>
       </main>
 

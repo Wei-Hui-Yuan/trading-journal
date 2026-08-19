@@ -404,30 +404,41 @@ INVESTMENT_NAMES = {
 }
 
 
-def _names_by_line() -> tuple[list[tuple[str, int]], int]:
+def _names_by_line() -> tuple[list[tuple[str, int]], int, int]:
     """Every identifier main.py actually references, with its line.
 
     Parsed rather than grepped. A substring search reports `DerivedPosition`
     as a reference to `Position`, and flags any comment that mentions the
     trading side -- but comments explaining the separation are exactly what
     should be encouraged. Only real name and attribute references count.
+
+    Returns the two markers that divide the file into three regions: the
+    journal, the investment book, and the CSV exports. The exports read both
+    books deliberately -- that is what an export of everything is -- so they sit
+    outside both and are excluded from the partition rather than exempted
+    inside it. `end` is EOF when that section is absent, which makes the
+    partition revert to the stricter two-region form rather than opening a hole.
     """
     import ast
     import inspect
 
-    source = inspect.getsource(main)
-    boundary = next(
-        i for i, line in enumerate(source.splitlines(), 1)
-        if "# THE INVESTMENT BOOK" in line
-    )
+    lines = inspect.getsource(main).splitlines()
+
+    def marker(needle: str, default: int) -> int:
+        return next(
+            (i for i, line in enumerate(lines, 1) if needle in line), default
+        )
+
+    boundary = marker("# THE INVESTMENT BOOK", 0)
+    end = marker("# THE CSV EXPORTS", len(lines) + 1)
 
     found: list[tuple[str, int]] = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(ast.parse("\n".join(lines))):
         if isinstance(node, ast.Name):
             found.append((node.id, node.lineno))
         elif isinstance(node, ast.Attribute):
             found.append((node.attr, node.lineno))
-    return found, boundary
+    return found, boundary, end
 
 
 def test_the_investment_section_touches_no_trading_table():
@@ -435,10 +446,10 @@ def test_the_investment_section_touches_no_trading_table():
     investment book has grown a dependency on the journal and the two can no
     longer fail independently.
     """
-    found, boundary = _names_by_line()
+    found, boundary, end = _names_by_line()
     offenders = [
         (name, line) for name, line in found
-        if line >= boundary and name in TRADING_NAMES
+        if boundary <= line < end and name in TRADING_NAMES
     ]
     assert not offenders, f"investment section references trading models: {offenders}"
 
@@ -446,7 +457,7 @@ def test_the_investment_section_touches_no_trading_table():
 def test_no_trading_endpoint_calls_into_the_investment_book():
     """The other direction, and the one that would actually break the journal:
     nothing above the section may depend on anything inside it."""
-    found, boundary = _names_by_line()
+    found, boundary, _end = _names_by_line()
     offenders = [
         (name, line) for name, line in found
         if line < boundary and name in INVESTMENT_NAMES
@@ -457,9 +468,18 @@ def test_no_trading_endpoint_calls_into_the_investment_book():
 def test_the_boundary_test_can_actually_fail():
     """A guardrail that cannot fire is decoration. Confirms both name sets
     appear somewhere in the file, so the two tests above are checking a real
-    partition rather than passing on empty sets."""
-    found, boundary = _names_by_line()
+    partition rather than passing on empty sets.
+
+    The last assertion earns its keep now that the investment region has an END
+    as well as a start: the export section narrowed the window, and a window
+    narrowed until it is empty makes the test above pass by examining nothing.
+    """
+    found, boundary, end = _names_by_line()
     names = {name for name, _ in found}
     assert TRADING_NAMES & names, "no trading models found at all"
     assert INVESTMENT_NAMES & names, "no investment models found at all"
     assert any(line >= boundary for _, line in found), "section boundary is at EOF"
+    assert boundary < end, "the investment section starts after it ends"
+    assert any(
+        boundary <= line < end for _, line in found
+    ), "the investment region is empty -- the partition test now checks nothing"
