@@ -153,6 +153,16 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Before the build, because it is the faster of the two and the more
+      # likely to fail: a broken build is usually a broken import, which the
+      # typecheck above has already caught.
+      #
+      # No Clerk keys here. These tests mount hooks, not pages, so nothing
+      # reaches ClerkProvider -- and the build step below is what proves the
+      # provider is satisfied.
+      - name: Test
+        run: npm test
+
       # Clerk's provider wraps every statically prerendered page, so the build
       # needs a publishable key present and well-formed. These are throwaway
       # values with no account behind them -- structurally valid so the SDK can
