@@ -135,7 +135,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Comfortably above Next 14.2's floor of >=18.17, and an LTS line, so
+          # Comfortably above Next 16's floor of >=20.9, and an LTS line, so
           # this does not need revisiting on a whim. Note there is no .nvmrc or
           # `engines` field in the repo: local development and Vercel each pick
           # their own version independently. Adding one is worth doing, but it
@@ -152,6 +152,17 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      # First time this project has ever been linted in CI. The `lint` script
+      # carried no config for the life of the repo, so `next lint` could not
+      # run -- and Next 16 removed that command outright, which is what forced
+      # the real setup.
+      #
+      # Runs with a `--max-warnings` baseline rather than a clean slate: see
+      # eslint.config.mjs for why the 23 known warnings are warnings and not
+      # errors. The point of the cap is that the 24th fails here.
+      - name: Lint
+        run: npm run lint
 
       # Before the build, because it is the faster of the two and the more
       # likely to fail: a broken build is usually a broken import, which the
