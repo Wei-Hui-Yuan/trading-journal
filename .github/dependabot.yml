@@ -1,0 +1,82 @@
+# Dependabot: the thing that notices a dependency moved.
+#
+# Until now nothing did. The Next.js CVEs that were fixed by hand were found
+# because someone happened to run `npm audit` during unrelated work -- and they
+# had been public for a while by then. For a project that gets attention in
+# occasional evening sessions months apart, "someone happens to look" is not a
+# strategy. This is the thing that looks.
+#
+# Deliberately NOT auto-merging anything. Every update arrives as a pull request
+# that CI runs and a person reads. That matters most for `next`, which this repo
+# pins exactly and upgrades only as a deliberate decision -- Dependabot may
+# propose that, but it does not get to make it.
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # The frontend
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      # Monday morning Singapore time, so a week's worth of PRs is waiting at
+      # the start of the week rather than arriving through it.
+      day: monday
+      time: '09:00'
+      timezone: Asia/Singapore
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps arrive as ONE pull request. Twenty separate PRs
+      # for twenty patch bumps is how a notification channel becomes noise that
+      # gets muted, and a muted channel is worse than none.
+      minor-and-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      # Security fixes, separated so they are never queued behind routine
+      # version churn.
+      security:
+        applies-to: security-updates
+        patterns: ['*']
+    # Majors stay UNGROUPED on purpose: each one is a migration with its own
+    # breaking changes, and reviewing several at once in a single diff is how a
+    # breaking change gets waved through.
+
+  # ---------------------------------------------------------------------------
+  # The API
+  # ---------------------------------------------------------------------------
+  # requirements.txt is fully pinned, including transitive dependencies, which
+  # is what makes `pip install --no-deps` in CI a real check. Dependabot
+  # respects exact pins and raises a PR to move them rather than resolving
+  # around them.
+  - package-ecosystem: pip
+    directory: /api
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Singapore
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      security:
+        applies-to: security-updates
+        patterns: ['*']
+
+  # ---------------------------------------------------------------------------
+  # The workflows themselves
+  # ---------------------------------------------------------------------------
+  # Actions are pinned by major tag (`actions/checkout@v4`), which silently
+  # stops receiving updates once a v5 exists. This is what surfaces that.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      timezone: Asia/Singapore
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ['*']
