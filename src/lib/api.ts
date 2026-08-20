@@ -12,8 +12,10 @@ import type {
   PositionDeleteResult,
   SuppressedExecution,
   UnsuppressResult,
+  CsvExport,
   Discipline,
   DisciplineCreatePayload,
+  ExportDataset,
   IngestAccepted,
   IngestResult,
   IngestStarted,
@@ -867,4 +869,80 @@ export async function promoteSizingEntry(id: string): Promise<TradePlan> {
     `/sizing-scratchpad/${id}/promote`
   );
   return data;
+}
+
+// ===========================================================================
+// CSV export
+// ===========================================================================
+
+/** How long an export may take. */
+const EXPORT_TIMEOUT_MS = 60_000;
+
+/**
+ * Pull the filename out of a Content-Disposition header.
+ *
+ * Returns null rather than guessing, so the caller's fallback is visible in one
+ * place instead of being buried in a regex that quietly matched nothing. The
+ * header is only readable at all because the API lists it in
+ * `expose_headers` -- it is not CORS-safelisted, and without that the browser
+ * strips it.
+ */
+function filenameFromDisposition(header: unknown): string | null {
+  if (typeof header !== 'string') return null;
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+/**
+ * Recover the server's error message from a failed blob request.
+ *
+ * `responseType: 'blob'` makes the RESPONSE a blob whether it succeeded or
+ * not, so on a 4xx/5xx the shared response interceptor finds `data.detail`
+ * undefined and leaves the useless "Request failed with status code 500". The
+ * body is still JSON -- it just arrived wrapped -- so unwrap it here, at the
+ * only endpoint in the app that asks for a blob.
+ */
+async function unwrapBlobError(error: unknown): Promise<unknown> {
+  if (!axios.isAxiosError(error) || !(error.response?.data instanceof Blob)) {
+    return error;
+  }
+  try {
+    const parsed = JSON.parse(await error.response.data.text()) as {
+      detail?: unknown;
+    };
+    const detail = messageFromDetail(parsed.detail);
+    if (detail) error.message = detail;
+  } catch {
+    // Not JSON after all. The status-code message is poor but honest, and
+    // inventing a better one here would be worse.
+  }
+  return error;
+}
+
+/**
+ * GET /api/export/{dataset}.csv — download one dataset.
+ *
+ * Fetched through axios rather than pointed at with a plain link: the API needs
+ * an Authorization header on every request, and an `<a href>` cannot carry one.
+ * The bytes therefore arrive here and the caller is what hands them to the
+ * browser as a file.
+ */
+export async function downloadExport(dataset: ExportDataset): Promise<CsvExport> {
+  try {
+    const response = await apiClient.get(`/export/${dataset}.csv`, {
+      responseType: 'blob',
+      // Longer than the shared 30s: the round-trip export reads the whole
+      // ledger and every fill behind it in one pass, where an ordinary request
+      // reads one page.
+      timeout: EXPORT_TIMEOUT_MS,
+    });
+    return {
+      blob: response.data as Blob,
+      filename:
+        filenameFromDisposition(response.headers['content-disposition']) ??
+        `${dataset}.csv`,
+    };
+  } catch (error) {
+    throw await unwrapBlobError(error);
+  }
 }

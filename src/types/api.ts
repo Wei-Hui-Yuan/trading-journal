@@ -1472,3 +1472,33 @@ export interface AuditResult {
   status: AuditStatus;
   checks: AuditCheck[];
 }
+
+// ---------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------
+
+/**
+ * The four exports, at two grains per book.
+ *
+ * The ANALYSIS grain (`round-trips`, `investment-holdings`) is the unit each
+ * half of the app is about, carrying the derived figures the pages show -- the
+ * file to pivot in a spreadsheet.
+ *
+ * The LEDGER grain (`executions`, `investment-transactions`) is the rows as
+ * stored. Those are the records that cannot be recomputed from anything else,
+ * and they carry no derived column at all.
+ *
+ * These strings are the API path segment, not labels -- they must keep matching
+ * `ExportDataset` in api/main.py.
+ */
+export type ExportDataset =
+  | 'round-trips'
+  | 'executions'
+  | 'investment-holdings'
+  | 'investment-transactions';
+
+/** A downloaded export, with the filename the server chose for it. */
+export interface CsvExport {
+  blob: Blob;
+  filename: string;
+}

@@ -53,3 +53,6 @@ yarn-error.log*
 Thumbs.db
 *.swp
 .idea/
+
+# clerk configuration (can include secrets)
+/.clerk/
