@@ -51,6 +51,13 @@ export default defineConfig({
      *     -- exactly the shape where a new one could invalidate nothing, or
      *     the wrong thing, and every existing assertion would still pass. A
      *     single uncovered branch in any of these six fails the build.
+     *
+     *   * `PlanModal.tsx` is tested (30 cases) but deliberately NOT in this
+     *     list. It lands at 82%/76%/75%/81% -- strong, but the edit-mode
+     *     chart replace/delete flow and a few other paths were scoped out of
+     *     that pass, so a 100% gate on it would fail today rather than guard
+     *     anything. Its coverage still counts toward the global floor above;
+     *     it earns the hard gate once those remaining paths are covered.
      */
     coverage: {
       provider: 'v8',
@@ -58,10 +65,10 @@ export default defineConfig({
       exclude: ['src/types/**', '**/*.test.{ts,tsx}'],
       reporter: ['text-summary', 'html', 'json-summary'],
       thresholds: {
-        statements: 6,
-        branches: 4,
-        functions: 6,
-        lines: 6,
+        statements: 12,
+        branches: 10,
+        functions: 11,
+        lines: 12,
 
         'src/lib/positionSizing.ts': {
           statements: 100, branches: 100, functions: 100, lines: 100,
