@@ -1,0 +1,83 @@
+# Scheduled vulnerability audit.
+#
+# Separate from ci.yml on purpose, and the reason is the failure mode each one
+# is allowed to have.
+#
+# ci.yml answers "does this change work" and blocks merging when it does not.
+# A CVE published in a transitive dependency is not a broken change -- it is
+# news about the outside world, and wiring it into ci.yml would mean an
+# unrelated advisory somewhere in the tree blocks every pull request until it is
+# resolved. That is how an audit step ends up being disabled.
+#
+# So this runs on its own clock and fails on its own. A red scheduled run mails
+# the repository owner, which is exactly the notification that was missing when
+# the Next.js advisories sat unnoticed.
+
+name: Audit
+
+on:
+  schedule:
+    # 01:00 UTC Monday = 09:00 Monday in Singapore, matching Dependabot's
+    # window so the week starts with both the advisories and the PRs that fix
+    # them. Cron has no timezone; UTC is the only thing GitHub accepts.
+    - cron: '0 1 * * 1'
+  # Runnable by hand, which is how it gets used after a long gap -- nothing in
+  # the repo changed but a great deal outside it did.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` rather than a bare audit: auditing needs a resolved tree, and
+      # this audits the tree the lockfile actually produces rather than whatever
+      # a fresh resolution would pick today.
+      - name: Install locked dependencies
+        run: npm ci
+
+      # `high` is the floor deliberately. Every advisory that has actually
+      # mattered on this project was high or critical, and failing on `low`
+      # would produce a red run for an advisory nobody would act on -- which
+      # trains you to ignore the red.
+      - name: Audit
+        run: npm audit --audit-level=high
+
+  pip:
+    name: pip audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches api/Dockerfile's python:3.12-slim, so this audits the
+          # interpreter production actually runs.
+          python-version: '3.12'
+
+      # pip-audit is installed here rather than added to requirements-dev.txt:
+      # nothing in the test suite imports it, and requirements-dev is checked in
+      # CI with `pip install --no-deps`, so an entry there would have to be
+      # pinned along with its own transitive tree for a tool that only ever runs
+      # in this job.
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      # Audits the pinned runtime set -- the dependencies that actually reach
+      # production, where the auth and the database live. Dev-only tooling is
+      # left out: a vulnerability in a test runner is not exposed to anything.
+      - name: Audit runtime dependencies
+        run: pip-audit --strict --requirement requirements.txt

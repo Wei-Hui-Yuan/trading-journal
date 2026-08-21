@@ -61,9 +61,30 @@ def test_no_rules_followed_scores_0():
 
 
 def test_a_mixed_answer_set_scores_the_share_followed():
-    assert compute_discipline_score({"a": True, "b": True, "c": False}) == round(
-        2 / 3 * 100, 2
-    )
+    # Written as a literal rather than as `round(2 / 3 * 100, 2)`. Asserting
+    # against the same expression the implementation evaluates cannot fail --
+    # it would have gone on passing through the rounding change below.
+    assert compute_discipline_score({"a": True, "b": True, "c": False}) == 66.67
+
+
+def test_a_tie_rounds_up_the_way_the_browser_does():
+    """The one case where this used to disagree with src/lib/discipline.ts.
+
+    The score is duplicated in the frontend so a single journal row does not
+    need a round trip to compute it, which makes "the two agree" a real
+    requirement rather than a tidiness one. They did not: `round(x, 2)` is
+    half-to-even and JavaScript's `Math.round` is half-up, so one followed rule
+    out of 32 -- an exact tie at 3.125 -- scored 3.12 here and 3.13 in the
+    browser.
+
+    32 answered rules on one trade is unreachable today (there are five), which
+    is exactly why nobody would have noticed until the playbook grew. Pinned at
+    the smallest divergent case so the two implementations cannot drift apart
+    again silently.
+    """
+    thirty_two = {f"rule_{i}": i == 0 for i in range(32)}
+
+    assert compute_discipline_score(thirty_two) == 3.13
 
 
 def test_an_unanswered_trade_scores_none_not_zero():

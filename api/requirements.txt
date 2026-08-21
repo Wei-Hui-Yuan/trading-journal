@@ -88,12 +88,12 @@ anyio==4.13.0                   # via httpx, starlette
 certifi==2026.2.25              # via httpx, httpcore
 cffi==2.0.0                     # via cryptography
 click==8.4.2                    # via uvicorn, gunicorn
-cryptography==46.0.7            # via pyjwt[crypto]
+cryptography==50.0.0            # via pyjwt[crypto]
 greenlet==3.5.3                 # via sqlalchemy[asyncio]
 h11==0.16.0                     # via httpcore, uvicorn
 httpcore==1.0.9                 # via httpx
 httptools==0.8.0                # via uvicorn[standard]
-idna==3.11                      # via anyio, httpx
+idna==3.19                      # via anyio, httpx
 packaging==26.0                 # via gunicorn
 pycparser==3.0                  # via cffi
 pydantic-core==2.46.3           # via pydantic

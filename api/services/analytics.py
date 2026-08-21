@@ -10,6 +10,7 @@ the response boundary, so rounding never accumulates through the aggregation.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -1167,11 +1168,29 @@ def compute_discipline_score(disciplines: dict[str, bool]) -> Optional[float]:
     has no compliance to report, and reading it as 0% would count a review
     backlog as total indiscipline -- the exact trap PositionDiscipline's own
     docstring warns against for the single-rule case.
+
+    HALF-UP, not Python's built-in `round`. This formula is deliberately
+    duplicated in the frontend (src/lib/discipline.ts) so a single row's score
+    does not need a round trip to compute, and the two have to agree to the
+    digit or the same trade reads differently in a journal row than it does
+    behind a compliance bucket.
+
+    `round(x, 2)` is half-to-EVEN, and JavaScript has no equivalent: `Math.round`
+    is half-up, and reproducing Python's banker's rounding in JS means
+    reimplementing it against the exact binary value of a double. So the
+    agreement is bought on this side instead, where `floor(x * 10000 + 0.5)` is
+    precisely what `Math.round(x * 10000)` does for a non-negative x -- and a
+    percentage is never negative.
+
+    The two used to diverge, by one hundredth, on any tie: 1 followed rule of 32
+    gave 3.12 here and 3.13 in the browser. Unreachable in practice (it takes 32
+    answered rules and there are five), which is exactly why it would have gone
+    unnoticed until the playbook grew.
     """
     if not disciplines:
         return None
     followed = sum(1 for value in disciplines.values() if value)
-    return round(followed / len(disciplines) * 100, 2)
+    return math.floor(followed / len(disciplines) * 10000 + 0.5) / 100
 
 
 # Fixed percentage ranges, not derived from the current rule count. The
