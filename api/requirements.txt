@@ -96,7 +96,7 @@ httptools==0.8.0                # via uvicorn[standard]
 idna==3.19                      # via anyio, httpx
 packaging==26.3                 # via gunicorn
 pycparser==3.0                  # via cffi
-pydantic-core==2.48.0           # via pydantic
+pydantic-core==2.46.4           # via pydantic
 pyyaml==6.0.3                   # via uvicorn[standard]
 starlette==1.6.0                # via fastapi
 typing-extensions==4.16.0       # via pydantic, sqlalchemy, starlette
