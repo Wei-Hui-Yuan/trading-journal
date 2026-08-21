@@ -28,7 +28,19 @@ const config = [
     // Build output, dependencies, generated types, and the Python API.
     // `.next/dev` is new in 16, which split dev output so dev and build can run
     // concurrently.
-    ignores: ['.next/**', 'node_modules/**', 'next-env.d.ts', 'api/**'],
+    //
+    // `coverage/**` matters more than it looks: the HTML reporter writes
+    // istanbul's own bundled assets (prettify.js, sorter.js, block-navigation.js)
+    // there, and linting them adds three warnings that have nothing to do with
+    // this codebase -- enough to trip the --max-warnings ratchet on a run that
+    // changed no source at all.
+    ignores: [
+      '.next/**',
+      'coverage/**',
+      'node_modules/**',
+      'next-env.d.ts',
+      'api/**',
+    ],
   },
 
   ...next,

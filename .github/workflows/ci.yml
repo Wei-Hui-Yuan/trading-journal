@@ -171,8 +171,14 @@ jobs:
       # No Clerk keys here. These tests mount hooks, not pages, so nothing
       # reaches ClerkProvider -- and the build step below is what proves the
       # provider is satisfied.
+      #
+      # Runs WITH coverage rather than bare, because the thresholds in
+      # vitest.config.mts are only enforced when coverage is collected. The
+      # global floors are low by necessity and catch tests being deleted; the
+      # per-file 100% entries on the four fully-covered lib modules are the real
+      # gate, and they only bite here.
       - name: Test
-        run: npm test
+        run: npm run test:coverage
 
       # Clerk's provider wraps every statically prerendered page, so the build
       # needs a publishable key present and well-formed. These are throwaway
