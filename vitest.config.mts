@@ -39,12 +39,18 @@ export default defineConfig({
      *     where tests are deleted or a large untested surface lands, both of
      *     which push the percentage down.
      *
-     *   * The PER-FILE 100% entries are the real gate. Those four modules are
-     *     fully covered today, and they are the ones where a gap would hurt:
-     *     position sizing decides how much money goes on a trade, discipline
-     *     duplicates a backend formula, format fixes two bugs that reached
-     *     production, and download is eight lines with three load-bearing ones.
-     *     A single uncovered branch appearing in any of them fails the build.
+     *   * The PER-FILE 100% entries are the real gate: modules that are fully
+     *     covered today, and where a gap would hurt. `positionSizing` decides
+     *     how much money goes on a trade; `discipline` duplicates a backend
+     *     formula and has to keep agreeing with it; `format` fixes two bugs
+     *     that already reached production; `download` is eight lines with
+     *     three load-bearing ones; `investmentsApi` is the HTTP layer for a
+     *     second book with no domain logic of its own to catch a wrong verb
+     *     or URL; `useInvestments` wires thirteen mutations to cache keys, and
+     *     eleven of them invalidate the SAME key for eleven different reasons
+     *     -- exactly the shape where a new one could invalidate nothing, or
+     *     the wrong thing, and every existing assertion would still pass. A
+     *     single uncovered branch in any of these six fails the build.
      */
     coverage: {
       provider: 'v8',
@@ -52,10 +58,10 @@ export default defineConfig({
       exclude: ['src/types/**', '**/*.test.{ts,tsx}'],
       reporter: ['text-summary', 'html', 'json-summary'],
       thresholds: {
-        statements: 3,
-        branches: 3,
-        functions: 1,
-        lines: 3,
+        statements: 6,
+        branches: 4,
+        functions: 6,
+        lines: 6,
 
         'src/lib/positionSizing.ts': {
           statements: 100, branches: 100, functions: 100, lines: 100,
@@ -67,6 +73,12 @@ export default defineConfig({
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         'src/lib/download.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/lib/investmentsApi.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/hooks/useInvestments.ts': {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
       },
