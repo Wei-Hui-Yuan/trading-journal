@@ -33,13 +33,13 @@
 # Direct dependencies
 # ---------------------------------------------------------------------------
 
-fastapi==0.139.2
-uvicorn[standard]==0.51.0
-sqlalchemy[asyncio]==2.0.51
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+sqlalchemy[asyncio]==2.0.52
 asyncpg==0.31.0
 httpx==0.28.1
-python-dotenv==1.2.2
-pydantic==2.13.3
+python-dotenv==1.2.3
+pydantic==2.13.4
 
 # Multipart form parsing, which FastAPI needs for UploadFile. The chart
 # screenshot attached to a plan (POST /api/plans/{id}/chart) is the only
@@ -67,7 +67,7 @@ pyjwt[crypto]==2.13.0
 # Declaring it also pins the tz rules themselves. DST boundaries decide which
 # session a fill is classified into, so "America/New_York" quietly changing
 # under a rebuild is a data-correctness event; this makes it a commit.
-tzdata==2026.1
+tzdata==2026.3
 
 # Production WSGI/ASGI process manager. Previously installed by a bare
 # `pip install gunicorn` line in the Dockerfile, which put the one process that
@@ -82,25 +82,25 @@ gunicorn==26.0.0
 # machine, where pip must skip uvloop and add colorama.
 # ---------------------------------------------------------------------------
 
-annotated-doc==0.0.4            # via fastapi
-annotated-types==0.7.0          # via pydantic
-anyio==4.13.0                   # via httpx, starlette
-certifi==2026.2.25              # via httpx, httpcore
-cffi==2.0.0                     # via cryptography
+annotated-doc==0.0.5            # via fastapi
+annotated-types==0.8.0          # via pydantic
+anyio==4.14.2                   # via httpx, starlette
+certifi==2026.7.22              # via httpx, httpcore
+cffi==2.1.1                     # via cryptography
 click==8.4.2                    # via uvicorn, gunicorn
 cryptography==50.0.0            # via pyjwt[crypto]
-greenlet==3.5.3                 # via sqlalchemy[asyncio]
+greenlet==3.5.5                 # via sqlalchemy[asyncio]
 h11==0.16.0                     # via httpcore, uvicorn
 httpcore==1.0.9                 # via httpx
 httptools==0.8.0                # via uvicorn[standard]
 idna==3.19                      # via anyio, httpx
-packaging==26.0                 # via gunicorn
+packaging==26.3                 # via gunicorn
 pycparser==3.0                  # via cffi
-pydantic-core==2.46.3           # via pydantic
+pydantic-core==2.48.0           # via pydantic
 pyyaml==6.0.3                   # via uvicorn[standard]
-starlette==1.3.1                # via fastapi
-typing-extensions==4.15.0       # via pydantic, sqlalchemy, starlette
-typing-inspection==0.4.2        # via pydantic
+starlette==1.6.0                # via fastapi
+typing-extensions==4.16.0       # via pydantic, sqlalchemy, starlette
+typing-inspection==0.4.4        # via pydantic
 watchfiles==1.2.0               # via uvicorn[standard]
 websockets==16.0                # via uvicorn[standard]
 
