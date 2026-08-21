@@ -39,12 +39,25 @@ export default defineConfig({
      *     where tests are deleted or a large untested surface lands, both of
      *     which push the percentage down.
      *
-     *   * The PER-FILE 100% entries are the real gate. Those four modules are
-     *     fully covered today, and they are the ones where a gap would hurt:
-     *     position sizing decides how much money goes on a trade, discipline
-     *     duplicates a backend formula, format fixes two bugs that reached
-     *     production, and download is eight lines with three load-bearing ones.
-     *     A single uncovered branch appearing in any of them fails the build.
+     *   * The PER-FILE 100% entries are the real gate: modules that are fully
+     *     covered today, and where a gap would hurt. `positionSizing` decides
+     *     how much money goes on a trade; `discipline` duplicates a backend
+     *     formula and has to keep agreeing with it; `format` fixes two bugs
+     *     that already reached production; `download` is eight lines with
+     *     three load-bearing ones; `investmentsApi` is the HTTP layer for a
+     *     second book with no domain logic of its own to catch a wrong verb
+     *     or URL; `useInvestments` wires thirteen mutations to cache keys, and
+     *     eleven of them invalidate the SAME key for eleven different reasons
+     *     -- exactly the shape where a new one could invalidate nothing, or
+     *     the wrong thing, and every existing assertion would still pass. A
+     *     single uncovered branch in any of these six fails the build.
+     *
+     *   * `PlanModal.tsx` is tested (30 cases) but deliberately NOT in this
+     *     list. It lands at 82%/76%/75%/81% -- strong, but the edit-mode
+     *     chart replace/delete flow and a few other paths were scoped out of
+     *     that pass, so a 100% gate on it would fail today rather than guard
+     *     anything. Its coverage still counts toward the global floor above;
+     *     it earns the hard gate once those remaining paths are covered.
      */
     coverage: {
       provider: 'v8',
@@ -52,10 +65,10 @@ export default defineConfig({
       exclude: ['src/types/**', '**/*.test.{ts,tsx}'],
       reporter: ['text-summary', 'html', 'json-summary'],
       thresholds: {
-        statements: 3,
-        branches: 3,
-        functions: 1,
-        lines: 3,
+        statements: 12,
+        branches: 10,
+        functions: 11,
+        lines: 12,
 
         'src/lib/positionSizing.ts': {
           statements: 100, branches: 100, functions: 100, lines: 100,
@@ -67,6 +80,12 @@ export default defineConfig({
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         'src/lib/download.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/lib/investmentsApi.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/hooks/useInvestments.ts': {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
       },
