@@ -10,6 +10,8 @@
  * suite at all.
  */
 
+import '@testing-library/jest-dom/vitest';
+
 // `export {}` makes this a module, which is what `declare global` requires.
 export {};
 
