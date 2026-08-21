@@ -1,6 +1,42 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Where Tailwind scans for the classes it generates CSS for. v4 dropped the
+   JS config file as the default source of this, in favour of `@source`
+   directives sitting next to the CSS they affect. */
+@source "../components/**/*.{js,ts,jsx,tsx,mdx}";
+@source "../app/**/*.{js,ts,jsx,tsx,mdx}";
+
+/**
+ * The custom palette, ported from tailwind.config.ts's `theme.extend`.
+ *
+ * v4 moved theme customization out of the JS config and into CSS variables
+ * here -- a `colors.win.DEFAULT` becomes `--color-win` (bare), and each
+ * nested key becomes a suffixed variable (`colors.win.glow` ->
+ * `--color-win-glow`), which is what keeps `bg-win`, `text-win-glow` and
+ * every other utility already used across the app resolving unchanged.
+ *
+ * `darkMode: "class"` was NOT ported: grep confirms zero `dark:` utilities
+ * anywhere in this app. The dark palette is achieved entirely through these
+ * hardcoded colors and `className="dark"` on `<html>` in layout.tsx, which
+ * stays as inert markup -- Tailwind itself never conditions on it.
+ */
+@theme {
+  --color-obsidian-bg: #090D16;
+  --color-obsidian-card: #111726;
+  --color-obsidian-border: #1E293B;
+  --color-obsidian-muted: #64748B;
+
+  --color-win: #10B981;
+  --color-win-glow: rgba(16, 185, 129, 0.08);
+  --color-win-border: rgba(16, 185, 129, 0.25);
+
+  --color-loss: #F43F5E;
+  --color-loss-glow: rgba(244, 63, 94, 0.08);
+  --color-loss-border: rgba(244, 63, 94, 0.25);
+
+  --shadow-win-glow: 0 0 15px -3px rgba(16, 185, 129, 0.2);
+  --shadow-loss-glow: 0 0 15px -3px rgba(244, 63, 94, 0.2);
+}
 
 :root {
   --foreground-rgb: 255, 255, 255;
