@@ -45,7 +45,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         {/* Sub-breakdown: Market Trading P&L vs Broker Fees */}
         <div className="mt-3 pt-2.5 border-t border-obsidian-border/60 flex flex-col space-y-1 font-mono">
           <div className="flex justify-between items-center text-xs">
-            <span className="text-obsidian-muted text-[11px]">Market Trading P&amp;L:</span>
+            <span className="text-[11px] font-semibold text-slate-300">Market Trading P&amp;L:</span>
             <span className={stats.grossPnl >= 0 ? 'text-win font-semibold' : 'text-loss font-semibold'}>
               {formatMoney(stats.grossPnl)}
             </span>
@@ -58,7 +58,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
                 separately — about 5.3c per closing fill. That is precisely
                 what makes the three lines here sum to the statement. */}
             <span
-              className="text-obsidian-muted text-[11px] cursor-help border-b border-dotted border-obsidian-border"
+              className="text-[11px] font-semibold text-slate-300 cursor-help border-b border-dotted border-obsidian-border"
               title={
                 `IBKR commission: ${formatMoney(-stats.ibCommission)}\n` +
                 `Exchange, clearing & regulatory: ${formatMoney(
@@ -101,7 +101,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
           {stats.openRunPnl !== 0 && (
             <div className="flex justify-between items-center text-xs">
               <span
-                className="text-obsidian-muted text-[11px] cursor-help border-b border-dotted border-obsidian-border"
+                className="text-[11px] font-semibold text-slate-300 cursor-help border-b border-dotted border-obsidian-border"
                 title={
                   'Realised by scaling out of positions you still hold. Already ' +
                   'in Net P&L, but not in the closed round trips below — those ' +
@@ -143,6 +143,47 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         <div className="mt-2 text-[11px] text-obsidian-muted">
           <span>{stats.totalTrades} trade{stats.totalTrades === 1 ? '' : 's'}</span>
         </div>
+
+        {/* The population behind the percentage, in Net P&L's breakdown
+            vocabulary rather than a new one -- same divider, same row shape,
+            same 11px muted label against a coloured figure.
+
+            Rendered only when the API reports it. `wins === null` means an
+            older backend that never counted, which is a different fact from
+            a window that genuinely had none, and inventing "0 W" for it
+            would be a lie the card cannot take back. */}
+        {stats.wins !== null && stats.losses !== null && (
+          <div className="mt-3 pt-2.5 border-t border-obsidian-border/60 flex flex-col space-y-1 font-mono">
+            <div className="flex justify-between items-center text-xs">
+              <span className="text-[11px] font-semibold text-slate-300">Wins:</span>
+              <span className="text-win font-semibold">{stats.wins}</span>
+            </div>
+            <div className="flex justify-between items-center text-xs">
+              <span className="text-[11px] font-semibold text-slate-300">Losses:</span>
+              <span className="text-loss font-semibold">{stats.losses}</span>
+            </div>
+            {/* Only when there are some, exactly like Net P&L's open-positions
+                row. A scratch closed at precisely break-even, so it is neither
+                a win nor a loss -- but win_rate_pct divides by ALL trades, so
+                it still drags the percentage down. Naming it is what stops
+                "47 + 87 does not make 136" from reading as a bug. */}
+            {stats.scratches !== null && stats.scratches > 0 && (
+              <div className="flex justify-between items-center text-xs">
+                <span
+                  className="text-[11px] font-semibold text-slate-300 cursor-help border-b border-dotted border-obsidian-border"
+                  title={
+                    'Closed at exactly break-even, so neither a win nor a loss. ' +
+                    'Still counted in the ' + stats.totalTrades + ' above, and still ' +
+                    'in the win rate’s denominator.'
+                  }
+                >
+                  Scratches:
+                </span>
+                <span className="text-slate-300 font-semibold">{stats.scratches}</span>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Trade Quality: Profit Factor, Avg ROI, and Avg R merged into one

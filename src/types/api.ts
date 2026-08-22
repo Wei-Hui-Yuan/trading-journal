@@ -1219,6 +1219,21 @@ export interface CoreStats {
   win_rate_pct: number;
   total_trades: number;
   /**
+   * The population behind `win_rate_pct`, so the strip can show "47W / 89L".
+   *
+   * These need NOT sum to `total_trades`. A round trip that closed at exactly
+   * break-even is a scratch — neither win nor loss — the same distinction
+   * `HeatmapCell.profit_factor` already relies on. `win_rate_pct` is
+   * wins/total_trades, so a scratch dilutes it rather than sitting outside
+   * the denominator.
+   *
+   * Optional because a frontend deploy can land before the API one; treat
+   * absence as "not reported" and fall back to the bare trade count.
+   */
+  wins?: number;
+  losses?: number;
+  scratches?: number;
+  /**
    * Gross wins / gross losses.
    *
    * `null` when there are no losing trades — the ratio is unbounded and has no
@@ -1430,6 +1445,15 @@ export interface KPIStats {
   openRunPnl: number;
   winRate: number;
   totalTrades: number;
+  /**
+   * Win/loss/scratch counts, or null when the API did not report them (an
+   * older backend). Null is distinct from zero: zero means "counted, none
+   * found", null means "not counted", and only the second should fall back
+   * to showing the bare trade count.
+   */
+  wins: number | null;
+  losses: number | null;
+  scratches: number | null;
   /** null when there are no losing trades - the ratio is unbounded. */
   profitFactor: number | null;
   avgRoi: number;

@@ -61,6 +61,9 @@ const EMPTY_STATS: KPIStats = {
   totalCommission: 0,
   winRate: 0,
   totalTrades: 0,
+  wins: null,
+  losses: null,
+  scratches: null,
   profitFactor: 0,
   avgRoi: 0,
   avgR: null,
@@ -108,6 +111,11 @@ export default function Home() {
         totalCommission: core.total_commission ?? 0,
         winRate: core.win_rate_pct,
         totalTrades: core.total_trades,
+        // `?? null`, not `?? 0`: an API that has not shipped these yet must
+        // fall back to the bare trade count, not claim zero wins.
+        wins: core.wins ?? null,
+        losses: core.losses ?? null,
+        scratches: core.scratches ?? null,
         // Passed through as null rather than coerced to 0: the strip renders
         // an unbounded ratio as infinity.
         profitFactor: core.profit_factor,
