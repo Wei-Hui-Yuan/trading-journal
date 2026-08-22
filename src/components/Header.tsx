@@ -73,7 +73,7 @@ const SyncStatusBadge: React.FC = () => {
 
   if (!lastSync && !persisted) {
     return (
-      <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-obsidian-border text-xs font-mono">
+      <div className="flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border border-obsidian-border text-sm font-mono">
         <span className="h-2 w-2 rounded-full bg-slate-600" />
         <span className="text-slate-300">IBKR Sync:</span>
         <span className="text-obsidian-muted">never</span>
@@ -93,7 +93,7 @@ const SyncStatusBadge: React.FC = () => {
 
   if (running) {
     return (
-      <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border border-slate-600 text-xs font-mono">
+      <div className="flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border border-slate-600 text-sm font-mono">
         <span className="h-2 w-2 rounded-full bg-slate-300 animate-pulse" />
         <span className="text-slate-300">IBKR Sync:</span>
         <span className="text-slate-300">
@@ -152,7 +152,7 @@ const SyncStatusBadge: React.FC = () => {
 
   return (
     <div
-      className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border ${tone.border} text-xs font-mono`}
+      className={`flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border ${tone.border} text-sm font-mono`}
       title={
         (stale
           ? days === null
@@ -206,7 +206,7 @@ const DataHealthBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
       type="button"
       onClick={onOpen}
       title="FIFO and broker reconciliation — does stored state still agree with the fills?"
-      className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-obsidian-bg border ${tone.border} text-xs font-mono transition-colors hover:border-slate-600`}
+      className={`flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border ${tone.border} text-sm font-mono transition-colors hover:border-slate-600`}
     >
       <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
       <span className="text-slate-300">Data:</span>
@@ -249,7 +249,7 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
       {/* Row 1: identity, live status, account. Nothing here is navigation --
           it is either who this is (branding, avatar) or what state the app
           is in right now (sync, data health, pending reviews). */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
 
         <div className="flex items-center space-x-3">
           <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-win/20 to-emerald-900/40 border border-win/30 flex items-center justify-center shadow-win-glow">
@@ -267,28 +267,36 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
         {/* The "Regime: Bull Trending" badge that used to sit here was static
             text — it never consulted anything and read as live market state. */}
         <div className="flex items-center space-x-3">
+          {/* Grouped with the two status badges, not styled as an alert
+              anymore: the amber-950/pulse/spin treatment it used to have here
+              duplicated the KPI strip's own "Inbox Queue" card (now removed)
+              and borrowed the same busy-spinner vocabulary SyncBrokerButton
+              uses for a sync actually in progress -- a static count sitting
+              beside "syncing" made the two impossible to tell apart at a
+              glance. Left of IBKR Sync because it is the more actionable of
+              the three: reviews waiting on you outrank status you are only
+              checking. Hidden entirely at zero, same as before. */}
           <div className="hidden md:flex items-center space-x-3">
+            {pendingCount > 0 && (
+              <div className="flex items-center space-x-2 px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-sm font-mono">
+                <RefreshCw className="h-4 w-4" />
+                <span>{pendingCount} Pending Reviews</span>
+              </div>
+            )}
             <SyncStatusBadge />
             <DataHealthBadge onOpen={() => setIsHealthOpen(true)} />
           </div>
 
-          {pendingCount > 0 && (
-            <div className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-mono animate-pulse">
-              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-              <span>{pendingCount} Pending Reviews</span>
-            </div>
-          )}
-
           <Link
             href="/settings"
             aria-label="Settings"
-            className="p-2 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition"
+            className="p-3 rounded-lg bg-obsidian-bg border border-obsidian-border text-obsidian-muted hover:text-slate-200 hover:border-slate-700 transition"
           >
-            <SlidersHorizontal className="h-4 w-4" />
+            <SlidersHorizontal className="h-5 w-5" />
           </Link>
 
-          <div className="h-8 w-8 rounded-lg bg-slate-800 border border-obsidian-border flex items-center justify-center text-slate-300 font-semibold text-xs">
-            <User className="h-4 w-4 text-slate-400" />
+          <div className="h-11 w-11 rounded-lg bg-slate-800 border border-obsidian-border flex items-center justify-center text-slate-300 font-semibold text-xs">
+            <User className="h-5 w-5 text-slate-400" />
           </div>
         </div>
       </div>
@@ -297,15 +305,15 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
           "do something right now" (Plan Trade, Sync Broker) -- kept apart
           from row 1's status indicators, which are neither. */}
       <div className="border-t border-obsidian-border">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-11 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
           <nav className="flex items-center space-x-5 overflow-x-auto">
             {NAV_LINKS.map(({ href, label, icon: Icon }) => (
               <Link
                 key={href}
                 href={href}
-                className="inline-flex items-center gap-1.5 py-1 text-xs font-medium text-obsidian-muted whitespace-nowrap border-b-2 border-transparent hover:text-slate-100 hover:border-slate-600 transition-colors"
+                className="inline-flex items-center gap-1.5 py-3 text-sm font-medium text-obsidian-muted whitespace-nowrap border-b-2 border-transparent hover:text-slate-100 hover:border-slate-600 transition-colors"
               >
-                <Icon className="h-3.5 w-3.5" />
+                <Icon className="h-4 w-4" />
                 {label}
               </Link>
             ))}
@@ -319,9 +327,9 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
             <button
               type="button"
               onClick={() => setIsPlanOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
             >
-              <ClipboardList className="h-3.5 w-3.5" />
+              <ClipboardList className="h-4 w-4" />
               <span className="hidden sm:inline">Plan Trade</span>
             </button>
 

@@ -1,12 +1,13 @@
 /**
- * KPIStatStrip: scoped to the Avg R card only.
+ * KPIStatStrip: scoped to the two merged cards from the Phase 3 redesign
+ * (Win Rate + Total Trades, and the Profit Factor / Avg ROI / Avg R "Trade
+ * Quality" card) plus the pre-existing Avg R coverage that card absorbed.
  *
- * The rest of this component (Net P&L, Win Rate, Total Trades, Profit
- * Factor, Avg ROI, Inbox Queue) has no test coverage of its own, and this
- * file does not attempt to add it -- that would be a much larger, separate
- * undertaking than the one new card this suite exists to verify. Avg R is
- * pure presentation (a `KPIStats` prop straight to JSX, no hooks, no query),
- * so it is cheap to test in isolation without mounting the dashboard page
+ * Net P&L has no test coverage of its own, and this file does not attempt
+ * to add it -- that would be a much larger, separate undertaking than the
+ * merge this suite exists to verify. Both merged cards are pure
+ * presentation (a `KPIStats` prop straight to JSX, no hooks, no query), so
+ * they are cheap to test in isolation without mounting the dashboard page
  * that actually produces the prop.
  */
 
@@ -33,11 +34,16 @@ function stats(overrides: Partial<KPIStats> = {}): KPIStats {
     avgRoi: 0,
     avgR: null,
     avgRSample: 0,
-    pendingCount: 0,
     ...overrides,
   };
 }
 
+function winRateCard() {
+  return within(screen.getByText('Win Rate').closest('div.rounded-xl') as HTMLElement);
+}
+
+/** Scopes to the merged "Trade Quality" card -- Profit Factor, Avg ROI, and
+ * Avg R all live inside it, so any of their own labels works as the anchor. */
 function avgRCard() {
   return within(screen.getByText('Avg R').closest('div.rounded-xl') as HTMLElement);
 }
@@ -76,5 +82,60 @@ describe('KPIStatStrip > Avg R card', () => {
 
     rerender(<KPIStatStrip stats={stats({ avgR: 1, avgRSample: 2 })} />);
     expect(await avgRCard().findByText('2 scored trades')).toBeInTheDocument();
+  });
+});
+
+describe('KPIStatStrip > Win Rate card (merged with Total Trades)', () => {
+  it('renders the win rate headline and the trade count as its qualifier', async () => {
+    render(<KPIStatStrip stats={stats({ winRate: 34.56, totalTrades: 136 })} />);
+    const card = winRateCard();
+    expect(await card.findByText('34.56%')).toBeInTheDocument();
+    expect(await card.findByText('136 trades')).toBeInTheDocument();
+  });
+
+  it('keeps the trade count singular at exactly 1, same convention as the scored-trades hint', async () => {
+    render(<KPIStatStrip stats={stats({ totalTrades: 1 })} />);
+    expect(await winRateCard().findByText('1 trade')).toBeInTheDocument();
+  });
+
+  it("does not also render 'Sample Size' -- Total Trades' old standalone caption is gone, not duplicated", async () => {
+    render(<KPIStatStrip stats={stats({ totalTrades: 5 })} />);
+    expect(screen.queryByText('Sample Size')).not.toBeInTheDocument();
+  });
+});
+
+describe('KPIStatStrip > Trade Quality card (merged Profit Factor / Avg ROI / Avg R)', () => {
+  it('renders all three rows with their own values and qualifiers', async () => {
+    render(
+      <KPIStatStrip
+        stats={stats({ profitFactor: 1.85, avgRoi: 3.2, avgR: 0.45, avgRSample: 28 })}
+      />
+    );
+    const card = avgRCard();
+    expect(await card.findByText('1.85')).toBeInTheDocument();
+    expect(await card.findByText('Gross win $ / loss $')).toBeInTheDocument();
+    expect(await card.findByText('+3.20%')).toBeInTheDocument();
+    expect(await card.findByText('+0.45R')).toBeInTheDocument();
+  });
+
+  it('renders infinity, not a number, for a null profit factor', async () => {
+    render(<KPIStatStrip stats={stats({ profitFactor: null })} />);
+    expect(await avgRCard().findByText('∞')).toBeInTheDocument();
+  });
+
+  it('captions Avg ROI as "Capital-weighted", not the old, wrong "Per Execution" (avg_roi_pct sums whole positions, not fills)', async () => {
+    render(<KPIStatStrip stats={stats({ avgRoi: 1 })} />);
+    expect(await avgRCard().findByText('Capital-weighted')).toBeInTheDocument();
+    expect(screen.queryByText('Per Execution')).not.toBeInTheDocument();
+  });
+
+  it('does not render Profit Factor, Avg ROI, or Avg R as their own separate cards anymore', () => {
+    render(<KPIStatStrip stats={stats({})} />);
+    expect(screen.queryByText('Profit Factor ($)')?.closest('div.rounded-xl')).toBe(
+      screen.queryByText('Avg Trade ROI')?.closest('div.rounded-xl')
+    );
+    expect(screen.queryByText('Avg Trade ROI')?.closest('div.rounded-xl')).toBe(
+      screen.queryByText('Avg R')?.closest('div.rounded-xl')
+    );
   });
 });
