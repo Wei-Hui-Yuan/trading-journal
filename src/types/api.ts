@@ -1433,6 +1433,15 @@ export interface KPIStats {
   /** null when there are no losing trades - the ratio is unbounded. */
   profitFactor: number | null;
   avgRoi: number;
+  /**
+   * Average R per trade, from the SAME source as the Analytics tab's own
+   * figure (`AdvancedMetrics.avg_r`) -- not derived from `core_stats`, which
+   * has no notion of R at all. Null when no trade in the window has both an
+   * exit and a usable stop to score.
+   */
+  avgR: number | null;
+  /** How many scored trades `avgR` is averaged over. 0 exactly when avgR is null. */
+  avgRSample: number;
   pendingCount: number;
 }
 

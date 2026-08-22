@@ -40,6 +40,7 @@ import type { KPIStats, TimeframeSelection } from '@/types/api';
 import {
   usePendingPositions,
   useDashboardStats,
+  useAdvancedMetrics,
 } from '@/hooks/useTradeInbox';
 
 /**
@@ -62,6 +63,8 @@ const EMPTY_STATS: KPIStats = {
   totalTrades: 0,
   profitFactor: 0,
   avgRoi: 0,
+  avgR: null,
+  avgRSample: 0,
   pendingCount: 0,
 };
 
@@ -82,8 +85,17 @@ export default function Home() {
   // and the stat strip does not double-fetch.
   const dashboardQuery = useDashboardStats(timeframe);
   const pendingQuery = usePendingPositions();
+  // The SAME query the Analytics tab runs for this window -- avg_r has no
+  // home in core_stats, which has no notion of R at all, so this is a second
+  // request rather than a field threaded through the dashboard endpoint. No
+  // loading/error UI of its own: like pendingQuery below, it degrades to the
+  // strip's own null handling while pending, which is the same tradeoff
+  // TradeLedger.tsx's secondary queries already make.
+  const metricsQuery = useAdvancedMetrics(timeframe);
 
   const pendingCount = pendingQuery.data?.length ?? 0;
+  const avgR = metricsQuery.data?.avg_r ?? null;
+  const avgRSample = metricsQuery.data?.scored_trades ?? 0;
 
   // Map the API's snake_case core stats onto the strip's view model.
   const core = dashboardQuery.data?.core_stats;
@@ -101,9 +113,11 @@ export default function Home() {
         // an unbounded ratio as infinity.
         profitFactor: core.profit_factor,
         avgRoi: core.avg_roi_pct,
+        avgR,
+        avgRSample,
         pendingCount,
       }
-    : { ...EMPTY_STATS, pendingCount };
+    : { ...EMPTY_STATS, avgR, avgRSample, pendingCount };
 
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownRight,
@@ -592,15 +592,6 @@ const PlanVsExecution: React.FC<{
   );
 };
 
-const planCandidateTimeFormatter = new Intl.DateTimeFormat('en-US', {
-  month: 'short',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-  timeZone: 'America/New_York',
-});
-
 /**
  * The escape hatch for the normal plan-then-fill-then-sync order.
  *
@@ -638,7 +629,7 @@ const AttachPlanPanel: React.FC<{
         <p className="text-[11px] text-obsidian-muted">
           No open plan for {rt.symbol} {rt.direction}
           {plans && plans.length > 0
-            ? ` (${plans.length} open plan${plans.length === 1 ? '' : 's'} exist for other tickers or directions).`
+            ? ` (${plans.length} open plan${plans.length === 1 ? ' exists' : 's exist'} for other tickers or directions).`
             : '.'}
         </p>
       ) : (
@@ -659,7 +650,7 @@ const AttachPlanPanel: React.FC<{
               </span>
               {plan.created_at && (
                 <span className="font-mono text-[10px] text-obsidian-muted">
-                  written {planCandidateTimeFormatter.format(new Date(plan.created_at))} ET
+                  written {planTimeFormatter.format(new Date(plan.created_at))} ET
                 </span>
               )}
               <button
@@ -723,6 +714,11 @@ export const TradeLedger: React.FC = () => {
     [filter, selectedStrategy, searchTerm]
   );
 
+  // Distinguishes "nothing matches what you asked for" from "there is
+  // nothing here at all" -- the same isFiltered-driven split
+  // InvestmentTable.tsx uses for its own empty state.
+  const isFiltered = filter !== 'all' || selectedStrategy !== 'all' || searchTerm !== '';
+
   const {
     flat: visible,
     isLoading,
@@ -738,6 +734,12 @@ export const TradeLedger: React.FC = () => {
   } = useRoundTrips(filters);
   // Independent of the filter above — see the hook.
   const openCount = useOpenRoundTripCount();
+  // Neither this, openCount above, nor openPlans below has loading/error UI
+  // of its own -- each degrades to "empty" (0, an unpopulated dropdown, no
+  // attach candidates) while pending, or if the request fails outright.
+  // Deliberate: these are secondary reads the page can do without, unlike
+  // the round trips query above, whose own loading/error states this
+  // component does handle explicitly.
   const { data: strategies } = useStrategies();
   const annotate = useAnnotateTrade();
   const review = useReviewPosition();
@@ -761,7 +763,12 @@ export const TradeLedger: React.FC = () => {
   // never gated on whether one is expanded, since that would mean an extra
   // round trip every time a row opens rather than one shared list.
   const { data: openPlans } = usePlans('OPEN');
-  const [planError, setPlanError] = useState<string | null>(null);
+  // Keyed by round trip, like planDrafts/reviewDrafts below. A failed
+  // attach/detach/plan-save/review-save must stay put on the row it happened
+  // to, not read as though it belongs to whichever row is expanded next --
+  // only one row is ever expanded at a time, but that is not the same
+  // guarantee as this error being cleared when the user moves on.
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   // Which fill is being corrected, and the in-progress values. Kept as strings
   // for the same reason the manual form does: a controlled number input has to
   // represent "empty" and mid-typing states that Number() would mangle.
@@ -785,8 +792,32 @@ export const TradeLedger: React.FC = () => {
     setExpanded((current) => (current === key ? null : key));
   }, []);
 
+  // A fill left mid-edit must not silently resume "editing" the next time its
+  // row is expanded. editingFillId is a single, ledger-wide value rather than
+  // one keyed per row -- there is never more than one expanded row to hold
+  // it -- so as soon as the previously-expanded row stops being the one
+  // showing (collapsed outright, or replaced by a different row opening) any
+  // in-progress fill edit belongs to a row the user can no longer see, and is
+  // discarded the same way clicking Cancel would.
+  const previouslyExpandedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previouslyExpandedRef.current;
+    previouslyExpandedRef.current = expanded;
+    if (previous) setEditingFillId(null);
+  }, [expanded]);
+
   const planOf = (rt: RoundTrip) => planDrafts[rt.key] ?? planDraftFrom(rt);
   const reviewOf = (rt: RoundTrip) => reviewDrafts[rt.key] ?? reviewDraftFrom(rt);
+
+  const setRowError = (rt: RoundTrip, message: string | null) =>
+    setRowErrors((prev) => {
+      if (message === null) {
+        if (!(rt.key in prev)) return prev;
+        const { [rt.key]: _removed, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [rt.key]: message };
+    });
 
   const setPlan = (rt: RoundTrip, patch: Partial<PlanDraft>) =>
     setPlanDrafts((prev) => ({ ...prev, [rt.key]: { ...planOf(rt), ...patch } }));
@@ -796,42 +827,56 @@ export const TradeLedger: React.FC = () => {
   const savePlan = (rt: RoundTrip) => {
     if (!rt.plan_trade_id) return;
     const d = planOf(rt);
-    annotate.mutate({
-      id: rt.plan_trade_id,
-      payload: {
-        strategy_id: d.strategyId || null,
-        thesis: d.thesis.trim() || null,
-        planned_entry: parseNumber(d.plannedEntry),
-        stop_loss: parseNumber(d.stopLoss),
-        actual_stop_loss: parseNumber(d.actualStopLoss),
-        target: parseNumber(d.target),
-        risk_percent: parseNumber(d.riskPercent),
-        risk_amount: parseNumber(d.riskAmount),
-        conviction: parseNumber(d.conviction),
-        emotional_state: d.emotionalState.trim() || null,
+    setRowError(rt, null);
+    annotate.mutate(
+      {
+        id: rt.plan_trade_id,
+        payload: {
+          strategy_id: d.strategyId || null,
+          thesis: d.thesis.trim() || null,
+          planned_entry: parseNumber(d.plannedEntry),
+          stop_loss: parseNumber(d.stopLoss),
+          actual_stop_loss: parseNumber(d.actualStopLoss),
+          target: parseNumber(d.target),
+          risk_percent: parseNumber(d.riskPercent),
+          risk_amount: parseNumber(d.riskAmount),
+          conviction: parseNumber(d.conviction),
+          emotional_state: d.emotionalState.trim() || null,
+        },
       },
-    });
+      {
+        onSuccess: () => setDeleteNotice(`${rt.symbol}: plan saved.`),
+        onError: (err) => setRowError(rt, err.message),
+      }
+    );
   };
 
   const saveReview = (rt: RoundTrip) => {
     if (!rt.position_id) return;
     const d = reviewOf(rt);
-    review.mutate({
-      id: rt.position_id,
-      payload: {
-        exit_reason: d.exitReason || null,
-        review_went_well: d.wentWell.trim() || null,
-        review_went_wrong: d.wentWrong.trim() || null,
-        review_lessons: d.lessons.trim() || null,
-        trade_grade: d.grade || null,
-        ideal_entry: parseNumber(d.idealEntry),
-        ideal_stop: parseNumber(d.idealStop),
-        ideal_target: parseNumber(d.idealTarget),
-        revised_entry: parseNumber(d.revisedEntry),
-        revised_stop: parseNumber(d.revisedStop),
-        revised_target: parseNumber(d.revisedTarget),
+    setRowError(rt, null);
+    review.mutate(
+      {
+        id: rt.position_id,
+        payload: {
+          exit_reason: d.exitReason || null,
+          review_went_well: d.wentWell.trim() || null,
+          review_went_wrong: d.wentWrong.trim() || null,
+          review_lessons: d.lessons.trim() || null,
+          trade_grade: d.grade || null,
+          ideal_entry: parseNumber(d.idealEntry),
+          ideal_stop: parseNumber(d.idealStop),
+          ideal_target: parseNumber(d.idealTarget),
+          revised_entry: parseNumber(d.revisedEntry),
+          revised_stop: parseNumber(d.revisedStop),
+          revised_target: parseNumber(d.revisedTarget),
+        },
       },
-    });
+      {
+        onSuccess: () => setDeleteNotice(`${rt.symbol}: review saved.`),
+        onError: (err) => setRowError(rt, err.message),
+      }
+    );
   };
 
   if (isLoading) {
@@ -847,7 +892,7 @@ export const TradeLedger: React.FC = () => {
     return (
       <div className="flex items-center justify-center py-16 text-sm text-loss">
         <AlertCircle className="mr-2 h-4 w-4" />
-        {(error as Error).message}
+        {error instanceof Error ? error.message : 'Failed to load journal.'}
       </div>
     );
   }
@@ -921,7 +966,7 @@ export const TradeLedger: React.FC = () => {
 
       {visible.length === 0 ? (
         <p className="py-16 text-center text-sm text-obsidian-muted">
-          No trades match this filter.
+          {isFiltered ? 'No trades match this filter.' : 'Nothing in the journal yet.'}
         </p>
       ) : (
         <div
@@ -955,7 +1000,7 @@ export const TradeLedger: React.FC = () => {
                   onToggle={toggleExpanded}
                 />
 
-                {isExpanded && plan && rev && (
+                {plan && rev && (
                   <div className="space-y-6 border-t border-obsidian-border px-4 py-4">
                     {/* What the headline P&L on the row above is made of. First,
                         because it explains a number the user has already read. */}
@@ -971,9 +1016,9 @@ export const TradeLedger: React.FC = () => {
                         }
                         onUnlink={() => {
                           if (!rt.plan_trade_id) return;
-                          setPlanError(null);
+                          setRowError(rt, null);
                           detachMutation.mutate(rt.plan_trade_id, {
-                            onError: (err) => setPlanError(err.message),
+                            onError: (err) => setRowError(rt, err.message),
                           });
                         }}
                       />
@@ -989,18 +1034,18 @@ export const TradeLedger: React.FC = () => {
                         }
                         onAttach={(planId) => {
                           if (!rt.plan_trade_id) return;
-                          setPlanError(null);
+                          setRowError(rt, null);
                           attachMutation.mutate(
                             { tradeId: rt.plan_trade_id, planId },
-                            { onError: (err) => setPlanError(err.message) }
+                            { onError: (err) => setRowError(rt, err.message) }
                           );
                         }}
                       />
                     )}
-                    {planError && (
+                    {rowErrors[rt.key] && (
                       <div className="flex items-start text-xs text-loss">
                         <AlertCircle className="mr-1.5 mt-px h-3.5 w-3.5 shrink-0" />
-                        <span>{planError}</span>
+                        <span>{rowErrors[rt.key]}</span>
                       </div>
                     )}
 
@@ -1591,11 +1636,12 @@ export const TradeLedger: React.FC = () => {
             commit: () => deleteTradeMutation.mutateAsync(fill.trade_id),
             onCommitted: (result) => {
               const r = result as TradeDeleteResult;
-              if (r.reviews_discarded > 0) {
-                setDeleteNotice(
-                  `${roundTrip.symbol}: ${r.positions_removed} round trip(s) removed, ${r.positions_rebuilt} rebuilt, ${r.reviews_discarded} review(s) discarded.`
-                );
-              }
+              setDeleteNotice(
+                `${roundTrip.symbol}: ${r.positions_removed} round trip(s) removed, ${r.positions_rebuilt} rebuilt` +
+                  (r.reviews_discarded > 0
+                    ? `, ${r.reviews_discarded} review(s) discarded.`
+                    : '.')
+              );
             },
             onError: (err) => setDeleteNotice(err.message),
           });
