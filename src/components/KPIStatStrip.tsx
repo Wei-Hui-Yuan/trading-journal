@@ -1,7 +1,7 @@
 import React from 'react';
 import type { KPIStats } from '@/types/api';
 import { formatMoney, formatSignedPercent } from '@/lib/format';
-import { TrendingUp, TrendingDown, Target, BarChart2, DollarSign, Clock, ShieldAlert } from 'lucide-react';
+import { TrendingUp, TrendingDown, Target, BarChart2, DollarSign, Clock, ShieldAlert, Crosshair } from 'lucide-react';
 
 interface KPIStatStripProps {
   stats: KPIStats;
@@ -11,8 +11,15 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
   const isNetWin = stats.netPnl >= 0;
   const isRoiPositive = stats.avgRoi > 0;
 
+  // lg:grid-cols-4, not -7: Net P&L is uniquely dense (5 sub-rows against
+  // everything else's 1-2), and forcing all 7 cards onto one row at
+  // max-w-7xl's ~1216px content width (the steady-state for every viewport
+  // from 1024px up, since the max-width caps it there) clips Net P&L's
+  // headline figure -- confirmed in-browser at both 1024px and 1280px
+  // before landing on 4. Wraps to a plain 4-then-3 second row instead,
+  // which comfortably fits every card at every width above.
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       
       {/* Net PnL */}
       <div className={`p-4 rounded-xl border bg-obsidian-card transition-all duration-200 ${
@@ -186,6 +193,42 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         </div>
         <div className="mt-2 text-[11px] text-obsidian-muted">
           <span>Per Execution</span>
+        </div>
+      </div>
+
+      {/* Avg R
+          A different denominator than the R above -- this is Analytics'
+          `avg_r`, from the trades ledger, not `core_stats`. null means no
+          trade in the window has both an exit and a usable stop to score,
+          which most journals will see before their first stop is entered. */}
+      <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Avg R</span>
+          <div className="p-1.5 rounded-lg bg-blue-500/10 text-blue-400">
+            <Crosshair className="h-4 w-4" />
+          </div>
+        </div>
+        <div className="mt-2 flex items-baseline justify-between">
+          <span
+            className={`text-2xl font-bold font-mono ${
+              stats.avgR === null
+                ? 'text-white'
+                : stats.avgR > 0
+                  ? 'text-win'
+                  : stats.avgR < 0
+                    ? 'text-loss'
+                    : 'text-white'
+            }`}
+          >
+            {stats.avgR === null
+              ? '—'
+              : `${stats.avgR >= 0 ? '+' : ''}${stats.avgR.toFixed(2)}R`}
+          </span>
+        </div>
+        <div className="mt-2 text-[11px] text-obsidian-muted">
+          <span>
+            {stats.avgRSample} scored trade{stats.avgRSample === 1 ? '' : 's'}
+          </span>
         </div>
       </div>
 

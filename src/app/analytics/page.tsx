@@ -111,6 +111,16 @@ function RDistribution({ metrics }: { metrics: AdvancedMetrics }) {
   );
 }
 
+// A journal can span years, so unlike TradeLedger.tsx's plan timestamps
+// (always fresh to the trade being viewed) this needs the year spelled out --
+// "Aug 15" alone would misdate anything traded before this year.
+const lastTradedFormatter = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: '2-digit',
+  year: 'numeric',
+  timeZone: 'America/New_York',
+});
+
 /**
  * Which playbook entries are actually earning their place.
  *
@@ -165,57 +175,88 @@ function StrategyBreakdownChart({ metrics }: { metrics: AdvancedMetrics }) {
           const positive = row.total_r >= 0;
           const width = half(row.total_r);
           const isUnassigned = row.strategy === 'Unassigned';
+
+          // Neither fits in the bar itself: a single total R says nothing
+          // about whether it came from one lucky trade or twenty steady
+          // ones, and the bar has no axis for time at all. best_r/worst_r
+          // are null together, exactly when there is nothing scored to
+          // range over.
+          const detail: string[] = [];
+          if (row.best_r !== null && row.worst_r !== null) {
+            detail.push(
+              `best ${row.best_r >= 0 ? '+' : ''}${row.best_r.toFixed(2)}R`,
+              `worst ${row.worst_r >= 0 ? '+' : ''}${row.worst_r.toFixed(2)}R`
+            );
+          }
+          if (row.last_traded !== null) {
+            detail.push(
+              `last traded ${lastTradedFormatter.format(new Date(row.last_traded))}`
+            );
+          }
+
           return (
-            <div key={row.strategy} className="flex items-center gap-3 group">
-              <div className="w-40 shrink-0 text-right">
-                {isUnassigned ? (
-                  <span
-                    className="text-[11px] text-obsidian-muted italic"
-                    title="Trades with no strategy set — assign one in the journal"
-                  >
-                    {row.strategy} ({row.trade_count})
-                  </span>
-                ) : (
-                  <Link
-                    href="/strategies"
-                    className="text-[11px] text-slate-300 hover:text-white hover:underline"
-                    title={`Open "${row.strategy}" in the strategy playbook`}
-                  >
-                    {row.strategy} ({row.trade_count})
-                  </Link>
-                )}
-              </div>
+            <div key={row.strategy}>
+              <div className="flex items-center gap-3 group">
+                <div className="w-40 shrink-0 text-right">
+                  {isUnassigned ? (
+                    <span
+                      className="text-[11px] text-obsidian-muted italic"
+                      title="Trades with no strategy set — assign one in the journal"
+                    >
+                      {row.strategy} ({row.trade_count})
+                    </span>
+                  ) : (
+                    <Link
+                      href="/strategies"
+                      className="text-[11px] text-slate-300 hover:text-white hover:underline"
+                      title={`Open "${row.strategy}" in the strategy playbook`}
+                    >
+                      {row.strategy} ({row.trade_count})
+                    </Link>
+                  )}
+                </div>
 
-              {/* Plot area: 50% either side of a centre zero line. */}
-              <div className="relative h-7 flex-1 rounded bg-obsidian-bg/60">
-                <div className="absolute inset-y-0 left-1/2 w-px bg-obsidian-border" />
-                <div
-                  className={`absolute inset-y-1 rounded-sm transition-opacity group-hover:opacity-90 ${
-                    positive ? 'bg-blue-500' : 'bg-loss'
+                {/* Plot area: 50% either side of a centre zero line. */}
+                <div className="relative h-7 flex-1 rounded bg-obsidian-bg/60">
+                  <div className="absolute inset-y-0 left-1/2 w-px bg-obsidian-border" />
+                  <div
+                    className={`absolute inset-y-1 rounded-sm transition-opacity group-hover:opacity-90 ${
+                      positive ? 'bg-blue-500' : 'bg-loss'
+                    }`}
+                    style={
+                      positive
+                        ? { left: '50%', width: `${width}%` }
+                        : { right: '50%', width: `${width}%` }
+                    }
+                    title={
+                      `${row.strategy}: ${row.total_r >= 0 ? '+' : ''}${row.total_r.toFixed(2)}R ` +
+                      `over ${row.scored} scored trade${row.scored === 1 ? '' : 's'}` +
+                      (row.unscored ? ` (${row.unscored} unscored)` : '') +
+                      (row.avg_r !== null ? ` · avg ${row.avg_r.toFixed(2)}R` : '') +
+                      (row.win_rate_pct !== null ? ` · win ${row.win_rate_pct}%` : '')
+                    }
+                  />
+                </div>
+
+                <span
+                  className={`w-16 shrink-0 text-right font-mono text-[11px] ${
+                    positive ? 'text-blue-400' : 'text-loss'
                   }`}
-                  style={
-                    positive
-                      ? { left: '50%', width: `${width}%` }
-                      : { right: '50%', width: `${width}%` }
-                  }
-                  title={
-                    `${row.strategy}: ${row.total_r >= 0 ? '+' : ''}${row.total_r.toFixed(2)}R ` +
-                    `over ${row.scored} scored trade${row.scored === 1 ? '' : 's'}` +
-                    (row.unscored ? ` (${row.unscored} unscored)` : '') +
-                    (row.avg_r !== null ? ` · avg ${row.avg_r.toFixed(2)}R` : '') +
-                    (row.win_rate_pct !== null ? ` · win ${row.win_rate_pct}%` : '')
-                  }
-                />
+                >
+                  {row.total_r >= 0 ? '+' : ''}
+                  {row.total_r.toFixed(2)}R
+                </span>
               </div>
 
-              <span
-                className={`w-16 shrink-0 text-right font-mono text-[11px] ${
-                  positive ? 'text-blue-400' : 'text-loss'
-                }`}
-              >
-                {row.total_r >= 0 ? '+' : ''}
-                {row.total_r.toFixed(2)}R
-              </span>
+              {detail.length > 0 && (
+                <div className="flex items-center gap-3">
+                  <div className="w-40 shrink-0" />
+                  <p className="mt-0.5 flex-1 text-[10px] text-obsidian-muted">
+                    {detail.join(' · ')}
+                  </p>
+                  <div className="w-16 shrink-0" />
+                </div>
+              )}
             </div>
           );
         })}
@@ -269,6 +310,13 @@ function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
   const rows = metrics.discipline_breakdown ?? [];
 
   const pct = (value: number | null) => (value === null ? '—' : `${value}%`);
+  // avg_r and r_sample are two separate fields on the wire, checked
+  // together rather than assumed to always agree -- the same defensive
+  // shape ComplianceBuckets below already uses for the identical pairing.
+  const r = (value: number | null, sample: number) =>
+    value === null || sample === 0
+      ? '—'
+      : `${value >= 0 ? '+' : ''}${value.toFixed(2)}R`;
 
   return (
     <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
@@ -305,12 +353,20 @@ function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
                   </td>
                   <td className="py-2 text-right font-mono text-slate-300">
                     {pct(row.followed.win_rate_pct)}
+                    {/* r_sample can be smaller than trade_count -- not every
+                        trade carries a stop to score R against. */}
+                    <div className="text-[10px] text-obsidian-muted">
+                      {r(row.followed.avg_r, row.followed.r_sample)}
+                    </div>
                   </td>
                   <td className="py-2 text-right font-mono text-slate-300">
                     {row.not_followed.trade_count}
                   </td>
                   <td className="py-2 text-right font-mono text-slate-300">
                     {pct(row.not_followed.win_rate_pct)}
+                    <div className="text-[10px] text-obsidian-muted">
+                      {r(row.not_followed.avg_r, row.not_followed.r_sample)}
+                    </div>
                   </td>
                   {/* Null means one side has no trades, so there is nothing to
                       compare against. Shown as a dash rather than 0, which
@@ -332,6 +388,28 @@ function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
                     {row.edge_win_rate_pct === null
                       ? '—'
                       : `${row.edge_win_rate_pct >= 0 ? '+' : ''}${row.edge_win_rate_pct} pts`}
+                    {/* The R-based edge can disagree with the win-rate edge
+                        above it -- a rule can win more often and still cost
+                        more per trade, or the reverse -- which is the whole
+                        reason to show both rather than only one. */}
+                    <div
+                      className={`text-[10px] font-normal ${
+                        row.edge_r === null
+                          ? 'text-obsidian-muted'
+                          : row.edge_r >= 0
+                            ? 'text-win'
+                            : 'text-loss'
+                      }`}
+                      title={
+                        row.edge_r === null
+                          ? 'No comparison available — every reviewed trade fell on one side of this rule'
+                          : 'R gained per trade by following this rule, against not following it'
+                      }
+                    >
+                      {row.edge_r === null
+                        ? '—'
+                        : `${row.edge_r >= 0 ? '+' : ''}${row.edge_r.toFixed(2)}R`}
+                    </div>
                   </td>
                 </tr>
               ))}
