@@ -7,8 +7,10 @@ import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
 import { DataHealthModal } from './DataHealthModal';
+import { SyncRunDetailModal } from './SyncRunDetailModal';
 import {
   useLastSync,
+  useLatestSyncRun,
   useSyncRunWatcher,
   useSyncStatus,
 } from '@/hooks/useTradeInbox';
@@ -57,19 +59,14 @@ const SYNC_STALE_AFTER_SECONDS = 80 * 60 * 60;
  * quiet market. The in-memory value still wins when it is NEWER, because a
  * sync that just finished should show instantly rather than after a refetch.
  */
-const SyncStatusBadge: React.FC = () => {
+const SyncStatusBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
   const lastSync = useLastSync();
   const { data: status } = useSyncStatus();
+  // Which run this badge is describing. Shared with the detail modal the
+  // badge opens, so the two can never name different runs.
+  const run = useLatestSyncRun();
 
   const persisted = status?.latest ?? null;
-
-  // Prefer whichever actually happened last. Normally that is the in-memory
-  // one during a session where you pressed the button, and the persisted one
-  // on a fresh page load or after the schedule ran.
-  const useMemory =
-    lastSync !== undefined &&
-    (persisted === null ||
-      new Date(lastSync.at).getTime() >= new Date(persisted.started_at).getTime());
 
   if (!lastSync && !persisted) {
     return (
@@ -104,14 +101,12 @@ const SyncStatusBadge: React.FC = () => {
     );
   }
 
-  const outcome = useMemory ? lastSync!.outcome : persisted!.outcome;
-  const at = useMemory ? lastSync!.at : persisted!.started_at;
-  const summary = useMemory
-    ? lastSync!.summary
-    : persisted!.error ??
-      (persisted!.trades_created > 0
-        ? `${persisted!.trades_created} new`
-        : `${persisted!.executions_parsed} returned`);
+  // Unreachable: the two branches above cover exactly the cases the hook
+  // returns null for. Present so this reads as total rather than relying on
+  // a non-null assertion to agree with a rule enforced elsewhere.
+  if (!run) return null;
+
+  const { outcome, at, summary } = run;
 
   // Stale beats fresh-but-red: a run that failed five minutes ago and a ledger
   // that has been un-synced for four days are different problems, and the
@@ -135,15 +130,15 @@ const SyncStatusBadge: React.FC = () => {
   // The status code only means something when the server answered, and only
   // this tab ever has one — a run read back from the record has no HTTP
   // response attached to it.
-  const code = useMemory
-    ? lastSync!.status !== null
-      ? ` · ${lastSync!.status}`
+  const code = run.fromMemory
+    ? run.status !== null
+      ? ` · ${run.status}`
       : ' · no response'
     : '';
   // Saying which is not cosmetic: "the schedule ran and found nothing" and
   // "nothing has run since you last pressed the button" are the two states
   // this badge exists to separate.
-  const source = !useMemory && persisted!.trigger === 'cron' ? ' · scheduled' : '';
+  const source = run.trigger === 'cron' ? ' · scheduled' : '';
 
   const days =
     status?.seconds_since_success != null
@@ -151,15 +146,19 @@ const SyncStatusBadge: React.FC = () => {
       : null;
 
   return (
-    <div
-      className={`flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border ${tone.border} text-sm font-mono`}
+    <button
+      type="button"
+      onClick={onOpen}
       title={
         (stale
           ? days === null
             ? 'No sync has ever completed successfully. '
             : `No successful sync for ${days} day${days === 1 ? '' : 's'}. `
-          : '') + `${summary} — ${new Date(at).toLocaleString()}`
+          : '') +
+        `${summary} — ${new Date(at).toLocaleString()}` +
+        '\n\nClick for the full result.'
       }
+      className={`flex items-center space-x-2 px-4 py-3 rounded-lg bg-obsidian-bg border ${tone.border} text-sm font-mono transition-colors hover:border-slate-600`}
     >
       <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
       <span className="text-slate-300">IBKR Sync:</span>
@@ -170,7 +169,7 @@ const SyncStatusBadge: React.FC = () => {
       <span className="text-obsidian-muted">
         {stale ? (days === null ? 'never succeeded' : `stale · ${days}d`) : summary}
       </span>
-    </div>
+    </button>
   );
 };
 
@@ -224,6 +223,7 @@ const DataHealthBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
 export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   const [isPlanOpen, setIsPlanOpen] = useState(false);
   const [isHealthOpen, setIsHealthOpen] = useState(false);
+  const [isSyncDetailOpen, setIsSyncDetailOpen] = useState(false);
 
   // MOUNTED HERE, AND NOWHERE ELSE. A sync now finishes in the background, so
   // something has to notice and do what the mutation's onSuccess used to:
@@ -283,7 +283,7 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
                 <span>{pendingCount} Pending Reviews</span>
               </div>
             )}
-            <SyncStatusBadge />
+            <SyncStatusBadge onOpen={() => setIsSyncDetailOpen(true)} />
             <DataHealthBadge onOpen={() => setIsHealthOpen(true)} />
           </div>
 
@@ -341,6 +341,10 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
       <PlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
 
       <DataHealthModal open={isHealthOpen} onClose={() => setIsHealthOpen(false)} />
+      <SyncRunDetailModal
+        open={isSyncDetailOpen}
+        onClose={() => setIsSyncDetailOpen(false)}
+      />
 
       {/* Mounted here so the summary survives navigating between pages while a
           sync is still in flight — the request outlives any one route. */}
