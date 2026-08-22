@@ -366,6 +366,9 @@ def compute_core_stats(
             "open_run_pnl": 0.0,
             "win_rate_pct": 0.0,
             "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "scratches": 0,
             "profit_factor": 0.0,
             "avg_roi_pct": 0.0,
         }
@@ -376,6 +379,10 @@ def compute_core_stats(
     gross_profit = Decimal("0")  # sum of winning P&L
     gross_loss = Decimal("0")  # sum of |losing P&L|
     wins = 0
+    # Counted, not just accumulated. `gross_loss` already sums the money; this
+    # is the population behind it, and win_rate_pct alone cannot be inverted to
+    # recover it once scratches exist -- see `scratches` in the return below.
+    losses = 0
     # Capital-weighted, not a mean of per-position ROI%: summed separately and
     # divided once, below, so a $1 position's +300% cannot swing the figure as
     # hard as a $1,000 position's +5%. Both sums are restricted to the same
@@ -403,6 +410,7 @@ def compute_core_stats(
             wins += 1
         elif pnl < 0:
             gross_loss += -pnl
+            losses += 1
 
         # ROI is measured against capital committed at entry. Guard the
         # denominator: a zero entry price or quantity would otherwise raise.
@@ -466,6 +474,18 @@ def compute_core_stats(
         "open_run_pnl": float(open_run_pnl),
         "win_rate_pct": round(wins / total_trades * 100, 2) if total_trades else 0.0,
         "total_trades": total_trades,
+        # The population behind win_rate_pct, split out so the dashboard can
+        # show "47W / 89L" rather than a bare percentage.
+        #
+        # These need NOT sum to total_trades. A round trip that closed at
+        # exactly break-even is neither -- it is a scratch, and it is named
+        # here for the same reason `open_run_pnl` is: an unexplained
+        # difference between two figures on one screen reads as a bug. Note
+        # that win_rate_pct is wins/total_trades, so scratches DILUTE it
+        # rather than being excluded from the denominator.
+        "wins": wins,
+        "losses": losses,
+        "scratches": total_trades - wins - losses,
         "profit_factor": profit_factor,
         # roi_pnl_sum, not net_pnl: net_pnl is leg-grain when legs are given
         # (the dashboard's normal case) and includes open_run_pnl, money

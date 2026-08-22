@@ -30,6 +30,11 @@ function stats(overrides: Partial<KPIStats> = {}): KPIStats {
     openRunPnl: 0,
     winRate: 0,
     totalTrades: 0,
+    // Default to the not-reported case, so every test that does not opt in
+    // is also asserting the older-API fallback still renders.
+    wins: null,
+    losses: null,
+    scratches: null,
     profitFactor: 0,
     avgRoi: 0,
     avgR: null,
@@ -101,6 +106,53 @@ describe('KPIStatStrip > Win Rate card (merged with Total Trades)', () => {
   it("does not also render 'Sample Size' -- Total Trades' old standalone caption is gone, not duplicated", async () => {
     render(<KPIStatStrip stats={stats({ totalTrades: 5 })} />);
     expect(screen.queryByText('Sample Size')).not.toBeInTheDocument();
+  });
+});
+
+describe('KPIStatStrip > Win Rate card win/loss split', () => {
+  it('renders the win and loss counts alongside the total', async () => {
+    render(<KPIStatStrip stats={stats({ winRate: 34.56, totalTrades: 136, wins: 47, losses: 89, scratches: 0 })} />);
+    const card = winRateCard();
+    expect(await card.findByText('136 trades')).toBeInTheDocument();
+    expect(await card.findByText('47')).toBeInTheDocument();
+    expect(await card.findByText('89')).toBeInTheDocument();
+  });
+
+  it('colors wins with the win token and losses with the loss token', async () => {
+    render(<KPIStatStrip stats={stats({ totalTrades: 10, wins: 6, losses: 4, scratches: 0 })} />);
+    const card = winRateCard();
+    expect(await card.findByText('6')).toHaveClass('text-win');
+    expect(await card.findByText('4')).toHaveClass('text-loss');
+  });
+
+  it('hides the scratches row when there are none, like Net P&L hides open positions', async () => {
+    render(<KPIStatStrip stats={stats({ totalTrades: 10, wins: 6, losses: 4, scratches: 0 })} />);
+    expect(screen.queryByText('Scratches:')).not.toBeInTheDocument();
+  });
+
+  it('shows the scratches row when a round trip closed exactly flat', async () => {
+    render(<KPIStatStrip stats={stats({ totalTrades: 10, wins: 6, losses: 3, scratches: 1 })} />);
+    const card = winRateCard();
+    expect(await card.findByText('Scratches:')).toBeInTheDocument();
+    expect(await card.findByText('1')).toBeInTheDocument();
+  });
+
+  it('falls back to the bare trade count when the API did not report the split', async () => {
+    // wins === null is an older backend, which is NOT the same fact as a
+    // window with zero wins -- rendering "0" for it would be an invention.
+    render(<KPIStatStrip stats={stats({ totalTrades: 136, wins: null, losses: null, scratches: null })} />);
+    const card = winRateCard();
+    expect(await card.findByText('136 trades')).toBeInTheDocument();
+    expect(screen.queryByText('Wins:')).not.toBeInTheDocument();
+    expect(screen.queryByText('Losses:')).not.toBeInTheDocument();
+  });
+
+  it('still renders the split when a window genuinely had zero wins', async () => {
+    // The counterpart to the test above: 0 is reported, null is not.
+    render(<KPIStatStrip stats={stats({ totalTrades: 3, wins: 0, losses: 3, scratches: 0 })} />);
+    const card = winRateCard();
+    expect(await card.findByText('Wins:')).toBeInTheDocument();
+    expect(await card.findByText('0')).toHaveClass('text-win');
   });
 });
 

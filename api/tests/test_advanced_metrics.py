@@ -252,6 +252,94 @@ class TestCapitalWeightedROI:
         assert with_legs["avg_roi_pct"] == without_legs["avg_roi_pct"] == 50.0
 
 
+class TestWinLossSplit:
+    """wins/losses/scratches: the population behind win_rate_pct.
+
+    Split out so the dashboard can say "47W / 89L" rather than a bare
+    percentage. The case worth testing is the one a percentage cannot
+    express -- a round trip that closed at exactly break-even is neither a
+    win nor a loss, so the two counts are not required to sum to
+    total_trades.
+    """
+
+    def test_counts_both_populations(self):
+        stats = compute_core_stats([
+            make_position(pnl="100", entry_price="10", quantity="10"),
+            make_position(pnl="50", entry_price="10", quantity="10"),
+            make_position(pnl="-30", entry_price="10", quantity="10"),
+        ])
+
+        assert stats["wins"] == 2
+        assert stats["losses"] == 1
+        assert stats["scratches"] == 0
+
+    def test_a_break_even_round_trip_is_a_scratch_not_a_loss(self):
+        """The whole reason `scratches` is reported rather than derived.
+
+        Absorbing it into losses would report a loss that never happened;
+        leaving it unnamed would make wins + losses silently disagree with
+        total_trades on screen.
+        """
+        stats = compute_core_stats([
+            make_position(pnl="100", entry_price="10", quantity="10"),
+            make_position(pnl="0", entry_price="10", quantity="10"),
+            make_position(pnl="-30", entry_price="10", quantity="10"),
+        ])
+
+        assert stats["wins"] == 1
+        assert stats["losses"] == 1
+        assert stats["scratches"] == 1
+        assert stats["wins"] + stats["losses"] != stats["total_trades"]
+
+    def test_the_three_always_partition_total_trades(self):
+        """Every round trip lands in exactly one bucket, so the sum is exact."""
+        stats = compute_core_stats([
+            make_position(pnl=pnl, entry_price="10", quantity="10")
+            for pnl in ("100", "0", "-30", "0", "7", "-1")
+        ])
+
+        assert stats["wins"] + stats["losses"] + stats["scratches"] == stats["total_trades"]
+        assert stats["scratches"] == 2
+
+    def test_scratches_dilute_win_rate_rather_than_leaving_the_denominator(self):
+        """win_rate_pct is wins/total_trades -- a scratch is not a free pass.
+
+        Pinned because the alternative reading (wins / (wins + losses)) would
+        report 100% here, and the card shows the percentage and the split
+        side by side where any disagreement is visible.
+        """
+        stats = compute_core_stats([
+            make_position(pnl="100", entry_price="10", quantity="10"),
+            make_position(pnl="0", entry_price="10", quantity="10"),
+        ])
+
+        assert stats["win_rate_pct"] == 50.0
+        assert stats["scratches"] == 1
+
+    def test_empty_input_carries_the_keys_rather_than_omitting_them(self):
+        """The early return is a second, hand-maintained copy of the shape."""
+        stats = compute_core_stats([])
+
+        assert stats["wins"] == 0
+        assert stats["losses"] == 0
+        assert stats["scratches"] == 0
+
+    def test_legs_without_positions_still_reports_the_keys(self):
+        """Money banked out of a position still open: no round trips to count.
+
+        Skips the early return (legs are truthy) but never enters the
+        position loop, which is the one path where the counters and
+        total_trades are all zero for different reasons.
+        """
+        stats = compute_core_stats([], [make_leg("-30")])
+
+        assert stats["total_trades"] == 0
+        assert stats["wins"] == 0
+        assert stats["losses"] == 0
+        assert stats["scratches"] == 0
+        assert stats["open_run_pnl"] == -30.0
+
+
 class TestReviewedTradeQuantity:
     """quantity has to survive a fractional share, not truncate it to 0."""
 
