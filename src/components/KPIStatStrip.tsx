@@ -166,7 +166,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
             <div className="flex items-baseline justify-between">
               {/* Suffixed because Analytics shows a DIFFERENT profit factor,
                   computed on R-multiples -- this one is gross win $ / loss $. */}
-              <span className="text-[11px] text-obsidian-muted">Profit Factor ($)</span>
+              <span className="text-[11px] font-semibold text-slate-300">Profit Factor ($)</span>
               <span className="font-mono text-base font-semibold text-white">
                 {stats.profitFactor === null ? '∞' : stats.profitFactor.toFixed(2)}
               </span>
@@ -176,7 +176,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
 
           <div className="border-t border-obsidian-border/60 pt-1">
             <div className="flex items-baseline justify-between">
-              <span className="text-[11px] text-obsidian-muted">Avg Trade ROI</span>
+              <span className="text-[11px] font-semibold text-slate-300">Avg Trade ROI</span>
               {/* Coloured by its own sign, not hardcoded green. A losing
                   average rendered in win-green alongside a "+" it had not
                   earned. */}
@@ -202,7 +202,7 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
                   `core_stats`. null means no trade in the window has both an
                   exit and a usable stop to score, which most journals will
                   see before their first stop is entered. */}
-              <span className="text-[11px] text-obsidian-muted">Avg R</span>
+              <span className="text-[11px] font-semibold text-slate-300">Avg R</span>
               <span
                 className={`font-mono text-base font-semibold ${
                   stats.avgR === null
