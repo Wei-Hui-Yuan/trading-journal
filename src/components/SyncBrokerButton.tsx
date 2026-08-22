@@ -181,7 +181,7 @@ export const SyncBrokerButton: React.FC = () => {
 
   // Glassmorphic base: translucent fill + blur + hairline top highlight.
   const base =
-    'group relative inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs font-medium ' +
+    'group relative inline-flex items-center gap-2 rounded-lg px-4 py-3 text-sm font-medium ' +
     'backdrop-blur-md border transition-all duration-300 ease-out select-none ' +
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-obsidian-card';
 
@@ -204,15 +204,15 @@ export const SyncBrokerButton: React.FC = () => {
 
   const icon =
     state === 'syncing' ? (
-      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+      <RefreshCw className="h-4 w-4 animate-spin" />
     ) : state === 'success' ? (
-      <Check className="h-3.5 w-3.5" />
+      <Check className="h-4 w-4" />
     ) : state === 'partial' ? (
-      <AlertTriangle className="h-3.5 w-3.5" />
+      <AlertTriangle className="h-4 w-4" />
     ) : state === 'error' ? (
-      <X className="h-3.5 w-3.5" />
+      <X className="h-4 w-4" />
     ) : (
-      <DownloadCloud className="h-3.5 w-3.5 transition-transform duration-300 group-hover:-translate-y-px" />
+      <DownloadCloud className="h-4 w-4 transition-transform duration-300 group-hover:-translate-y-px" />
     );
 
   return (

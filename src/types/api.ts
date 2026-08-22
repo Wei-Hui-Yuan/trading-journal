@@ -1442,7 +1442,6 @@ export interface KPIStats {
   avgR: number | null;
   /** How many scored trades `avgR` is averaged over. 0 exactly when avgR is null. */
   avgRSample: number;
-  pendingCount: number;
 }
 
 /**

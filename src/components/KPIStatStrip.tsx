@@ -1,7 +1,7 @@
 import React from 'react';
 import type { KPIStats } from '@/types/api';
 import { formatMoney, formatSignedPercent } from '@/lib/format';
-import { TrendingUp, TrendingDown, Target, BarChart2, DollarSign, Clock, ShieldAlert, Crosshair } from 'lucide-react';
+import { TrendingUp, TrendingDown, Target, Gauge } from 'lucide-react';
 
 interface KPIStatStripProps {
   stats: KPIStats;
@@ -11,15 +11,18 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
   const isNetWin = stats.netPnl >= 0;
   const isRoiPositive = stats.avgRoi > 0;
 
-  // lg:grid-cols-4, not -7: Net P&L is uniquely dense (5 sub-rows against
-  // everything else's 1-2), and forcing all 7 cards onto one row at
-  // max-w-7xl's ~1216px content width (the steady-state for every viewport
-  // from 1024px up, since the max-width caps it there) clips Net P&L's
-  // headline figure -- confirmed in-browser at both 1024px and 1280px
-  // before landing on 4. Wraps to a plain 4-then-3 second row instead,
-  // which comfortably fits every card at every width above.
+  // lg:grid-cols-3: three cards, one clean row -- the column count survives
+  // unchanged from the six-card layout, since three of six divides exactly
+  // as cleanly as three of three. Win Rate and Total Trades merged into one
+  // card below (a bare trade count was context for the win rate, not a
+  // fact worth a whole card), and Profit Factor/Avg ROI/Avg R merged into
+  // "Trade Quality" -- CSS grid stretches every card in a row to match the
+  // tallest, and with six cards that meant Win Rate and Total Trades sat at
+  // 43% and 38% dead space next to Net P&L's five sub-rows (measured
+  // in-browser). Real multi-line content in their place closes most of
+  // that gap without changing the grid at all.
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
       
       {/* Net PnL */}
       <div className={`p-4 rounded-xl border bg-obsidian-card transition-all duration-200 ${
@@ -116,7 +119,11 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
         </div>
       </div>
 
-      {/* Win Rate */}
+      {/* Win Rate + Total Trades. Total Trades used to be its own card, but a
+          bare count next to Win Rate had nothing else to say -- it exists to
+          answer "how much sits behind that percentage", which is exactly
+          what a win rate's own sample size is. Folded in as the qualifier
+          line rather than kept as a headline of its own. */}
       <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
         <div className="flex items-center justify-between">
           <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Win Rate</span>
@@ -128,125 +135,94 @@ export const KPIStatStrip: React.FC<KPIStatStripProps> = ({ stats }) => {
           <span className="text-2xl font-bold font-mono text-white">{stats.winRate}%</span>
         </div>
         <div className="mt-2 w-full bg-obsidian-bg rounded-full h-1.5 overflow-hidden border border-obsidian-border">
-          <div 
-            className="bg-win h-full rounded-full transition-all duration-500" 
+          <div
+            className="bg-win h-full rounded-full transition-all duration-500"
             style={{ width: `${Math.min(stats.winRate, 100)}%` }}
           />
         </div>
-      </div>
-
-      {/* Total Trades */}
-      <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Total Trades</span>
-          <div className="p-1.5 rounded-lg bg-indigo-500/10 text-indigo-400">
-            <BarChart2 className="h-4 w-4" />
-          </div>
-        </div>
-        <div className="mt-2 flex items-baseline justify-between">
-          <span className="text-2xl font-bold font-mono text-white">{stats.totalTrades}</span>
-        </div>
         <div className="mt-2 text-[11px] text-obsidian-muted">
-          <span>Sample Size</span>
+          <span>{stats.totalTrades} trade{stats.totalTrades === 1 ? '' : 's'}</span>
         </div>
       </div>
 
-      {/* Profit Factor */}
+      {/* Trade Quality: Profit Factor, Avg ROI, and Avg R merged into one
+          card. The three used to be separate cards, each stretched to Net
+          P&L's height by CSS grid with almost nothing to fill it -- the same
+          problem Win Rate/Total Trades had. They share no common
+          denominator (gross $ ratio, capital-weighted %, and a mean over
+          scored trades are three different things), so each row keeps its
+          own qualifier immediately below it rather than one heading
+          implying they agree. */}
       <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
         <div className="flex items-center justify-between">
-          {/* Suffixed because Analytics shows a DIFFERENT profit factor, computed
-              on R-multiples. Same name, different denominator: this one is
-              gross win $ / gross loss $. */}
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Profit Factor ($)</span>
+          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Trade Quality</span>
           <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400">
-            <DollarSign className="h-4 w-4" />
+            <Gauge className="h-4 w-4" />
           </div>
         </div>
-        <div className="mt-2 flex items-baseline justify-between">
-          <span className="text-2xl font-bold font-mono text-white">
-            {stats.profitFactor === null ? '∞' : stats.profitFactor.toFixed(2)}
-          </span>
-        </div>
-        <div className="mt-2 text-[11px] text-emerald-400 font-medium">
-          <span>&gt; 2.0 Benchmark</span>
-        </div>
-      </div>
 
-      {/* Avg ROI */}
-      <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Avg Trade ROI</span>
-          <div className="p-1.5 rounded-lg bg-purple-500/10 text-purple-400">
-            {isRoiPositive ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
+        <div className="mt-1.5 space-y-1">
+          <div>
+            <div className="flex items-baseline justify-between">
+              {/* Suffixed because Analytics shows a DIFFERENT profit factor,
+                  computed on R-multiples -- this one is gross win $ / loss $. */}
+              <span className="text-[11px] text-obsidian-muted">Profit Factor ($)</span>
+              <span className="font-mono text-base font-semibold text-white">
+                {stats.profitFactor === null ? '∞' : stats.profitFactor.toFixed(2)}
+              </span>
+            </div>
+            <p className="text-[10px] text-obsidian-muted">Gross win $ / loss $</p>
           </div>
-        </div>
-        <div className="mt-2 flex items-baseline justify-between">
-          {/* Coloured by its own sign, not hardcoded green. A losing average
-              rendered in win-green alongside a "+" it had not earned. */}
-          <span
-            className={`text-2xl font-bold font-mono ${
-              isRoiPositive ? 'text-win' : stats.avgRoi < 0 ? 'text-loss' : 'text-white'
-            }`}
-          >
-            {formatSignedPercent(stats.avgRoi)}
-          </span>
-        </div>
-        <div className="mt-2 text-[11px] text-obsidian-muted">
-          <span>Per Execution</span>
-        </div>
-      </div>
 
-      {/* Avg R
-          A different denominator than the R above -- this is Analytics'
-          `avg_r`, from the trades ledger, not `core_stats`. null means no
-          trade in the window has both an exit and a usable stop to score,
-          which most journals will see before their first stop is entered. */}
-      <div className="p-4 rounded-xl border border-obsidian-border bg-obsidian-card hover:border-slate-700 transition-all duration-200">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-obsidian-muted uppercase tracking-wider">Avg R</span>
-          <div className="p-1.5 rounded-lg bg-blue-500/10 text-blue-400">
-            <Crosshair className="h-4 w-4" />
+          <div className="border-t border-obsidian-border/60 pt-1">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] text-obsidian-muted">Avg Trade ROI</span>
+              {/* Coloured by its own sign, not hardcoded green. A losing
+                  average rendered in win-green alongside a "+" it had not
+                  earned. */}
+              <span
+                className={`font-mono text-base font-semibold ${
+                  isRoiPositive ? 'text-win' : stats.avgRoi < 0 ? 'text-loss' : 'text-white'
+                }`}
+              >
+                {formatSignedPercent(stats.avgRoi)}
+              </span>
+            </div>
+            {/* Was "Per Execution" -- wrong. `avg_roi_pct` sums P&L and cost
+                basis across whole POSITIONS (round trips), not individual
+                fills, and divides once: capital-weighted, not a plain mean
+                of each trade's own ROI%. */}
+            <p className="text-[10px] text-obsidian-muted">Capital-weighted</p>
           </div>
-        </div>
-        <div className="mt-2 flex items-baseline justify-between">
-          <span
-            className={`text-2xl font-bold font-mono ${
-              stats.avgR === null
-                ? 'text-white'
-                : stats.avgR > 0
-                  ? 'text-win'
-                  : stats.avgR < 0
-                    ? 'text-loss'
-                    : 'text-white'
-            }`}
-          >
-            {stats.avgR === null
-              ? '—'
-              : `${stats.avgR >= 0 ? '+' : ''}${stats.avgR.toFixed(2)}R`}
-          </span>
-        </div>
-        <div className="mt-2 text-[11px] text-obsidian-muted">
-          <span>
-            {stats.avgRSample} scored trade{stats.avgRSample === 1 ? '' : 's'}
-          </span>
-        </div>
-      </div>
 
-      {/* Pending Review Queue Alert */}
-      <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-950/10 hover:border-amber-500/50 transition-all duration-200 relative overflow-hidden group">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-semibold text-amber-400 uppercase tracking-wider">Inbox Queue</span>
-          <div className="p-1.5 rounded-lg bg-amber-500/20 text-amber-300">
-            <Clock className="h-4 w-4" />
+          <div className="border-t border-obsidian-border/60 pt-1">
+            <div className="flex items-baseline justify-between">
+              {/* A different denominator than the ROI above -- this is
+                  Analytics' `avg_r`, from the trades ledger, not
+                  `core_stats`. null means no trade in the window has both an
+                  exit and a usable stop to score, which most journals will
+                  see before their first stop is entered. */}
+              <span className="text-[11px] text-obsidian-muted">Avg R</span>
+              <span
+                className={`font-mono text-base font-semibold ${
+                  stats.avgR === null
+                    ? 'text-white'
+                    : stats.avgR > 0
+                      ? 'text-win'
+                      : stats.avgR < 0
+                        ? 'text-loss'
+                        : 'text-white'
+                }`}
+              >
+                {stats.avgR === null
+                  ? '—'
+                  : `${stats.avgR >= 0 ? '+' : ''}${stats.avgR.toFixed(2)}R`}
+              </span>
+            </div>
+            <p className="text-[10px] text-obsidian-muted">
+              {stats.avgRSample} scored trade{stats.avgRSample === 1 ? '' : 's'}
+            </p>
           </div>
-        </div>
-        <div className="mt-2 flex items-baseline justify-between">
-          <span className="text-2xl font-bold font-mono text-amber-300">{stats.pendingCount}</span>
-          <span className="text-xs text-amber-400/80 font-medium">Action Req.</span>
-        </div>
-        <div className="mt-2 flex items-center text-[11px] text-amber-400/70 space-x-1">
-          <ShieldAlert className="h-3 w-3" />
-          <span>Requires Manual Review</span>
         </div>
       </div>
 

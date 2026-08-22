@@ -65,7 +65,6 @@ const EMPTY_STATS: KPIStats = {
   avgRoi: 0,
   avgR: null,
   avgRSample: 0,
-  pendingCount: 0,
 };
 
 export default function Home() {
@@ -115,9 +114,8 @@ export default function Home() {
         avgRoi: core.avg_roi_pct,
         avgR,
         avgRSample,
-        pendingCount,
       }
-    : { ...EMPTY_STATS, avgR, avgRSample, pendingCount };
+    : { ...EMPTY_STATS, avgR, avgRSample };
 
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
