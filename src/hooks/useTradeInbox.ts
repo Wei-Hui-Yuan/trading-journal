@@ -455,6 +455,79 @@ function completeResult(
 }
 
 /**
+ * The finished run the header is describing -- this tab's, or the server's.
+ *
+ * Extracted from SyncStatusBadge so the badge and the detail modal it opens
+ * cannot disagree about WHICH run they are talking about. A badge reading
+ * "12:44" that opens a panel describing last night's cron run is worse than
+ * no panel, and two copies of this rule is exactly how that happens.
+ *
+ * Returns null while a run is in flight or nothing has ever run: both are
+ * states the badge renders itself and neither has a result to show.
+ */
+export function useLatestSyncRun(): {
+  outcome: 'success' | 'partial' | 'error';
+  at: string;
+  /** Completed from the stored partial, so it is always safe to render. */
+  result: IngestResult | null;
+  summary: string;
+  /** Only this tab's own runs carry an HTTP status. */
+  status: number | null;
+  /** 'cron' | 'manual' on a persisted run; null when read from memory. */
+  trigger: string | null;
+  fromMemory: boolean;
+} | null {
+  const lastSync = useLastSync();
+  const { data } = useSyncStatus();
+  const persisted = data?.latest ?? null;
+
+  const running = persisted?.outcome === 'running' && !data?.latest_looks_abandoned;
+  if (running) return null;
+  if (!lastSync && !persisted) return null;
+
+  // Prefer whichever actually happened last. Normally that is the in-memory
+  // one during a session where you pressed the button, and the persisted one
+  // on a fresh page load or after the schedule ran.
+  const useMemory =
+    lastSync !== undefined &&
+    (persisted === null ||
+      new Date(lastSync.at).getTime() >= new Date(persisted.started_at).getTime());
+
+  if (useMemory) {
+    return {
+      outcome: lastSync!.outcome,
+      at: lastSync!.at,
+      result: lastSync!.result,
+      summary: lastSync!.summary,
+      status: lastSync!.status,
+      trigger: null,
+      fromMemory: true,
+    };
+  }
+
+  // A persisted run can still be 'running' here only when it looks abandoned,
+  // which the badge reports as a failure rather than as work in progress.
+  const outcome =
+    persisted!.outcome === 'success' || persisted!.outcome === 'partial'
+      ? persisted!.outcome
+      : 'error';
+
+  return {
+    outcome,
+    at: persisted!.started_at,
+    result: completeResult(persisted!.result),
+    summary:
+      persisted!.error ??
+      (persisted!.trades_created > 0
+        ? `${persisted!.trades_created} new`
+        : `${persisted!.executions_parsed} returned`),
+    status: null,
+    trigger: persisted!.trigger,
+    fromMemory: false,
+  };
+}
+
+/**
  * React to a sync that has finished: refresh what it changed, and report it.
  *
  * Shared by two callers that used to be one. A browser is now handed a 202 and
