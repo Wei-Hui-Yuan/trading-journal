@@ -1,10 +1,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import Link from 'next/link';
 import {
   AlertCircle,
-  ArrowLeft,
   Check,
   Database,
   Download,
@@ -15,6 +13,7 @@ import {
   Wallet,
 } from 'lucide-react';
 
+import { PageHeader } from '@/components/PageHeader';
 import {
   useSettings,
   useSuppressedExecutions,
@@ -172,31 +171,11 @@ export default function SettingsPage() {
 
   return (
     <div className="min-h-screen flex flex-col bg-obsidian-bg">
-      <header className="border-b border-obsidian-border bg-obsidian-card/80 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-win/20 to-emerald-900/40 border border-win/30 flex items-center justify-center">
-              <SlidersHorizontal className="h-5 w-5 text-win" />
-            </div>
-            <div>
-              <span className="font-bold text-lg tracking-wider text-white">
-                SETTINGS
-              </span>
-              <p className="text-xs text-obsidian-muted font-medium">
-                Defaults every new trade is sized against
-              </p>
-            </div>
-          </div>
-
-          <Link
-            href="/"
-            className="inline-flex items-center gap-2 rounded-lg bg-obsidian-bg border border-obsidian-border px-3 py-2 text-xs font-medium text-obsidian-muted hover:text-slate-100 hover:border-slate-600 transition-colors"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Dashboard
-          </Link>
-        </div>
-      </header>
+      <PageHeader
+        icon={SlidersHorizontal}
+        title="SETTINGS"
+        subtitle="Defaults every new trade is sized against"
+      />
 
       <main className="flex-1 max-w-2xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <section className="rounded-xl border border-obsidian-border bg-obsidian-card p-5">
