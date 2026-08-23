@@ -666,10 +666,17 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
                   Risk % This Trade
                 </span>
+                {/* 0.01, matching trades.risk_percent's NUMERIC(6,2). `step`
+                    is a validity rule, not just a spinner increment: at 0.05
+                    the browser refused to submit a typed 1.23 with "the two
+                    nearest valid values are 1.2 and 1.25" -- a constraint
+                    nothing downstream actually wanted. Not `any`, because the
+                    column keeps two decimals and 1.234 would be stored as
+                    1.23 without saying so. */}
                 <input
                   type="number"
                   inputMode="decimal"
-                  step="0.05"
+                  step="0.01"
                   min="0"
                   value={form.riskPercent}
                   onChange={(e) => patch({ riskPercent: e.target.value })}
