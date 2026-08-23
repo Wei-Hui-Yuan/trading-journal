@@ -394,6 +394,36 @@ describe('validation', () => {
   });
 });
 
+describe('risk % granularity', () => {
+  /** The input is only reachable through its label -- placeholder "1" is not unique. */
+  const riskPercent = () =>
+    screen.getByText('Risk % This Trade').closest('label')!.querySelector('input')!;
+
+  it('accepts a two-decimal risk %, which step="0.05" used to block', async () => {
+    // Not a style preference: `step` is a VALIDITY rule, so at 0.05 the browser
+    // refused to submit a typed 1.23 -- "the two nearest valid values are 1.2
+    // and 1.25" -- for a figure nothing downstream constrains that way.
+    mountModal();
+    await ready();
+    const input = riskPercent();
+    fireEvent.change(input, { target: { value: '1.23' } });
+
+    expect(input.validity.stepMismatch).toBe(false);
+  });
+
+  it('still rejects a third decimal, which NUMERIC(_,2) would silently round', async () => {
+    // The reason this is 0.01 rather than `any`: the column keeps two
+    // decimals, and 1.234 coming back as 1.23 without a word is worse than
+    // being told up front.
+    mountModal();
+    await ready();
+    const input = riskPercent();
+    fireEvent.change(input, { target: { value: '1.234' } });
+
+    expect(input.validity.stepMismatch).toBe(true);
+  });
+});
+
 describe('submitting a new plan', () => {
   it('POSTs the payload and reports it was saved', async () => {
     mountModal();

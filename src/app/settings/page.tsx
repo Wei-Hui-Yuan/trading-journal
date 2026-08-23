@@ -257,10 +257,15 @@ export default function SettingsPage() {
                 <span className="text-[11px] uppercase tracking-wider text-obsidian-muted">
                   Default Risk Per Trade (%)
                 </span>
+                {/* 0.01, matching app_settings.risk_percent's NUMERIC(5,2).
+                    Precision matters more here than on a plan: this value is
+                    stored exactly as typed, where a plan's is recomputed from
+                    the share count before saving. `any` would let 1.234
+                    through and the column would round it to 1.23 silently. */}
                 <input
                   type="number"
                   inputMode="decimal"
-                  step="0.05"
+                  step="0.01"
                   min="0"
                   value={draft.riskPercent}
                   onChange={(e) => patch({ riskPercent: e.target.value })}
