@@ -44,10 +44,7 @@ export const SyncRunDetailModal: React.FC<{ open: boolean; onClose: () => void }
   open,
   onClose,
 }) => {
-  const [mounted, setMounted] = React.useState(false);
   const run = useLatestSyncRun();
-
-  React.useEffect(() => setMounted(true), []);
 
   React.useEffect(() => {
     if (!open) return;
@@ -58,7 +55,13 @@ export const SyncRunDetailModal: React.FC<{ open: boolean; onClose: () => void }
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose]);
 
-  if (!open || !mounted) return null;
+  // No `mounted` effect to defer the first render, unlike the older modals
+  // here: that pattern exists so a portal is never built during SSR, and this
+  // one cannot be. `open` is driven solely by a client `useState(false)`, so
+  // the server and the first client render both take this branch and agree.
+  // Guarding on `document` states the actual requirement -- somewhere to
+  // portal INTO -- rather than approximating it with a render cycle.
+  if (!open || typeof document === 'undefined') return null;
 
   const tone = run ? SYNC_TONE[run.outcome] : null;
 
