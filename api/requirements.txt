@@ -34,7 +34,7 @@
 # ---------------------------------------------------------------------------
 
 fastapi==0.141.1
-uvicorn[standard]==0.52.3
+uvicorn[standard]==0.52.4
 sqlalchemy[asyncio]==2.0.52
 asyncpg==0.31.0
 httpx==0.28.1
@@ -72,7 +72,7 @@ tzdata==2026.3
 # Production WSGI/ASGI process manager. Previously installed by a bare
 # `pip install gunicorn` line in the Dockerfile, which put the one process that
 # supervises everything else outside the lockfile entirely.
-gunicorn==26.0.0
+gunicorn==26.1.0
 
 # ---------------------------------------------------------------------------
 # Transitive dependencies
