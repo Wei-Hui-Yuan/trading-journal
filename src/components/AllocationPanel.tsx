@@ -303,6 +303,52 @@ function squarifyItems<T>(items: T[], valueOf: (t: T) => number, rect: VRect): {
   return sorted.map((item, i) => ({ item, rect: rects[i] }));
 }
 
+/** What a tile can show, given the pixel rect squarify laid it into. */
+interface TileLabel {
+  showTicker: boolean;
+  /** The value/percent line. Horizontal only -- see the note below. */
+  showDetail: boolean;
+  /** Ticker text should be set in `writing-mode: vertical-rl`. */
+  vertical: boolean;
+}
+
+/**
+ * A small holding sitting beside a much larger one in the same sector fails
+ * the horizontal test on width alone -- SOXX at 7.9% of its sector rendered
+ * as a 23x160px sliver, well under the ~44px a horizontal ticker needs, while
+ * sitting on 3,700px^2 of actual area. That area was real; it just was not
+ * laid out in a direction horizontal text could use.
+ *
+ * Rotating the ticker recovers it: `writing-mode: vertical-rl` runs the text
+ * down the tile's height, so what has to clear the 44px bar is now `h`, and
+ * what has to be merely thick enough for the glyphs is `w`.
+ *
+ * No separate "taller than wide" guard: `!horizontal` combined with `h > 44`
+ * already forces `w <= 44` (the only way `w>44 && h>24` can be false while
+ * `h>44` holds), which in turn forces `h > w`. A short, wide tile that fails
+ * on width alone therefore never reaches this branch to begin with -- adding
+ * the check back would be testing something the other three conditions have
+ * already made impossible.
+ *
+ * The detail line (value + %) stays horizontal-only. Two glyph runs both
+ * rotated into an already-narrow column is the kind of clipping that reads
+ * as broken rather than small; the tile's `title` tooltip still carries the
+ * exact figures.
+ *
+ * A tile can still end up with no label at all -- there is no orientation
+ * that fits a holding thin enough in both directions, and that limit is
+ * real: at 1% of a sector a ticker is a few pixels wide regardless of angle.
+ */
+export function planTileLabel(rect: { w: number; h: number }): TileLabel {
+  const horizontal = rect.w > 44 && rect.h > 24;
+  const vertical = !horizontal && rect.h > 44 && rect.w > 18;
+  return {
+    showTicker: horizontal || vertical,
+    showDetail: horizontal && rect.h > 42,
+    vertical,
+  };
+}
+
 interface Tile {
   ticker: string;
   deployed: number;
@@ -594,8 +640,7 @@ export const AllocationPanel: React.FC<{
                 )}
                 <div className="relative flex-1">
                   {b.tiles.map((t) => {
-                    const showLine1 = t.rect.w > 44 && t.rect.h > 24;
-                    const showLine2 = showLine1 && t.rect.h > 42;
+                    const { showTicker, showDetail, vertical } = planTileLabel(t.rect);
                     const fill =
                       colorMode === 'sector'
                         ? b.color
@@ -623,12 +668,23 @@ export const AllocationPanel: React.FC<{
                             backgroundImage: t.isUntargeted ? HATCH_BG : undefined,
                           }}
                         >
-                          {showLine1 && (
-                            <span className="px-1 text-[11px] font-bold leading-tight text-slate-100">
+                          {showTicker && (
+                            <span
+                              className={
+                                vertical
+                                  ? 'px-0.5 text-[10px] font-bold leading-none text-slate-100'
+                                  : 'px-1 text-[11px] font-bold leading-tight text-slate-100'
+                              }
+                              style={
+                                vertical
+                                  ? { writingMode: 'vertical-rl', textOrientation: 'mixed' }
+                                  : undefined
+                              }
+                            >
                               {t.ticker}
                             </span>
                           )}
-                          {showLine2 && (
+                          {showDetail && (
                             <span className="px-1 font-mono text-[9px] leading-tight text-slate-300/80">
                               {colorMode === 'sector'
                                 ? `${compactMoney(t.deployed)} · ${t.pctOfTotal.toFixed(1)}%`
