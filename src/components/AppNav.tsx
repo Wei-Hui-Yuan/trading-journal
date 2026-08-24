@@ -2,6 +2,8 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import type { LucideIcon } from 'lucide-react';
 import { Activity, BarChart3, BookOpen, BookText, Calculator, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
@@ -11,14 +13,11 @@ import { SyncRunDetailModal } from './SyncRunDetailModal';
 import {
   useLastSync,
   useLatestSyncRun,
+  usePendingPositions,
   useSyncRunWatcher,
   useSyncStatus,
 } from '@/hooks/useTradeInbox';
 import { useLastAudit } from '@/hooks/useDataAudit';
-
-interface HeaderProps {
-  pendingCount: number;
-}
 
 /** Wall-clock time of the sync, in the market timezone the app reports in. */
 const syncTimeFormatter = new Intl.DateTimeFormat('en-US', {
@@ -220,7 +219,106 @@ const DataHealthBadge: React.FC<{ onOpen: () => void }> = ({ onOpen }) => {
   );
 };
 
-export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
+/**
+ * Every route, once: what the tab says, and what the title block says.
+ *
+ * One table because these three facts were previously three separate
+ * copies -- NAV_LINKS here, a hand-rolled <header> on each page, and a
+ * back-link -- and they had already drifted. `label` is what the tab shows;
+ * omitting it (settings) keeps a route out of the tab row while still giving
+ * it an identity, which is what the gear icon reaches.
+ *
+ * The dashboard's entry is the app's own name on purpose: on '/' the page
+ * identity and the brand are the same thing, which is why the title block
+ * can be shared rather than special-cased.
+ */
+/**
+ * Whether `pathname` is this route, or lives under it.
+ *
+ * Segment-aware rather than a bare `startsWith`, which would light up
+ * '/sizing' for a '/sizing-anything' route, and would match EVERY path
+ * against '/' if the dashboard ever gained a tab. Written to cover children
+ * up front because the alternative -- exact equality -- silently un-highlights
+ * the tab the moment a section gains a detail page, and that is the kind of
+ * regression nobody files a bug for.
+ */
+const isCurrent = (href: string, pathname: string) =>
+  href === '/' ? pathname === '/' : pathname === href || pathname.startsWith(`${href}/`);
+
+interface NavPage {
+  href: string;
+  /** Shown in the tab row. Absent keeps the route out of it (settings). */
+  label?: string;
+  icon?: LucideIcon;
+  title: string;
+  subtitle: string;
+  /** Only the dashboard, where the page name IS the product name. */
+  brand?: boolean;
+}
+
+const PAGES: readonly NavPage[] = [
+  {
+    href: '/',
+    title: 'TRADING JOURNAL',
+    subtitle: 'IBKR Gateway Execution Engine',
+    brand: true,
+  },
+  {
+    href: '/journal',
+    label: 'Journal',
+    icon: BookText,
+    title: 'TRADE JOURNAL',
+    subtitle: 'Every trade, open and closed — the plan, the fills, and the review',
+  },
+  {
+    href: '/analytics',
+    label: 'Analytics',
+    icon: BarChart3,
+    title: 'ANALYTICS & REVIEW',
+    subtitle: 'R-multiples, slippage, and behavioural attribution',
+  },
+  {
+    href: '/strategies',
+    label: 'Strategies',
+    icon: BookOpen,
+    title: 'STRATEGY PLAYBOOK',
+    subtitle: 'Define methods, entry triggers, and exit rules',
+  },
+  {
+    href: '/sizing',
+    label: 'Sizing',
+    icon: Calculator,
+    title: 'SIZING SCRATCHPAD',
+    subtitle: 'Record entry, stop, target and shares fast — promote to a real plan when there is time',
+  },
+  {
+    href: '/investments',
+    label: 'Portfolio',
+    icon: Landmark,
+    title: 'INVESTMENT PORTFOLIO',
+    subtitle: 'The long-term book — what you hold, and what the model says it is worth',
+  },
+  {
+    // No `label`, so no tab. Reached by the gear icon in row 1, which is
+    // where a settings link belongs rather than beside the working pages.
+    href: '/settings',
+    title: 'SETTINGS',
+    subtitle: 'Defaults every new trade is sized against',
+  },
+];
+
+/** The tab row: every page that asked for a label, in table order. */
+const NAV_LINKS = PAGES.filter(
+  (page): page is NavPage & { label: string; icon: LucideIcon } =>
+    page.label !== undefined && page.icon !== undefined
+);
+
+export const AppNav: React.FC = () => {
+  const pathname = usePathname();
+  // Owned here rather than passed in. The dashboard used to read this and hand
+  // it down, which only worked because the dashboard was the only page with a
+  // header; a nav on every page cannot depend on one route to fetch for it.
+  const pendingCount = usePendingPositions().data?.length ?? 0;
   const [isPlanOpen, setIsPlanOpen] = useState(false);
   const [isHealthOpen, setIsHealthOpen] = useState(false);
   const [isSyncDetailOpen, setIsSyncDetailOpen] = useState(false);
@@ -233,34 +331,55 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
   // run started here still get reported after navigating away.
   useSyncRunWatcher();
 
-  // Nav links, in one place so the two rows below cannot list them in a
-  // different order from each other. `plain` marks a Link needing no
-  // per-item box — the tab row below draws its own hover/underline instead.
-  const NAV_LINKS = [
-    { href: '/journal', label: 'Journal', icon: BookText },
-    { href: '/analytics', label: 'Analytics', icon: BarChart3 },
-    { href: '/strategies', label: 'Strategies', icon: BookOpen },
-    { href: '/sizing', label: 'Sizing', icon: Calculator },
-    { href: '/investments', label: 'Portfolio', icon: Landmark },
-  ] as const;
+  // The page being viewed, for the title block and the active tab. One lookup
+  // for both, so the bar cannot name one page while underlining another.
+  const current = PAGES.find((page) => isCurrent(page.href, pathname));
 
   return (
     <header className="border-b border-obsidian-border bg-obsidian-card/80 backdrop-blur-md sticky top-0 z-50">
       {/* Row 1: identity, live status, account. Nothing here is navigation --
           it is either who this is (branding, avatar) or what state the app
           is in right now (sync, data health, pending reviews). */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      {/* min-h, not h: these subtitles are the ones that used to live in
+          PageHeader, and the longest wraps to two lines on a phone. A fixed
+          64px clipped them straight through the border -- the same bug that
+          shared header had before it was measured at 375px. */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 min-h-16 py-2 flex items-center justify-between gap-3">
 
+        {/* Logo doubles as the way home, which is why no page carries a
+            "← Dashboard" link any more. Six of them used to, and the tab row
+            below could not show which page you were on because it only ever
+            existed on the one page that was never a destination. */}
         <div className="flex items-center space-x-3">
-          <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-win/20 to-emerald-900/40 border border-win/30 flex items-center justify-center shadow-win-glow">
+          <Link
+            href="/"
+            aria-label="Dashboard"
+            className="h-9 w-9 shrink-0 rounded-xl bg-gradient-to-br from-win/20 to-emerald-900/40 border border-win/30 flex items-center justify-center shadow-win-glow transition-colors hover:border-win/60"
+          >
             <Activity className="h-5 w-5 text-win" />
-          </div>
+          </Link>
           <div>
             <div className="flex items-center space-x-2">
-              <span className="font-bold text-lg tracking-wider text-white">TRADING JOURNAL</span>
-              <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-win/10 text-win border border-win/20">PRO</span>
+              {/* The h1 every page needs, in one place. Three pages used to
+                  render their title as a <span>, so they had no heading. */}
+              <h1 className="font-bold text-lg tracking-wider text-white">
+                {current?.title ?? 'TRADING JOURNAL'}
+              </h1>
+              {/* Brand furniture, so it sits beside the brand name and nowhere
+                  else -- "ANALYTICS & REVIEW  PRO" would read as a tier of the
+                  page rather than of the product. */}
+              {current?.brand && (
+                <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-win/10 text-win border border-win/20">PRO</span>
+              )}
             </div>
-            <p className="text-xs text-obsidian-muted font-medium">IBKR Gateway Execution Engine</p>
+            {/* Hidden below sm. These subtitles are explanatory copy, and the
+                longest wraps to three lines on a phone -- 178px of chrome on
+                an 812px screen, for a page the h1 above already names. The
+                nav row and the status badges earn that space; a second
+                sentence does not. */}
+            <p className="hidden sm:block text-xs text-obsidian-muted font-medium">
+              {current?.subtitle ?? 'IBKR Gateway Execution Engine'}
+            </p>
           </div>
         </div>
 
@@ -307,16 +426,26 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
       <div className="border-t border-obsidian-border">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
           <nav className="flex items-center space-x-5 overflow-x-auto">
-            {NAV_LINKS.map(({ href, label, icon: Icon }) => (
-              <Link
-                key={href}
-                href={href}
-                className="inline-flex items-center gap-1.5 py-3 text-sm font-medium text-obsidian-muted whitespace-nowrap border-b-2 border-transparent hover:text-slate-100 hover:border-slate-600 transition-colors"
-              >
-                <Icon className="h-4 w-4" />
-                {label}
-              </Link>
-            ))}
+            {NAV_LINKS.map(({ href, label, icon: Icon }) => {
+              const active = isCurrent(href, pathname);
+              return (
+                <Link
+                  key={href}
+                  href={href}
+                  // Read out as well as drawn. The underline is the whole
+                  // signal for a sighted user and nothing at all otherwise.
+                  aria-current={active ? 'page' : undefined}
+                  className={`inline-flex items-center gap-1.5 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${
+                    active
+                      ? 'text-white border-win'
+                      : 'text-obsidian-muted border-transparent hover:text-slate-100 hover:border-slate-600'
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </Link>
+              );
+            })}
           </nav>
 
           <div className="flex items-center space-x-2 pl-3">
@@ -338,7 +467,13 @@ export const Header: React.FC<HeaderProps> = ({ pendingCount }) => {
         </div>
       </div>
 
-      <PlanModal open={isPlanOpen} onClose={() => setIsPlanOpen(false)} />
+      {/* Mounted only while open. PlanModal calls useStrategies,
+          useDisciplines and useSettings above its own `if (!open) return null`,
+          so a permanently-mounted copy would pull three queries on every page
+          in the app for a dialog that is usually never opened. It already
+          resets its whole form on `open`, so a fresh mount is the same
+          behaviour it had before. */}
+      {isPlanOpen && <PlanModal open onClose={() => setIsPlanOpen(false)} />}
 
       <DataHealthModal open={isHealthOpen} onClose={() => setIsHealthOpen(false)} />
       <SyncRunDetailModal

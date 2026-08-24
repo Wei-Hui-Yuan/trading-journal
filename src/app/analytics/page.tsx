@@ -4,7 +4,6 @@ import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
   AlertCircle,
-  BarChart3,
   Check,
   CheckCircle2,
   Loader2,
@@ -13,7 +12,6 @@ import {
   X,
 } from 'lucide-react';
 
-import { PageHeader } from '@/components/PageHeader';
 import {
   useAdvancedMetrics,
   usePendingPositions,
@@ -730,12 +728,6 @@ export default function AnalyticsPage() {
 
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
-      <PageHeader
-        icon={BarChart3}
-        title="ANALYTICS & REVIEW"
-        subtitle="R-multiples, slippage, and behavioural attribution"
-      />
-
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
         {/* Above the KPI cards for the same reason it is on the dashboard:
             this governs every figure below it, and a control that scopes the

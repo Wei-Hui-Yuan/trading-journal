@@ -13,7 +13,6 @@ import {
   TrendingUp,
 } from 'lucide-react';
 
-import { PageHeader } from '@/components/PageHeader';
 import {
   useCreateDiscipline,
   useCreateStrategy,
@@ -273,12 +272,6 @@ export default function StrategiesPage() {
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
       {/* Page header */}
-      <PageHeader
-        icon={BookOpen}
-        title="STRATEGY PLAYBOOK"
-        subtitle="Define methods, entry triggers, and exit rules"
-      />
-
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-6">
 

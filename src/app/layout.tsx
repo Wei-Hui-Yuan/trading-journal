@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { ClerkProvider } from '@clerk/nextjs';
 import './globals.css';
 import { QueryProvider } from '@/components/QueryProvider';
+import { AppNav } from '@/components/AppNav';
 
 export const metadata: Metadata = {
   title: 'Trading Journal | Institutional Dashboard',
@@ -107,7 +108,21 @@ export default function RootLayout({
       </head>
       <body className="bg-obsidian-bg text-slate-100 antialiased selection:bg-win selection:text-obsidian-bg">
         <ClerkProvider>
-          <QueryProvider>{children}</QueryProvider>
+          <QueryProvider>
+            {/*
+              Every page, not just the dashboard. This was already the stated
+              intent -- AppNav mounts `useSyncRunWatcher` and the sync toast,
+              both commented as relying on being present app-wide -- but it
+              was only ever imported by the dashboard, so a sync started there
+              and then navigated away from finished with nothing refreshing
+              the ledger and no summary shown.
+
+              Inside QueryProvider because the nav reads the pending-review
+              count and the sync record from the query cache.
+            */}
+            <AppNav />
+            {children}
+          </QueryProvider>
         </ClerkProvider>
       </body>
     </html>

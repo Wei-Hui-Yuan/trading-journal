@@ -1,9 +1,6 @@
 'use client';
 
 import React from 'react';
-import { Calculator } from 'lucide-react';
-
-import { PageHeader } from '@/components/PageHeader';
 import { SizingScratchpad } from '@/components/SizingScratchpad';
 
 /**
@@ -15,13 +12,6 @@ import { SizingScratchpad } from '@/components/SizingScratchpad';
 export default function SizingPage() {
   return (
     <div className="min-h-screen bg-obsidian-bg">
-      <PageHeader
-        icon={Calculator}
-        title="SIZING SCRATCHPAD"
-        subtitle="Record entry, stop, target and shares fast — promote to a real plan when there is time"
-        accent="emerald"
-      />
-
       <main className="mx-auto max-w-5xl px-6 py-6">
         <SizingScratchpad />
       </main>
