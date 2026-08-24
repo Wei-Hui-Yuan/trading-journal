@@ -1,9 +1,6 @@
 'use client';
 
 import React from 'react';
-import { BookText } from 'lucide-react';
-
-import { PageHeader } from '@/components/PageHeader';
 import { TradeLedger } from '@/components/TradeLedger';
 
 /**
@@ -17,13 +14,6 @@ import { TradeLedger } from '@/components/TradeLedger';
 export default function JournalPage() {
   return (
     <div className="min-h-screen bg-obsidian-bg">
-      <PageHeader
-        icon={BookText}
-        title="TRADE JOURNAL"
-        subtitle="Every trade, open and closed — the plan, the fills, and the review"
-        accent="emerald"
-      />
-
       <main className="mx-auto max-w-7xl px-6 py-6">
         <TradeLedger />
       </main>

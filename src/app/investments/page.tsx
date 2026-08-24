@@ -1,9 +1,6 @@
 'use client';
 
 import React from 'react';
-import { Landmark } from 'lucide-react';
-
-import { PageHeader } from '@/components/PageHeader';
 import { InvestmentTable } from '@/components/InvestmentTable';
 
 /**
@@ -18,15 +15,6 @@ import { InvestmentTable } from '@/components/InvestmentTable';
 export default function InvestmentsPage() {
   return (
     <div className="min-h-screen bg-obsidian-bg">
-      <PageHeader
-        icon={Landmark}
-        title="INVESTMENT PORTFOLIO"
-        subtitle="The long-term book — what you hold, and what the model says it is worth"
-        accent="sky"
-        // Wider than every other page, matching the table below it.
-        maxWidthClass="max-w-[1400px]"
-      />
-
       <main className="mx-auto max-w-[1400px] px-6 py-6">
         <InvestmentTable />
       </main>

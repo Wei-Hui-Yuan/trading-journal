@@ -9,11 +9,9 @@ import {
   FileSpreadsheet,
   GhostIcon,
   Loader2,
-  SlidersHorizontal,
   Wallet,
 } from 'lucide-react';
 
-import { PageHeader } from '@/components/PageHeader';
 import {
   useSettings,
   useSuppressedExecutions,
@@ -171,12 +169,6 @@ export default function SettingsPage() {
 
   return (
     <div className="min-h-screen flex flex-col bg-obsidian-bg">
-      <PageHeader
-        icon={SlidersHorizontal}
-        title="SETTINGS"
-        subtitle="Defaults every new trade is sized against"
-      />
-
       <main className="flex-1 max-w-2xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <section className="rounded-xl border border-obsidian-border bg-obsidian-card p-5">
           <div className="flex items-center gap-2 mb-1">

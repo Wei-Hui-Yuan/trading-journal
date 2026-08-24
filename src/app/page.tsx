@@ -4,7 +4,6 @@ import React, { useState } from 'react';
 import dynamic from 'next/dynamic';
 import { AlertCircle, Loader2 } from 'lucide-react';
 
-import { Header } from '@/components/Header';
 import { KPIStatStrip } from '@/components/KPIStatStrip';
 import { DayOfWeekHeatmap } from '@/components/DayOfWeekHeatmap';
 import { TradeInboxQueue } from '@/components/TradeInboxQueue';
@@ -38,7 +37,6 @@ const EquityCurveChart = dynamic(
 );
 import type { KPIStats, TimeframeSelection } from '@/types/api';
 import {
-  usePendingPositions,
   useDashboardStats,
   useAdvancedMetrics,
 } from '@/hooks/useTradeInbox';
@@ -83,19 +81,19 @@ export default function Home() {
   // one-off investigation last week is a figure you would read as current.
   const [timeframe, setTimeframe] = useState<TimeframeSelection>(DEFAULT_SELECTION);
 
-  // Both queries are served from the React Query cache, so mounting the inbox
-  // and the stat strip does not double-fetch.
   const dashboardQuery = useDashboardStats(timeframe);
-  const pendingQuery = usePendingPositions();
   // The SAME query the Analytics tab runs for this window -- avg_r has no
   // home in core_stats, which has no notion of R at all, so this is a second
   // request rather than a field threaded through the dashboard endpoint. No
-  // loading/error UI of its own: like pendingQuery below, it degrades to the
-  // strip's own null handling while pending, which is the same tradeoff
-  // TradeLedger.tsx's secondary queries already make.
+  // loading/error UI of its own: it degrades to the strip's own null handling
+  // while pending, which is the same tradeoff TradeLedger.tsx's secondary
+  // queries already make.
+  //
+  // The pending-review count used to be fetched here too, purely to hand to
+  // the header. AppNav owns that now, and TradeInboxQueue below fetches its
+  // own, so nothing on this page needs it.
   const metricsQuery = useAdvancedMetrics(timeframe);
 
-  const pendingCount = pendingQuery.data?.length ?? 0;
   const avgR = metricsQuery.data?.avg_r ?? null;
   const avgRSample = metricsQuery.data?.scored_trades ?? 0;
 
@@ -127,9 +125,6 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-obsidian-bg text-slate-100 flex flex-col font-sans">
-      {/* Navigation Topbar */}
-      <Header pendingCount={pendingCount} />
-
       {/* Main Dashboard Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
 
