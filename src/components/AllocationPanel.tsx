@@ -306,8 +306,10 @@ function squarifyItems<T>(items: T[], valueOf: (t: T) => number, rect: VRect): {
 /** What a tile can show, given the pixel rect squarify laid it into. */
 interface TileLabel {
   showTicker: boolean;
-  /** The value/percent line. Horizontal only -- see the note below. */
+  /** The value/percent line. Full-size horizontal only -- see the note below. */
   showDetail: boolean;
+  /** Ticker text should render at the smaller 9px size, still horizontal. */
+  compact: boolean;
   /** Ticker text should be set in `writing-mode: vertical-rl`. */
   vertical: boolean;
 }
@@ -315,36 +317,45 @@ interface TileLabel {
 /**
  * A small holding sitting beside a much larger one in the same sector fails
  * the horizontal test on width alone -- SOXX at 7.9% of its sector rendered
- * as a 23x160px sliver, well under the ~44px a horizontal ticker needs, while
- * sitting on 3,700px^2 of actual area. That area was real; it just was not
- * laid out in a direction horizontal text could use.
+ * as a 23x160px sliver, well under the ~44px an 11px ticker needs, while
+ * sitting on real area the rest of this function exists to recover.
  *
- * Rotating the ticker recovers it: `writing-mode: vertical-rl` runs the text
- * down the tile's height, so what has to clear the 44px bar is now `h`, and
- * what has to be merely thick enough for the glyphs is `w`.
+ * Three tiers, tried in order, each one a fallback for when the last did not
+ * fit:
  *
- * No separate "taller than wide" guard: `!horizontal` combined with `h > 44`
- * already forces `w <= 44` (the only way `w>44 && h>24` can be false while
- * `h>44` holds), which in turn forces `h > w`. A short, wide tile that fails
- * on width alone therefore never reaches this branch to begin with -- adding
- * the check back would be testing something the other three conditions have
- * already made impossible.
+ *  1. Normal (11px): the common case, and the only tier that also earns a
+ *     detail line -- that text is longer than a ticker, so even the width
+ *     tier 2 accepts would not fit it.
+ *  2. Compact (9px), still horizontal: a 4-character ticker fits a 9px font
+ *     in ~24px, so the width bar drops to ~26 rather than needing tier 3's
+ *     rotation. Horizontal is objectively easier to read than sideways text,
+ *     so this is preferred over rotating whenever the width allows it, no
+ *     matter how tall the tile is.
+ *  3. Vertical, rotated: `writing-mode: vertical-rl` runs the ticker down
+ *     the tile's height instead of across its width, recovering tiles too
+ *     narrow for even the compact tier -- what has to clear a width bar
+ *     becomes `h`, and `w` only has to be thick enough for the glyphs.
  *
- * The detail line (value + %) stays horizontal-only. Two glyph runs both
- * rotated into an already-narrow column is the kind of clipping that reads
- * as broken rather than small; the tile's `title` tooltip still carries the
- * exact figures.
+ * Each tier's guard excludes every tier before it -- `compact` checks
+ * `!horizontal`, `vertical` checks `!horizontal && !compact` -- and both
+ * exclusions are load-bearing, not defensive filler: without `!horizontal`,
+ * a wide, tall tile would ALSO satisfy vertical's own `h>44 && w>18` and end
+ * up rotated on top of its normal label; without `!compact`, the same
+ * happens to any tile compact already claims.
  *
  * A tile can still end up with no label at all -- there is no orientation
  * that fits a holding thin enough in both directions, and that limit is
  * real: at 1% of a sector a ticker is a few pixels wide regardless of angle.
  */
 export function planTileLabel(rect: { w: number; h: number }): TileLabel {
-  const horizontal = rect.w > 44 && rect.h > 24;
-  const vertical = !horizontal && rect.h > 44 && rect.w > 18;
+  const tall = rect.h > 24;
+  const horizontal = rect.w > 44 && tall;
+  const compact = !horizontal && rect.w > 26 && tall;
+  const vertical = !horizontal && !compact && rect.h > 44 && rect.w > 18;
   return {
-    showTicker: horizontal || vertical,
+    showTicker: horizontal || compact || vertical,
     showDetail: horizontal && rect.h > 42,
+    compact,
     vertical,
   };
 }
@@ -640,7 +651,7 @@ export const AllocationPanel: React.FC<{
                 )}
                 <div className="relative flex-1">
                   {b.tiles.map((t) => {
-                    const { showTicker, showDetail, vertical } = planTileLabel(t.rect);
+                    const { showTicker, showDetail, compact, vertical } = planTileLabel(t.rect);
                     const fill =
                       colorMode === 'sector'
                         ? b.color
@@ -673,7 +684,9 @@ export const AllocationPanel: React.FC<{
                               className={
                                 vertical
                                   ? 'px-0.5 text-[10px] font-bold leading-none text-slate-100'
-                                  : 'px-1 text-[11px] font-bold leading-tight text-slate-100'
+                                  : compact
+                                    ? 'px-0.5 text-[9px] font-bold leading-none text-slate-100'
+                                    : 'px-1 text-[11px] font-bold leading-tight text-slate-100'
                               }
                               style={
                                 vertical
