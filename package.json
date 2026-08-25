@@ -1,6 +1,7 @@
 {
   "name": "trading-journal",
   "version": "0.1.0",
+  "description": "Personal execution journal and analytics dashboard for IBKR trades, plus a separate long-term investment tracker.",
   "private": true,
   "scripts": {
     "dev": "next dev",

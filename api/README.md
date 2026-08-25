@@ -190,6 +190,28 @@ then by full filename), so every environment applies them identically.
 
 Do not add to that list. Any *new* duplicate is an error.
 
+## Diagnostic scripts
+
+Standalone, run by hand when something is worth checking rather than from CI
+or the app itself. Every one is read-only unless noted otherwise.
+
+- `python check_storage_usage.py` — Supabase free-tier quota usage, projected
+  forward at the current growth rate.
+- `python diagnose_flex.py` — runs the configured IBKR Flex queries one at a
+  time and explains any error code, rather than the app's own "did not
+  return".
+- `python reconcile_positions.py` — re-runs FIFO for every ticker and diffs
+  the result against what `positions` currently stores. A clean run prints
+  zeros; run it after any bulk import or when a headline figure looks wrong.
+- `python verify_bootstrap_schema.py` — checks migration 000's hand-written
+  reconstruction of `trades`/`strategies` against a real database's actual
+  `information_schema`. Meant to be run against production.
+- `python verify_convergence.py` — checks that incremental matching (fill by
+  fill, as the sync does it) converges to the same state as a full rebuild
+  from scratch.
+- `python verify_round_trips.py` — checks the current `/api/round-trips`
+  query against the Python implementation it replaced, on real data.
+
 ## Routes
 
 - `GET /api/trades` — returns all trades grouped by status.
