@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { AlertCircle, Loader2, Trash2, X } from 'lucide-react';
 
 import { useCorrectBasis, useDeleteHolding, useUpdateHolding } from '@/hooks/useInvestments';
+import { projectedWeightPct } from '@/lib/allocationWeight';
 import type { Holding, HoldingCategory } from '@/types/investments';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Combobox } from './Combobox';
@@ -101,13 +102,14 @@ export const EditHoldingModal: React.FC<{
   // Preview only -- what this target WOULD weigh once funded, against the
   // rest of the book. This holding's own current cost basis is subtracted out
   // of the base first so it is not counted twice: once as what it costs
-  // today, and again inside the target being previewed.
+  // today, and again inside the target being previewed. Reads the live
+  // `exchangeRate` state, not `holding.exchange_rate`, so the preview stays
+  // in sync if the trader is mid-edit on currency/rate. See
+  // lib/allocationWeight.ts for why this converts through exchangeRate, and
+  // why `cost_basis_usd` (not `cost_basis`) is the right field to subtract.
   const allocationNum = Number(allocation);
-  const restOfBook = Math.max(0, totalCostBasis - holding.cost_basis);
-  const projectedWeightPct =
-    allocation.trim() && Number.isFinite(allocationNum) && allocationNum > 0
-      ? (allocationNum / (restOfBook + allocationNum)) * 100
-      : null;
+  const restOfBookUsd = Math.max(0, totalCostBasis - holding.cost_basis_usd);
+  const weightPct = projectedWeightPct(allocationNum, Number(exchangeRate) || 1, restOfBookUsd);
 
   const save = () => {
     setError(null);
@@ -284,9 +286,9 @@ export const EditHoldingModal: React.FC<{
                   onChange={(e) => setAllocation(e.target.value)}
                   className={`mt-1 ${INPUT} font-mono`}
                 />
-                {projectedWeightPct !== null && (
+                {weightPct !== null && (
                   <span className="mt-1 block text-[10px] text-slate-600">
-                    {projectedWeightPct.toFixed(1)}% of the book once funded
+                    {weightPct.toFixed(1)}% of the book once funded
                   </span>
                 )}
               </label>

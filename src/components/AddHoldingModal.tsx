@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { AlertCircle, Loader2, X } from 'lucide-react';
 
 import { useCreateHolding } from '@/hooks/useInvestments';
+import { projectedWeightPct } from '@/lib/allocationWeight';
 import type { HoldingCategory } from '@/types/investments';
 import { Combobox } from './Combobox';
 
@@ -68,11 +69,9 @@ export const AddHoldingModal: React.FC<{
   // Preview only -- what this target WOULD weigh once funded, against the
   // book as it stands today. A brand new holding has no cost basis of its
   // own yet, so the whole allocation is simply added to the existing total.
+  // See lib/allocationWeight.ts for why this converts through exchangeRate.
   const allocationNum = Number(allocation);
-  const projectedWeightPct =
-    allocation.trim() && Number.isFinite(allocationNum) && allocationNum > 0
-      ? (allocationNum / (totalCostBasis + allocationNum)) * 100
-      : null;
+  const weightPct = projectedWeightPct(allocationNum, Number(exchangeRate) || 1, totalCostBasis);
 
   const reset = () => {
     setTicker('');
@@ -254,9 +253,9 @@ export const AddHoldingModal: React.FC<{
                 placeholder="1000"
                 className={`mt-1 ${INPUT} font-mono`}
               />
-              {projectedWeightPct !== null && (
+              {weightPct !== null && (
                 <span className="mt-1 block text-[10px] text-slate-600">
-                  {projectedWeightPct.toFixed(1)}% of the book once funded
+                  {weightPct.toFixed(1)}% of the book once funded
                 </span>
               )}
             </label>

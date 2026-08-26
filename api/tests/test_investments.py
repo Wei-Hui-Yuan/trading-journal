@@ -23,7 +23,7 @@ import main  # noqa: E402
 JAN = datetime(2026, 1, 15, tzinfo=timezone.utc)
 
 
-def tx(kind, quantity=None, price=None, total=None, fees=0.0, day_offset=0):
+def tx(kind, quantity=None, price=None, total=None, fees=0.0, day_offset=0, exchange_rate=1):
     """One ledger row, with the same sign convention the endpoint writes."""
     if total is None and quantity is not None and price is not None:
         gross = quantity * price
@@ -39,7 +39,7 @@ def tx(kind, quantity=None, price=None, total=None, fees=0.0, day_offset=0):
         transaction_date=JAN + timedelta(days=day_offset),
         created_at=JAN + timedelta(days=day_offset),
         listed_currency="USD",
-        exchange_rate=1,
+        exchange_rate=exchange_rate,
         source="MANUAL",
     )
 
@@ -150,6 +150,119 @@ def test_a_transfer_arrives_with_its_cost_basis_intact():
     assert position.quantity == pytest.approx(50)
     assert position.cost_basis == pytest.approx(1000.0)
     assert position.average_cost == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# USD conversion (issue #5 of the calculation audit)
+#
+# Every `_usd` figure uses each TRANSACTION's own exchange_rate -- the rate
+# on the day that money actually moved -- not the holding's current one and
+# not one rate applied to a final total. This is what makes a purchase made
+# at 7.80 HKD/USD stay a 7.80 purchase in USD terms even after the rate has
+# since moved, and what makes a sale years later still relieve basis at each
+# purchase's own historical cost rather than today's rate applied
+# retroactively to the whole position.
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_purchase_converts_at_its_own_rate():
+    # 7,800 HKD spent at 7.80 HKD/USD is exactly $1,000 -- the textbook case
+    # migration 026's own comment gives ("a purchase made at 7.80 HKD/USD
+    # stays a purchase made at 7.80").
+    position = derive([tx("BUY", 10, 780.0, exchange_rate=7.8)])
+    assert position.cost_basis == pytest.approx(7800.0)  # native, unconverted
+    assert position.cost_basis_usd == pytest.approx(1000.0)
+
+
+def test_buying_twice_at_different_rates_sums_each_purchase_at_its_own_rate():
+    """The core of issue #5's fix: NOT the native total converted once at the
+    latest rate. That would give 16800 / 9.0 = 1866.67, a different (and
+    wrong) number from summing each purchase's own historical conversion."""
+    position = derive([
+        tx("BUY", 10, 780.0, exchange_rate=7.8, day_offset=0),  # $1,000
+        tx("BUY", 10, 900.0, exchange_rate=9.0, day_offset=30),  # $1,000
+    ])
+    assert position.cost_basis == pytest.approx(16800.0)  # native: 7800+9000
+    assert position.cost_basis_usd == pytest.approx(2000.0)  # NOT 1866.67
+    assert position.average_cost_usd == pytest.approx(100.0)  # $2,000 / 20 shares
+
+
+def test_a_sale_relieves_usd_cost_at_the_usd_average_not_todays_rate():
+    """Buys 10 shares for 7,800 HKD at 7.80 (=$1,000, $100/share USD), then
+    sells 5 at a DIFFERENT rate (8.50) on the sale day. The cost relieved in
+    USD must come from the $100/share USD average built from the purchase,
+    not from re-converting the native average at the sale's own rate."""
+    position = derive([
+        tx("BUY", 10, 780.0, exchange_rate=7.8, day_offset=0),
+        tx("SELL", 5, 850.0, exchange_rate=8.5, day_offset=10),
+    ])
+    # Proceeds: 5 x 850 = 4,250 HKD = $500 at 8.5. Relieved: 5 x $100 = $500.
+    assert position.realized_pnl_usd == pytest.approx(0.0)
+    assert position.cost_basis_usd == pytest.approx(500.0)  # $1,000 - $500 relieved
+
+
+def test_a_dividend_converts_at_its_own_transactions_rate():
+    position = derive([
+        tx("BUY", 10, 780.0, exchange_rate=7.8, day_offset=0),
+        tx("DIVIDEND", total=780.0, exchange_rate=7.8, day_offset=40),
+    ])
+    assert position.dividends == pytest.approx(780.0)
+    assert position.dividends_usd == pytest.approx(100.0)
+
+
+def test_a_usd_holding_has_identical_native_and_usd_figures():
+    """exchange_rate=1 (every real holding in this book today) must leave the
+    `_usd` twin numerically identical to the unsuffixed figure -- the
+    regression guard that this change is additive, not a behaviour change,
+    for every holding that exists right now."""
+    position = derive([
+        tx("BUY", 10, 100.0, day_offset=0),
+        tx("SELL", 4, 150.0, day_offset=10),
+        tx("DIVIDEND", total=25.0, day_offset=20),
+    ])
+    assert position.cost_basis_usd == pytest.approx(position.cost_basis)
+    assert position.realized_pnl_usd == pytest.approx(position.realized_pnl)
+    assert position.dividends_usd == pytest.approx(position.dividends)
+    assert position.average_cost_usd == pytest.approx(position.average_cost)
+
+
+# ---------------------------------------------------------------------------
+# _value_position_usd: market value's own conversion, using the HOLDING's
+# current rate (not any transaction's historical one -- see its docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_market_value_converts_at_the_holdings_current_rate():
+    position = main.DerivedPosition(ticker="TEST", cost_basis_usd=1000.0)
+    result = main._value_position_usd(market_value=15600.0, exchange_rate=7.8, position=position)
+    assert result["market_value_usd"] == pytest.approx(2000.0)
+
+
+def test_unrealized_pnl_usd_compares_current_market_value_to_usd_cost_basis():
+    # $2,000 market value against $1,000 USD cost basis = $1,000 gain, 100%.
+    position = main.DerivedPosition(ticker="TEST", cost_basis_usd=1000.0)
+    result = main._value_position_usd(market_value=15600.0, exchange_rate=7.8, position=position)
+    assert result["unrealized_pnl_usd"] == pytest.approx(1000.0)
+    assert result["unrealized_pnl_pct_usd"] == pytest.approx(100.0)
+
+
+def test_no_market_value_means_no_usd_figures_not_zero():
+    """Nothing held is not the same as held and worth zero -- the same
+    distinction get_portfolio already makes for the native figures."""
+    position = main.DerivedPosition(ticker="TEST", cost_basis_usd=1000.0)
+    result = main._value_position_usd(market_value=None, exchange_rate=7.8, position=position)
+    assert result["market_value_usd"] is None
+    assert result["unrealized_pnl_usd"] is None
+    assert result["unrealized_pnl_pct_usd"] is None
+
+
+def test_a_missing_exchange_rate_defaults_to_one():
+    """Matches _value_holding's own `_f(holding.exchange_rate) or 1.0`
+    fallback elsewhere in this file -- None must not propagate into a
+    ZeroDivisionError or a silently wrong conversion."""
+    position = main.DerivedPosition(ticker="TEST", cost_basis_usd=1000.0)
+    result = main._value_position_usd(market_value=2000.0, exchange_rate=None, position=position)
+    assert result["market_value_usd"] == pytest.approx(2000.0)
 
 
 # ---------------------------------------------------------------------------

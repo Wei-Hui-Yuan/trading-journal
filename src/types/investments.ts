@@ -145,6 +145,28 @@ export interface Holding {
   unrealized_pnl_pct: number | null;
   realized_pnl: number;
   dividends: number;
+  /**
+   * The USD twin of the field with the same name minus the suffix --
+   * `cost_basis_usd` is `cost_basis` converted, `market_value_usd` is
+   * `market_value` converted, and so on. NOT the same conversion rate for
+   * every field: cost/realized/dividends convert through each ledger
+   * transaction's OWN exchange_rate (the rate on the day that money moved),
+   * while market_value converts through this holding's CURRENT
+   * exchange_rate (today's rate for what the position is worth today) --
+   * see api/main.py's `_derive_position` and `_value_position_usd`. For
+   * every holding in this book today, listed_currency is USD and
+   * exchange_rate is 1, so these are numerically identical to their
+   * unsuffixed counterparts -- they exist so a portfolio-wide total (or a
+   * future non-USD holding) sums one consistent currency instead of adding
+   * raw figures from different currencies together (issue #5 of the
+   * calculation audit).
+   */
+  cost_basis_usd: number;
+  market_value_usd: number | null;
+  unrealized_pnl_usd: number | null;
+  unrealized_pnl_pct_usd: number | null;
+  realized_pnl_usd: number;
+  dividends_usd: number;
   transaction_count: number;
   first_acquired: string | null;
 

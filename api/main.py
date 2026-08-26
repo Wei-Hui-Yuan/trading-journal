@@ -6970,14 +6970,30 @@ class DerivedPosition(BaseModel):
     holding accumulated over years, often with a monthly purchase; average
     cost is what the portfolio sheet this replaces uses, and it is the figure
     that answers "what did my position cost me" without inventing lots.
+
+    Every money field below has a `_usd` twin, computed the same way but
+    converted through each TRANSACTION's own `exchange_rate` -- the rate on
+    the day that money actually moved, not today's. This is what makes a
+    dollar spent in January at 7.80 HKD/USD stay a January dollar even if the
+    rate has since moved to 7.85: the twin is a portfolio-wide, single-
+    currency figure suitable for summing across holdings, while the
+    unsuffixed field stays exactly what it always was -- the position in its
+    own listed currency, unconverted. See migration 026's own description of
+    exchange_rate ("what one USD was worth in it at the time") and issue #5
+    of the calculation audit, which found the portfolio-wide totals summing
+    these unconverted figures across holdings in different currencies.
     """
 
     ticker: str
     quantity: float = 0.0
     average_cost: Optional[float] = None
+    average_cost_usd: Optional[float] = None
     cost_basis: float = 0.0
+    cost_basis_usd: float = 0.0
     realized_pnl: float = 0.0
+    realized_pnl_usd: float = 0.0
     dividends: float = 0.0
+    dividends_usd: float = 0.0
     transaction_count: int = 0
     first_acquired: Optional[datetime] = None
     last_activity: Optional[datetime] = None
@@ -6989,18 +7005,32 @@ def _derive_position(ticker: str, rows: Sequence[InvestmentTransaction]) -> Deri
     A SELL relieves cost at the CURRENT average, which is what makes this
     average-cost rather than FIFO: the remaining basis per share is unchanged
     by a partial sale, so selling half a position does not silently reprice
-    the half still held.
+    the half still held. The USD-converted running totals (see
+    DerivedPosition's docstring) mirror this exactly, one exchange rate
+    per transaction rather than one for the whole position -- a partial sale
+    relieves USD cost at the USD average built from EACH purchase's own
+    historical rate, not at today's rate applied retroactively to all of it.
     """
     quantity = 0.0
     cost = 0.0
+    cost_usd = 0.0
     realized = 0.0
+    realized_usd = 0.0
     dividends = 0.0
+    dividends_usd = 0.0
     first_acquired: Optional[datetime] = None
     last_activity: Optional[datetime] = None
 
     for tx in sorted(rows, key=lambda r: (r.transaction_date, r.created_at or r.transaction_date)):
         kind = tx.transaction_type
         amount = _f(tx.total_amount) or 0.0
+        # This transaction's OWN rate, from the day the money moved -- not
+        # the holding's current one. Every accumulator below converts through
+        # this, per-transaction, rather than converting the final total
+        # through a single rate at the end, which is what makes a sale years
+        # later still relieve basis at each purchase's own historical cost.
+        rate = _f(tx.exchange_rate) or 1.0
+        amount_usd = amount / rate
         qty = _f(tx.quantity) or 0.0
         last_activity = tx.transaction_date
 
@@ -7010,21 +7040,28 @@ def _derive_position(ticker: str, rows: Sequence[InvestmentTransaction]) -> Deri
             # a magnitude. Taking it as-signed would make every purchase
             # reduce the basis.
             cost += abs(amount)
+            cost_usd += abs(amount_usd)
             if first_acquired is None:
                 first_acquired = tx.transaction_date
         elif kind == TX_SELL:
             average = cost / quantity if quantity > 0 else 0.0
+            average_usd = cost_usd / quantity if quantity > 0 else 0.0
             relieved = average * qty
+            relieved_usd = average_usd * qty
             realized += amount - relieved
+            realized_usd += amount_usd - relieved_usd
             cost = max(0.0, cost - relieved)
+            cost_usd = max(0.0, cost_usd - relieved_usd)
             quantity -= qty
             # A rounding residue on a full exit would otherwise leave a
             # basis attached to nothing.
             if quantity <= 1e-9:
                 quantity = 0.0
                 cost = 0.0
+                cost_usd = 0.0
         elif kind == TX_DIVIDEND:
             dividends += amount
+            dividends_usd += amount_usd
         elif kind == TX_ADJUSTMENT:
             # Signed deltas, not magnitudes -- the one place in this loop
             # that touches `cost` without abs(). No realized P&L and no
@@ -7032,17 +7069,23 @@ def _derive_position(ticker: str, rows: Sequence[InvestmentTransaction]) -> Deri
             # restatement of where the running total already stood.
             quantity += qty
             cost += amount
+            cost_usd += amount_usd
             if quantity <= 1e-9:
                 quantity = 0.0
                 cost = 0.0
+                cost_usd = 0.0
 
     return DerivedPosition(
         ticker=ticker,
         quantity=quantity,
         average_cost=(cost / quantity) if quantity > 0 else None,
+        average_cost_usd=(cost_usd / quantity) if quantity > 0 else None,
         cost_basis=cost,
+        cost_basis_usd=cost_usd,
         realized_pnl=realized,
+        realized_pnl_usd=realized_usd,
         dividends=dividends,
+        dividends_usd=dividends_usd,
         transaction_count=len(rows),
         first_acquired=first_acquired,
         last_activity=last_activity,
@@ -8304,6 +8347,38 @@ def _value_holding(
     }
 
 
+def _value_position_usd(
+    market_value: Optional[float], exchange_rate: Optional[float], position: DerivedPosition
+) -> dict:
+    """market_value_usd and what it does to unrealised P&L, for one holding.
+
+    Split out from get_portfolio so this conversion has its own test
+    independent of a database session -- the exact reasoning
+    _value_holding/_derive_position already follow elsewhere in this file.
+
+    Uses the HOLDING's current exchange_rate, not any transaction's
+    historical one: market value is what the position is worth today, so
+    today's rate is what converts it. cost_basis_usd on `position` instead
+    used each transaction's own historical rate (see _derive_position),
+    because it is money that already moved on a specific day in the past --
+    the two intentionally use different rates for different reasons.
+    """
+    rate = exchange_rate or 1.0
+    market_value_usd = market_value / rate if market_value is not None else None
+    unrealized_pnl_usd = (
+        market_value_usd - position.cost_basis_usd if market_value_usd is not None else None
+    )
+    unrealized_pnl_pct_usd = (
+        (market_value_usd / position.cost_basis_usd - 1.0) * 100.0
+        if market_value_usd is not None and position.cost_basis_usd > 0 else None
+    )
+    return {
+        "market_value_usd": market_value_usd,
+        "unrealized_pnl_usd": unrealized_pnl_usd,
+        "unrealized_pnl_pct_usd": unrealized_pnl_pct_usd,
+    }
+
+
 @app.get(
     "/api/investments/portfolio",
     dependencies=[Depends(verify_clerk_token)],
@@ -8335,6 +8410,11 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
         inputs_by_ticker.setdefault(row.ticker, {})[row.variant] = row
 
     rows: list[dict] = []
+    # USD, always -- see DerivedPosition's docstring. Every total below, and
+    # portfolio_weight_pct, is built from the `_usd` twin of each figure
+    # specifically so a HKD holding's weight is not computed by dividing a
+    # HKD number into a sum of HKD-and-USD-and-EUR numbers added together as
+    # if they were the same currency (issue #5 of the calculation audit).
     total_market_value = 0.0
 
     for holding in holdings:
@@ -8346,8 +8426,10 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
         # green gain of nothing against every ticker being tracked but not
         # owned.
         market_value = (price * position.quantity) if price and position.quantity else None
-        if market_value:
-            total_market_value += market_value
+        usd = _value_position_usd(market_value, _f(holding.exchange_rate), position)
+        market_value_usd = usd["market_value_usd"]
+        if market_value_usd:
+            total_market_value += market_value_usd
 
         variants = inputs_by_ticker.get(holding.ticker, {})
         merged, overridden = _merge_inputs(
@@ -8359,7 +8441,9 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
             "quantity": position.quantity,
             "average_cost": position.average_cost,
             "cost_basis": position.cost_basis,
+            "cost_basis_usd": position.cost_basis_usd,
             "market_value": market_value,
+            "market_value_usd": market_value_usd,
             "unrealized_pnl": (
                 market_value - position.cost_basis if market_value is not None else None
             ),
@@ -8367,8 +8451,12 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
                 (market_value / position.cost_basis - 1.0) * 100.0
                 if market_value is not None and position.cost_basis > 0 else None
             ),
+            "unrealized_pnl_usd": usd["unrealized_pnl_usd"],
+            "unrealized_pnl_pct_usd": usd["unrealized_pnl_pct_usd"],
             "realized_pnl": position.realized_pnl,
+            "realized_pnl_usd": position.realized_pnl_usd,
             "dividends": position.dividends,
+            "dividends_usd": position.dividends_usd,
             "transaction_count": position.transaction_count,
             "first_acquired": position.first_acquired,
             "valuation": (
@@ -8386,18 +8474,18 @@ async def get_portfolio(session: AsyncSession = Depends(get_session)):
         })
 
     for row in rows:
-        if row["market_value"] and total_market_value > 0:
-            row["portfolio_weight_pct"] = row["market_value"] / total_market_value * 100.0
+        if row["market_value_usd"] and total_market_value > 0:
+            row["portfolio_weight_pct"] = row["market_value_usd"] / total_market_value * 100.0
 
     return {
         "holdings": rows,
         "total_market_value": total_market_value,
-        "total_cost_basis": sum(r["cost_basis"] for r in rows),
+        "total_cost_basis": sum(r["cost_basis_usd"] for r in rows),
         "total_unrealized_pnl": sum(
-            r["unrealized_pnl"] for r in rows if r["unrealized_pnl"] is not None
+            r["unrealized_pnl_usd"] for r in rows if r["unrealized_pnl_usd"] is not None
         ),
-        "total_realized_pnl": sum(r["realized_pnl"] for r in rows),
-        "total_dividends": sum(r["dividends"] for r in rows),
+        "total_realized_pnl": sum(r["realized_pnl_usd"] for r in rows),
+        "total_dividends": sum(r["dividends_usd"] for r in rows),
         "as_of": datetime.now(timezone.utc),
     }
 
@@ -8681,11 +8769,14 @@ async def _export_investment_holdings(session: AsyncSession):
     header = [
         "ticker", "name", "sector", "category", "holding_type", "country",
         "listed_currency", "exchange_rate",
-        "quantity", "average_cost", "cost_basis",
+        "quantity", "average_cost", "cost_basis", "cost_basis_usd",
         "current_price", "price_is_manual", "price_updated_at",
         "day_change_pct",
-        "market_value", "unrealized_pnl", "unrealized_pnl_pct",
-        "realized_pnl", "dividends", "portfolio_weight_pct",
+        "market_value", "market_value_usd",
+        "unrealized_pnl", "unrealized_pnl_pct",
+        "unrealized_pnl_usd", "unrealized_pnl_pct_usd",
+        "realized_pnl", "realized_pnl_usd",
+        "dividends", "dividends_usd", "portfolio_weight_pct",
         "planned_allocation", "transaction_count", "first_acquired",
         "is_valuable", "valuation_available",
         "intrinsic_value_base", "intrinsic_value_conservative",
@@ -8712,15 +8803,21 @@ async def _export_investment_holdings(session: AsyncSession):
             fmt.number(row["quantity"]),
             fmt.number(row["average_cost"]),
             fmt.number(row["cost_basis"]),
+            fmt.number(row["cost_basis_usd"]),
             fmt.number(row["current_price"]),
             fmt.flag(row["price_is_manual"]),
             fmt.timestamp(row["price_updated_at"]),
             fmt.number(row["day_change_pct"]),
             fmt.number(row["market_value"]),
+            fmt.number(row["market_value_usd"]),
             fmt.number(row["unrealized_pnl"]),
             fmt.number(row["unrealized_pnl_pct"]),
+            fmt.number(row["unrealized_pnl_usd"]),
+            fmt.number(row["unrealized_pnl_pct_usd"]),
             fmt.number(row["realized_pnl"]),
+            fmt.number(row["realized_pnl_usd"]),
             fmt.number(row["dividends"]),
+            fmt.number(row["dividends_usd"]),
             fmt.number(row["portfolio_weight_pct"]),
             fmt.number(row["planned_allocation"]),
             fmt.number(row["transaction_count"]),
