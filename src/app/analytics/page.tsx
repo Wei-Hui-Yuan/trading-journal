@@ -518,6 +518,16 @@ function MistakeBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
                   <td className="py-2 text-slate-200">{row.mistake}</td>
                   <td className="py-2 text-right font-mono text-slate-300">
                     {row.trade_count}
+                    {/* A trade with no stop still counts as a real instance
+                        of the tag, but cannot be scored -- disclosed here
+                        rather than silently dropped from the count, the
+                        same way Strategy Breakdown discloses its own
+                        unscored trades. */}
+                    {row.unscored > 0 && (
+                      <span className="ml-1 text-[10px] text-obsidian-muted">
+                        ({row.unscored} unscored)
+                      </span>
+                    )}
                   </td>
                   <td
                     className={`py-2 text-right font-mono font-semibold ${
@@ -528,13 +538,17 @@ function MistakeBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
                   </td>
                   <td
                     className={`py-2 text-right font-mono ${
-                      row.avg_r >= 0 ? 'text-win' : 'text-loss'
+                      row.avg_r === null
+                        ? 'text-obsidian-muted'
+                        : row.avg_r >= 0
+                          ? 'text-win'
+                          : 'text-loss'
                     }`}
                   >
-                    {row.avg_r.toFixed(2)}R
+                    {row.avg_r === null ? '—' : `${row.avg_r.toFixed(2)}R`}
                   </td>
                   <td className="py-2 text-right font-mono text-slate-300">
-                    {row.win_rate_pct}%
+                    {row.win_rate_pct === null ? '—' : `${row.win_rate_pct}%`}
                   </td>
                 </tr>
               ))}

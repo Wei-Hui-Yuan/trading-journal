@@ -188,6 +188,8 @@ function mistakeRow(overrides: Partial<MistakeBreakdownRow> = {}): MistakeBreakd
   return {
     mistake: 'FOMO',
     trade_count: 3,
+    scored: 3,
+    unscored: 0,
     total_r: -2.4,
     avg_r: -0.8,
     win_rate_pct: 10,
@@ -996,6 +998,60 @@ describe('MistakeBreakdown', () => {
     expect(within(card).getByText('-0.80R')).toHaveClass('text-loss');
     expect(within(card).getByText('1.20R')).toHaveClass('text-win');
     expect(within(card).getByText('0.60R')).toHaveClass('text-win');
+  });
+
+  it('discloses an unscored trade instead of silently dropping it from the count', async () => {
+    // Issue #6 of the calculation audit: tagging a mistake on 3 trades where
+    // 1 lacks a stop used to render "2" with nothing hinting a third
+    // instance existed. trade_count (3) now includes it; this asserts the
+    // disclosure text is actually on screen, not just present in the data.
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        mistake_breakdown: [
+          mistakeRow({ mistake: 'Oversized', trade_count: 3, scored: 2, unscored: 1 }),
+        ],
+      })
+    );
+    await mountPage();
+    const card = sectionHeading('Performance by Mistake');
+    expect(within(card).getByText('3')).toBeInTheDocument();
+    expect(within(card).getByText('(1 unscored)')).toBeInTheDocument();
+  });
+
+  it('does not show an unscored note when every tagged trade was scoreable', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        mistake_breakdown: [mistakeRow({ mistake: 'FOMO', unscored: 0 })],
+      })
+    );
+    await mountPage();
+    const card = sectionHeading('Performance by Mistake');
+    expect(within(card).queryByText(/unscored/)).not.toBeInTheDocument();
+  });
+
+  it('shows a dash rather than crashing when a mistake has nothing scoreable at all', async () => {
+    // scored=0 -> avg_r and win_rate_pct are null, not a number to format.
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        mistake_breakdown: [
+          mistakeRow({
+            mistake: 'No Plan',
+            trade_count: 2,
+            scored: 0,
+            unscored: 2,
+            total_r: 0,
+            avg_r: null,
+            win_rate_pct: null,
+          }),
+        ],
+      })
+    );
+    await mountPage();
+    const card = sectionHeading('Performance by Mistake');
+    expect(within(card).getByText('No Plan')).toBeInTheDocument();
+    expect(within(card).getByText('(2 unscored)')).toBeInTheDocument();
+    // Two dashes: one for Avg R, one for Win %.
+    expect(within(card).getAllByText('—')).toHaveLength(2);
   });
 });
 

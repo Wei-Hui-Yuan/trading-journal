@@ -1493,26 +1493,38 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
 
     # Group performance by behavioural tag. One trade with several tags counts
     # toward each, so these buckets intentionally overlap.
+    #
+    # Iterates every trade, scored or not -- the same reasoning
+    # compute_strategy_breakdown already applies. A trade with no stop cannot
+    # be scored, but a mistake tag on it is still a real instance of that
+    # mistake; the old version iterated `scored` only, so tagging "Oversized"
+    # on three trades where one lacks a stop silently reported "2 trades",
+    # with nothing on screen hinting a third existed.
+    r_by_id = {t.trade_id: r for t, r in scored}
     by_mistake: dict[str, dict[str, Any]] = {}
-    for trade, r in scored:
+    for trade in trades:
         for tag in trade.mistakes or []:
-            bucket = by_mistake.setdefault(
-                tag, {"trade_count": 0, "total_r": 0.0, "wins": 0}
-            )
-            bucket["trade_count"] += 1
-            bucket["total_r"] += r
-            if r > 0:
-                bucket["wins"] += 1
+            bucket = by_mistake.setdefault(tag, {"r": [], "unscored": 0, "wins": 0})
+            r = r_by_id.get(trade.trade_id)
+            if r is None:
+                bucket["unscored"] += 1
+            else:
+                bucket["r"].append(r)
+                if r > 0:
+                    bucket["wins"] += 1
 
     mistake_breakdown = [
         {
             "mistake": tag,
-            "trade_count": b["trade_count"],
-            "total_r": round(b["total_r"], 4),
-            "avg_r": round(b["total_r"] / b["trade_count"], 4),
-            "win_rate_pct": round(b["wins"] / b["trade_count"] * 100, 2),
+            # Every trade tagged with this mistake, scoreable or not.
+            "trade_count": len(b["r"]) + b["unscored"],
+            "scored": len(b["r"]),
+            "unscored": b["unscored"],
+            "total_r": round(sum(b["r"]), 4) if b["r"] else 0.0,
+            "avg_r": round(sum(b["r"]) / len(b["r"]), 4) if b["r"] else None,
+            "win_rate_pct": round(b["wins"] / len(b["r"]) * 100, 2) if b["r"] else None,
         }
-        for tag, b in sorted(by_mistake.items(), key=lambda kv: kv[1]["total_r"])
+        for tag, b in sorted(by_mistake.items(), key=lambda kv: sum(kv[1]["r"]))
     ]
 
     return {

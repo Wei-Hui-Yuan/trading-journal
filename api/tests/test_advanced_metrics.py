@@ -24,8 +24,13 @@ from services.analytics import (
 def make_trade(
     direction="BUY", entry="100", exit_=None, stop=None, planned=None, mistakes=None
 ):
+    # Unique per call -- compute_advanced_metrics joins scored R values back
+    # onto trades by trade_id (see compute_strategy_breakdown and, since the
+    # #6 audit fix, the mistake breakdown too), and every trade in a real
+    # ledger has its own id. A shared literal here would collapse that join
+    # in any test with more than one trade, silently mixing up their R.
     return ReviewedTrade(
-        trade_id="t",
+        trade_id=str(uuid.uuid4()),
         ticker="AAA",
         direction=direction,
         quantity=100,
@@ -140,6 +145,44 @@ class TestAggregate:
 
     def test_worst_mistake_sorted_first(self, metrics):
         assert metrics["mistake_breakdown"][0]["mistake"] == "Chased"
+
+    def test_a_mistake_tagged_on_an_unscoreable_trade_is_not_invisible(self):
+        """Issue #6 of the calculation audit: tagging "Oversized" on 3 trades
+        where 1 lacks a stop used to report "2 trades" with nothing on
+        screen hinting a third existed -- because the old loop iterated only
+        `scored`, so an unscoreable trade's mistake tags were never even
+        counted. Mirrors compute_strategy_breakdown's own unscored handling."""
+        metrics = compute_advanced_metrics([
+            make_trade("BUY", "100", "106", "98", mistakes=["Oversized"]),  # R=3.0
+            make_trade("BUY", "100", "101", "98", mistakes=["Oversized"]),  # R=0.5
+            # No stop -> unscoreable, but still a real instance of the tag.
+            make_trade("BUY", "100", "110", None, mistakes=["Oversized"]),
+        ])
+        by = {b["mistake"]: b for b in metrics["mistake_breakdown"]}
+        assert by["Oversized"]["trade_count"] == 3
+        assert by["Oversized"]["scored"] == 2
+        assert by["Oversized"]["unscored"] == 1
+        # total_r/avg_r/win_rate still come from the 2 scoreable trades only
+        # -- the fix discloses the gap, it does not invent a score for it.
+        assert by["Oversized"]["total_r"] == 3.5
+        assert by["Oversized"]["avg_r"] == 1.75
+        assert by["Oversized"]["win_rate_pct"] == 100.0
+
+    def test_a_mistake_tagged_only_on_unscoreable_trades_still_appears(self):
+        """The tag must surface even with nothing to score at all -- a
+        trader tagging "No Plan" on their only unreviewed-stop trades should
+        still see the count, not have the mistake vanish entirely."""
+        metrics = compute_advanced_metrics([
+            make_trade("BUY", "100", "110", None, mistakes=["No Plan"]),
+            make_trade("BUY", "100", "90", None, mistakes=["No Plan"]),
+        ])
+        by = {b["mistake"]: b for b in metrics["mistake_breakdown"]}
+        assert by["No Plan"]["trade_count"] == 2
+        assert by["No Plan"]["scored"] == 0
+        assert by["No Plan"]["unscored"] == 2
+        assert by["No Plan"]["total_r"] == 0.0
+        assert by["No Plan"]["avg_r"] is None
+        assert by["No Plan"]["win_rate_pct"] is None
 
     def test_r_distribution_sums_to_scored(self, metrics):
         assert sum(metrics["r_distribution"].values()) == metrics["scored_trades"]

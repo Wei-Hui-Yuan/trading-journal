@@ -1309,10 +1309,14 @@ export interface DashboardStats {
 
 export interface MistakeBreakdown {
   mistake: string;
+  /** Every trade tagged with this mistake, scoreable or not. */
   trade_count: number;
+  /** How many could be scored in R — the rest have no stop recorded. */
+  scored: number;
+  unscored: number;
   total_r: number;
-  avg_r: number;
-  win_rate_pct: number;
+  avg_r: number | null;
+  win_rate_pct: number | null;
 }
 
 /**
