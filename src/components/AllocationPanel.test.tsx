@@ -19,7 +19,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { isDayChangeStale, planTileLabel } from '@/components/AllocationPanel';
+import { isDayChangeStale, isTrackedForProgress, planTileLabel } from '@/components/AllocationPanel';
 
 describe('planTileLabel', () => {
   it('shows the ticker and the detail line on a tile with room in both directions', () => {
@@ -217,5 +217,42 @@ describe('isDayChangeStale', () => {
         price_updated_at: FRESH,
       })
     ).toBe(true);
+  });
+});
+
+/**
+ * isTrackedForProgress: decides which holdings reach "Progress against
+ * target" (and so are eligible to be the DCA suggestion).
+ *
+ * Before this existed, the panel used ONE filter (cost_basis > 0) to gate
+ * both the treemap AND the progress table. That hid a holding with a real
+ * target but zero cost basis -- a position planned but not yet bought,
+ * explicitly supported by AddHoldingModal's own "build up over several
+ * purchases" use case -- from the table entirely, even though a 0%-funded
+ * holding is the most under-funded thing in the book by definition. This
+ * predicate is deliberately WIDER than a treemap tile's requirement: the
+ * treemap's own exclusion of a $0 holding happens elsewhere, by filtering
+ * on deployed/totalDeployed, not by narrowing who reaches the table.
+ */
+describe('isTrackedForProgress', () => {
+  it('tracks a holding with money deployed, target or not', () => {
+    expect(isTrackedForProgress({ cost_basis: 500, planned_allocation: null })).toBe(true);
+  });
+
+  it('tracks a holding with a real target but nothing bought yet', () => {
+    // The exact case the audit found missing: planned, not funded.
+    expect(isTrackedForProgress({ cost_basis: 0, planned_allocation: 2000 })).toBe(true);
+  });
+
+  it('does not track a holding with neither money nor a target', () => {
+    // Nothing to show progress on -- correctly excluded, not a gap.
+    expect(isTrackedForProgress({ cost_basis: 0, planned_allocation: null })).toBe(false);
+  });
+
+  it('does not track a holding with a zero or negative target and no money', () => {
+    // A cleared target (0) must not be treated as "planned" -- matches the
+    // `planned_allocation && planned_allocation > 0` check used elsewhere in
+    // this file to decide whether a target is real.
+    expect(isTrackedForProgress({ cost_basis: 0, planned_allocation: 0 })).toBe(false);
   });
 });

@@ -149,6 +149,27 @@ const signedPct = (pct: number | null) =>
  * the same way `planTileLabel` is, so this can be tested without mounting
  * the panel.
  */
+/**
+ * Whether a holding belongs in "Progress against target" (and so is
+ * eligible to be the DCA suggestion): it has real money deployed, a real
+ * target, or both. A holding with neither has nothing to show progress on
+ * and is correctly left out.
+ *
+ * Deliberately broader than what earns a treemap tile (cost_basis > 0
+ * alone) -- a target set before any purchase is an explicitly supported use
+ * case (see AddHoldingModal) and is by definition the most under-funded
+ * thing in the book, so it belongs in the table even though a $0 cost basis
+ * has no area to size a tile with. The treemap's own exclusion happens
+ * downstream, filtering on deployed/totalDeployed specifically, not by
+ * narrowing this predicate.
+ */
+export function isTrackedForProgress(h: {
+  cost_basis: number;
+  planned_allocation: number | null;
+}): boolean {
+  return h.cost_basis > 0 || (h.planned_allocation ?? 0) > 0;
+}
+
 export function isDayChangeStale(h: {
   day_change_pct: number | null;
   day_change_updated_at: string | null;
@@ -478,8 +499,21 @@ export const AllocationPanel: React.FC<{
     const funded = holdings.filter((h) => h.cost_basis > 0);
     const byTicker = new Map(funded.map((h) => [h.ticker, h]));
 
+    // Grouping (and so the progress table below, and the DCA suggestion) is
+    // built from a WIDER set than the treemap: a holding with a real target
+    // but zero cost basis -- a position you have planned but not started
+    // buying, an explicitly supported use case (see AddHoldingModal) -- is
+    // by definition the most under-funded thing in the book and belongs in
+    // "Progress against target" and eligible to be the DCA suggestion, even
+    // though it cannot be a treemap tile: a $0 cost basis has no area to
+    // size one with. That exclusion already happens downstream, on `funded`
+    // groups/rows specifically (`g.totalDeployed > 0` below for sector
+    // blocks, `r.deployed > 0` for tiles within one) -- widening the source
+    // here does not widen what the treemap draws.
+    const tracked = holdings.filter(isTrackedForProgress);
+
     const byGroup = new Map<string, Holding[]>();
-    for (const h of funded) {
+    for (const h of tracked) {
       const key = h.sector || h.category || 'No Target Set';
       if (!byGroup.has(key)) byGroup.set(key, []);
       byGroup.get(key)!.push(h);
