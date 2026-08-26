@@ -19,7 +19,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { isDayChangeStale, isTrackedForProgress, planTileLabel } from '@/components/AllocationPanel';
+import {
+  buildTile,
+  groupKeyFor,
+  isDayChangeStale,
+  isTrackedForProgress,
+  planTileLabel,
+  targetFor,
+} from '@/components/AllocationPanel';
 
 describe('planTileLabel', () => {
   it('shows the ticker and the detail line on a tile with room in both directions', () => {
@@ -254,5 +261,118 @@ describe('isTrackedForProgress', () => {
     // `planned_allocation && planned_allocation > 0` check used elsewhere in
     // this file to decide whether a target is real.
     expect(isTrackedForProgress({ cost_basis: 0, planned_allocation: 0 })).toBe(false);
+  });
+});
+
+/**
+ * groupKeyFor / targetFor: the fix for issue #4.
+ *
+ * The bug: a single bucket name, "No Target Set", used to decide BOTH which
+ * sector group a holding landed in (via sector || category fallback) AND
+ * whether the treemap drew its tile hatched (isUntargeted, which read
+ * `g.name === 'No Target Set'`). Those are two unrelated facts. A holding
+ * with a real sector but no target got the wrong answer (no hatch, even
+ * though it has no target); a holding with no sector but a real target also
+ * got the wrong answer (hatched, even though it has a target). These two
+ * functions replace that one conflated string with two independent reads,
+ * and the tests below are the exact four-quadrant matrix that proves they
+ * no longer influence each other.
+ */
+describe('groupKeyFor and targetFor are independent', () => {
+  it('groups by sector when present, regardless of target', () => {
+    expect(groupKeyFor({ sector: 'Technology', category: null })).toBe('Technology');
+  });
+
+  it('falls back to category when sector is absent, regardless of target', () => {
+    expect(groupKeyFor({ sector: null, category: 'ETF' })).toBe('ETF');
+  });
+
+  it('falls back to "Uncategorized" only when both sector and category are absent', () => {
+    expect(groupKeyFor({ sector: null, category: null })).toBe('Uncategorized');
+  });
+
+  it('a real target survives having no sector or category', () => {
+    expect(targetFor({ planned_allocation: 5000 })).toBe(5000);
+  });
+
+  it('no target is no target, even with a real sector', () => {
+    expect(targetFor({ planned_allocation: null })).toBeNull();
+  });
+
+  it('treats a cleared (zero) or negative target as no target', () => {
+    expect(targetFor({ planned_allocation: 0 })).toBeNull();
+    expect(targetFor({ planned_allocation: -100 })).toBeNull();
+  });
+
+  // The four quadrants the old single-bucket logic could not distinguish.
+  it('a categorized holding can still be untargeted (the old logic missed this hatch)', () => {
+    const h = { sector: 'Technology', category: null, planned_allocation: null };
+    expect(groupKeyFor(h)).toBe('Technology');
+    expect(targetFor(h)).toBeNull(); // isUntargeted should be true
+  });
+
+  it('an uncategorized holding can still have a real target (the old logic wrongly hatched it)', () => {
+    const h = { sector: null, category: null, planned_allocation: 3000 };
+    expect(groupKeyFor(h)).toBe('Uncategorized');
+    expect(targetFor(h)).toBe(3000); // isUntargeted should be false
+  });
+
+  it('a categorized, targeted holding gets neither gap', () => {
+    const h = { sector: 'Financials', category: null, planned_allocation: 1000 };
+    expect(groupKeyFor(h)).toBe('Financials');
+    expect(targetFor(h)).toBe(1000);
+  });
+
+  it('an uncategorized, untargeted holding gets both gaps', () => {
+    const h = { sector: null, category: null, planned_allocation: null };
+    expect(groupKeyFor(h)).toBe('Uncategorized');
+    expect(targetFor(h)).toBeNull();
+  });
+});
+
+/**
+ * buildTile: the actual call site issue #4's bug lived in.
+ *
+ * Before this fix, the line read `isUntargeted: g.name === 'No Target Set'`
+ * -- the sector BLOCK's name, not the ROW's own target. Extracted into its
+ * own function specifically so that exact wiring has a regression test: the
+ * predicate-level tests above prove groupKeyFor and targetFor each work in
+ * isolation, but only a test at this call site proves the tile's hatch flag
+ * is actually READING targetFor's answer rather than something about the
+ * group it happens to be sitting in.
+ */
+describe('buildTile', () => {
+  const RECT = { x: 0, y: 0, w: 10, h: 10 };
+
+  it('is untargeted when its row has no target, independent of grandTotal or the holding', () => {
+    const row = { ticker: 'XYZ', deployed: 0, target: null };
+    const tile = buildTile(row, undefined, 1000, RECT);
+    expect(tile.isUntargeted).toBe(true);
+  });
+
+  it('is NOT untargeted when its row has a real target -- even from a holding this fix would have hatched under the old group-name logic', () => {
+    // The exact regression: this ticker could be grouped under
+    // "Uncategorized" (no sector/category) while still having a real
+    // target. The old code checked `g.name`, which would have wrongly
+    // hatched this tile despite target !== null right here on the row.
+    const row = { ticker: 'ABC', deployed: 500, target: 2000 };
+    const tile = buildTile(row, undefined, 1000, RECT);
+    expect(tile.isUntargeted).toBe(false);
+  });
+
+  it('carries through the holding-derived fields unaffected by target status', () => {
+    const row = { ticker: 'ABC', deployed: 500, target: null };
+    const holding = {
+      unrealized_pnl_pct: 12.5,
+      day_change_pct: -0.5,
+      day_change_updated_at: '2026-06-05T00:00:00+00:00',
+      price_updated_at: '2026-06-05T00:00:00+00:00',
+    };
+    const tile = buildTile(row, holding, 1000, RECT);
+    expect(tile.pnlPct).toBe(12.5);
+    expect(tile.dayPct).toBe(-0.5);
+    expect(tile.dayStale).toBe(false);
+    expect(tile.pctOfTotal).toBe(50); // 500 / 1000
+    expect(tile.isUntargeted).toBe(true); // unaffected by the holding
   });
 });

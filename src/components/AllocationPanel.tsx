@@ -65,10 +65,15 @@ const GROUP_COLORS: Record<string, string> = {
   'Real Estate': '#2B6B5E',
   ETF: '#4A5568',
   // Deliberately near the card background rather than another muted hue --
-  // this bucket means "we don't know", and giving it a real color would make
-  // it look like a deliberate category instead of a gap to close. The
-  // diagonal hatch, not the fill, is what marks these tiles.
-  'No Target Set': '#1A2029',
+  // this bucket means "we don't know the sector or category", and giving it
+  // a real color would make it look like a deliberate classification instead
+  // of a gap to close. The diagonal hatch on its legend swatch, not the
+  // fill, is what marks it -- a DIFFERENT signal from a tile's own hatch,
+  // which means that specific holding has no target (see isUntargeted).
+  // Conflating the two used to be the bug: a holding could have a real
+  // sector but no target, or no sector but a real target, and this bucket
+  // name used to stand in for both.
+  Uncategorized: '#1A2029',
 };
 const FALLBACK_COLORS = ['#3B5978', '#5B4E80', '#8A5A2B', '#5C6B3A', '#2F6B60', '#2B5F6B', '#6B3B52'];
 
@@ -170,12 +175,65 @@ export function isTrackedForProgress(h: {
   return h.cost_basis > 0 || (h.planned_allocation ?? 0) > 0;
 }
 
+/**
+ * Which sector/category bucket a holding is grouped into -- sector, falling
+ * back to category, falling back to "Uncategorized" when neither is set.
+ *
+ * Deliberately independent of `targetFor` below: this used to be the one
+ * place both a holding's classification AND its target status were decided,
+ * under the single name "No Target Set", which conflated two unrelated
+ * gaps. A holding can be well-categorized and still have no target, or be
+ * uncategorized and still have a real one -- see isUntargeted at the Tile
+ * level, which now reads targetFor, not this function's result.
+ */
+export function groupKeyFor(h: { sector: string | null; category: string | null }): string {
+  return h.sector || h.category || 'Uncategorized';
+}
+
+/**
+ * A holding's real target, or null when none is set. `planned_allocation`
+ * alone is not enough -- 0 and negative values are cleared/invalid targets,
+ * not real ones, matching the check used everywhere else a target is read.
+ */
+export function targetFor(h: { planned_allocation: number | null }): number | null {
+  return h.planned_allocation && h.planned_allocation > 0 ? h.planned_allocation : null;
+}
+
 export function isDayChangeStale(h: {
   day_change_pct: number | null;
   day_change_updated_at: string | null;
   price_updated_at: string | null;
 }): boolean {
   return h.day_change_pct !== null && h.day_change_updated_at !== h.price_updated_at;
+}
+
+/**
+ * One treemap tile's data, from its row and (when funded) its holding.
+ *
+ * `isUntargeted` is read from the ROW's own `target` -- itself `targetFor`
+ * applied to the holding that produced it -- and deliberately not from
+ * anything about the sector block `r` sits in. Extracted specifically so
+ * this wiring has its own regression test: issue #4 was exactly this line
+ * reading `g.name === 'No Target Set'` instead, which answered a different
+ * question (is this holding's GROUP a classification gap) than the one the
+ * hatch is supposed to show (does THIS holding have no target).
+ */
+export function buildTile(
+  r: { ticker: string; deployed: number; target: number | null },
+  h: { unrealized_pnl_pct: number | null; day_change_pct: number | null; day_change_updated_at: string | null; price_updated_at: string | null } | undefined,
+  grandTotal: number,
+  rect: VRect
+): Tile {
+  return {
+    ticker: r.ticker,
+    deployed: r.deployed,
+    pctOfTotal: grandTotal > 0 ? (r.deployed / grandTotal) * 100 : 0,
+    pnlPct: h?.unrealized_pnl_pct ?? null,
+    dayPct: h?.day_change_pct ?? null,
+    dayStale: h ? isDayChangeStale(h) : false,
+    isUntargeted: r.target === null,
+    rect,
+  };
 }
 
 /** Height of a sector block's label strip, and the smallest block that gets
@@ -411,6 +469,10 @@ interface Tile {
   /** True when `dayPct` is not null but was left over from an earlier
    * refresh than the current price -- see isDayChangeStale. */
   dayStale: boolean;
+  /** True when THIS holding has no real planned_allocation -- independent
+   * of which group it landed in. NOT derived from the group's name: a
+   * holding can be well-categorized (e.g. "Technology") and still have no
+   * target, or be "Uncategorized" and still have a real one. */
   isUntargeted: boolean;
   /** LOCAL to the sector block, not to the whole canvas. */
   rect: VRect;
@@ -437,11 +499,18 @@ interface SectorBlock {
  * simply up a lot should not read as "over-allocated" for reasons unrelated
  * to any decision the user made.
  *
- * Grouped by sector (falling back to category, then to a "No Target Set"
+ * Grouped by sector (falling back to category, then to an "Uncategorized"
  * bucket) so both the treemap and the table beneath it use the same
  * grouping key -- a ticker in the "Technology" block of the treemap is the
  * same ticker under "Technology" in the table, not two different views that
  * happen to share a name.
+ *
+ * Grouping and targeting are independent axes, not one collapsed signal:
+ * "Uncategorized" means sector AND category are both absent, and says
+ * nothing about whether a target is set. A tile's own hatch (isUntargeted)
+ * means THAT holding has no target, and says nothing about which group it
+ * landed in -- a well-categorized Technology holding can still be
+ * untargeted, and an uncategorized one can still have a real target.
  */
 export const AllocationPanel: React.FC<{
   holdings: Holding[];
@@ -514,7 +583,7 @@ export const AllocationPanel: React.FC<{
 
     const byGroup = new Map<string, Holding[]>();
     for (const h of tracked) {
-      const key = h.sector || h.category || 'No Target Set';
+      const key = groupKeyFor(h);
       if (!byGroup.has(key)) byGroup.set(key, []);
       byGroup.get(key)!.push(h);
     }
@@ -524,7 +593,7 @@ export const AllocationPanel: React.FC<{
       const color = colorOverrides[name] ?? groupColor(name, GROUP_COLORS[name] ? 0 : unknownIdx++);
       const rows: GroupedRow[] = hs
         .map((h) => {
-          const target = h.planned_allocation && h.planned_allocation > 0 ? h.planned_allocation : null;
+          const target = targetFor(h);
           const gap = target !== null ? target - h.cost_basis : null;
           const fundedPct = target !== null ? (h.cost_basis / target) * 100 : null;
           const status: RowStatus = target === null ? 'no-target' : gap! > 0 ? 'short' : 'funded';
@@ -539,13 +608,13 @@ export const AllocationPanel: React.FC<{
       return { name, color, rows, totalDeployed };
     });
 
-    // Real sectors sorted largest first; "No Target Set" always last --
-    // it is a gap to close, not a position of the book worth leading with.
-    // (The treemap below uses its own, size-driven placement -- this
-    // ordering is for the progress table only.)
+    // Real sectors sorted largest first; "Uncategorized" always last -- it
+    // is a classification gap to close, not a position of the book worth
+    // leading with. (The treemap below uses its own, size-driven placement
+    // -- this ordering is for the progress table only.)
     const groups = [
-      ...built.filter((g) => g.name !== 'No Target Set').sort((a, b) => b.totalDeployed - a.totalDeployed),
-      ...built.filter((g) => g.name === 'No Target Set'),
+      ...built.filter((g) => g.name !== 'Uncategorized').sort((a, b) => b.totalDeployed - a.totalDeployed),
+      ...built.filter((g) => g.name === 'Uncategorized'),
     ];
 
     const allShort = groups.flatMap((g) => g.rows.filter((r) => r.status === 'short'));
@@ -579,19 +648,7 @@ export const AllocationPanel: React.FC<{
         g.rows.filter((r) => r.deployed > 0),
         (r) => r.deployed,
         inner
-      ).map(({ item: r, rect: local }) => {
-        const h = byTicker.get(r.ticker);
-        return {
-          ticker: r.ticker,
-          deployed: r.deployed,
-          pctOfTotal: grandTotal > 0 ? (r.deployed / grandTotal) * 100 : 0,
-          pnlPct: h?.unrealized_pnl_pct ?? null,
-          dayPct: h?.day_change_pct ?? null,
-          dayStale: h ? isDayChangeStale(h) : false,
-          isUntargeted: g.name === 'No Target Set',
-          rect: local,
-        };
-      });
+      ).map(({ item: r, rect: local }) => buildTile(r, byTicker.get(r.ticker), grandTotal, local));
       return {
         name: g.name,
         color: g.color,
@@ -791,7 +848,7 @@ export const AllocationPanel: React.FC<{
                 <SectorSwatch
                   name={g.name}
                   color={g.color}
-                  hatched={g.name === 'No Target Set'}
+                  hatched={g.name === 'Uncategorized'}
                   isOverridden={g.name in colorOverrides}
                   onPick={(color) => setSectorColor.mutate({ sector: g.name, color })}
                   onReset={() => deleteSectorColor.mutate(g.name)}
