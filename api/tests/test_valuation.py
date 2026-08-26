@@ -289,6 +289,65 @@ def test_the_exchange_rate_converts_only_the_final_per_share_figure():
 
 
 # ---------------------------------------------------------------------------
+# statement_exchange_rate: the SECOND hop (issue #5, part 2 of the audit).
+#
+# base_flow/shares/debt/cash are in the FILING currency, which is not always
+# the listing currency the test above converts into. A company that files in
+# EUR but lists as a USD ADR (ASML) needs statement currency -> USD -> listing
+# currency, not one multiplication doing both jobs at once.
+# ---------------------------------------------------------------------------
+
+
+def test_statement_exchange_rate_defaults_to_a_no_op():
+    """A USD-filing, USD-listing company (every holding in this book today)
+    needs neither rate, and the two hops must collapse to exactly what this
+    module did before statement_exchange_rate existed."""
+    common = dict(ticker="X", base_flow=1000.0, shares_outstanding=100.0,
+                  growth_1_5=0.10, beta=1.0)
+    assert v.ValuationInputs(**common).statement_exchange_rate == 1.0
+    default = v.value(v.ValuationInputs(**common)).base.intrinsic_value
+    explicit = v.value(
+        v.ValuationInputs(**common, statement_exchange_rate=1.0)
+    ).base.intrinsic_value
+    assert default == pytest.approx(explicit)
+
+
+def test_statement_exchange_rate_is_the_first_hop_not_the_second():
+    """A company that files in EUR and lists in USD: statement_exchange_rate
+    (EUR per USD) undoes the filing currency, exchange_rate (USD per listing
+    currency, here 1.0 for a USD ADR) does nothing further. This must NOT
+    equal what exchange_rate alone would produce at the same numeric rate --
+    that would mean the two hops are interchangeable, which is exactly the
+    bug this field exists to fix."""
+    common = dict(ticker="X", base_flow=1000.0, shares_outstanding=100.0,
+                  growth_1_5=0.10, beta=1.0)
+    at_par = v.value(v.ValuationInputs(**common)).base.intrinsic_value
+    # EUR-filer, USD ADR: divide by the EUR/USD rate, not multiply.
+    via_statement = v.value(
+        v.ValuationInputs(**common, statement_exchange_rate=0.92, exchange_rate=1.0)
+    ).base.intrinsic_value
+    assert via_statement == pytest.approx(at_par / 0.92, abs=0.005 / 0.92)
+    # Confirms it is not silently the same as the (wrong) single-hop
+    # multiplication the old code would have done.
+    assert via_statement != pytest.approx(at_par * 0.92, abs=0.005 * 0.92)
+
+
+def test_both_hops_compose_statement_to_usd_to_listing():
+    """The general case: a company filing in one currency, listed in a
+    THIRD. base_flow etc. are in the filing currency; the result must land
+    in the listing currency via USD, not directly."""
+    common = dict(ticker="X", base_flow=1000.0, shares_outstanding=100.0,
+                  growth_1_5=0.10, beta=1.0)
+    at_par = v.value(v.ValuationInputs(**common)).base.intrinsic_value
+    # Files in EUR (0.92 EUR/USD), listed in HKD (7.8 HKD/USD).
+    composed = v.value(
+        v.ValuationInputs(**common, statement_exchange_rate=0.92, exchange_rate=7.8)
+    ).base.intrinsic_value
+    expected = at_par / 0.92 * 7.8
+    assert composed == pytest.approx(expected, abs=0.005 * 7.8 / 0.92)
+
+
+# ---------------------------------------------------------------------------
 # The guardrail
 # ---------------------------------------------------------------------------
 

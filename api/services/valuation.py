@@ -146,9 +146,22 @@ class ValuationInputs:
     """Everything the model needs, and nothing it does not.
 
     Money figures share one unit (the workbook says "usually millions") and
-    must all be in the financial statement's currency. `exchange_rate`
-    converts the final per-share figure into the listing currency, which is
-    the only place the two can differ.
+    must all be in the financial STATEMENT's currency -- as filed, which is
+    not necessarily what the stock is listed in or priced in. Getting from
+    there to the listing currency is TWO hops, not one, and each rate
+    follows the same convention: 1 USD in that currency.
+
+        statement currency --(statement_exchange_rate)--> USD
+                            --(exchange_rate)--> listing currency
+
+    Both default to 1.0, so a USD-filing, USD-listed company (the ordinary
+    case) needs neither and the two hops collapse to a no-op, exactly as
+    before this field existed. A company that files in a different currency
+    than it lists in -- ASML (EUR, listed as a USD ADR), Novo Nordisk (DKK)
+    -- needs statement_exchange_rate supplied, or the result is silently
+    wrong: multiplying a EUR-denominated per_share by exchange_rate alone
+    (issue #5, part 2 of the calculation audit) treats it as if it were
+    already USD.
     """
 
     ticker: str
@@ -162,7 +175,10 @@ class ValuationInputs:
     total_debt: float = 0.0
     cash_and_st_investments: float = 0.0
     region: Region = "US"
+    # USD -> listing currency (the second hop).
     exchange_rate: float = 1.0
+    # Statement currency -> USD (the first hop). See the class docstring.
+    statement_exchange_rate: float = 1.0
     # Overrides the CAPM-style derivation entirely when supplied, which is
     # what the editable modal writes.
     discount_rate_override: Optional[float] = None
@@ -244,9 +260,15 @@ def value_scenario(inputs: ValuationInputs, rate: float,
     per_share -= inputs.total_debt / inputs.shares_outstanding
     per_share += inputs.cash_and_st_investments / inputs.shares_outstanding
 
+    # Statement currency -> USD -> listing currency. See ValuationInputs'
+    # docstring for why this is two hops rather than the one multiplication
+    # it used to be.
+    per_share_usd = per_share / inputs.statement_exchange_rate
+    intrinsic_value = per_share_usd * inputs.exchange_rate
+
     return ScenarioResult(
         scenario=scenario,
-        intrinsic_value=round(per_share * inputs.exchange_rate, 2),
+        intrinsic_value=round(intrinsic_value, 2),
         growth_1_5=stage_1,
         growth_6_10=stage_2,
         growth_11_20=stage_3,

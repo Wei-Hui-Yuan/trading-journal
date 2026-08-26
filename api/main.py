@@ -6896,6 +6896,16 @@ class InvestmentValuationInput(Base):
     growth_1_5 = Column(Numeric(10, 6), nullable=True)
     discount_rate = Column(Numeric(10, 6), nullable=True)
     region = Column(String(4), nullable=False, default="US")
+    # Migration 037. Display/context only, not part of the DCF math or the
+    # override system -- see statement_exchange_rate for the number that
+    # actually converts a non-USD filer's per-share figure.
+    statement_currency = Column(String(3), nullable=True)
+    # 1 USD in statement_currency -- see migration 037's comment for why
+    # this is NULL (not 1.0) whenever the filing currency is not USD and no
+    # one has supplied a rate: there is no FX provider to fetch one from,
+    # and defaulting to 1.0 would silently reproduce the bug this exists to
+    # fix (treating a non-USD per-share figure as if it were already USD).
+    statement_exchange_rate = Column(Numeric(18, 8), nullable=True)
     source = Column(String(24), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -6941,9 +6951,15 @@ TX_ADDS_SHARES = (TX_BUY, TX_TRANSFER)
 
 # The columns a valuation input row actually carries, in one place so the
 # merge, the upsert and the override endpoint cannot drift apart.
+#
+# statement_currency is deliberately NOT here, the same way `source` is not:
+# both are read-only display context (see _input_row), never an input the
+# DCF math consumes or a trader corrects -- statement_exchange_rate is the
+# one number that actually does either.
 VALUATION_FIELDS = (
     "base_flow", "metric", "shares_outstanding", "total_debt",
     "cash_and_st", "beta", "growth_1_5", "discount_rate", "region",
+    "statement_exchange_rate",
 )
 
 # How stale an 'auto' row may be before a refresh will replace it. Twenty-five
@@ -7842,6 +7858,11 @@ class ValuationOverride(BaseModel):
     growth_1_5: Optional[float] = None
     discount_rate: Optional[float] = Field(None, gt=0)
     region: Optional[str] = None
+    # 1 USD in the company's FILING currency -- see migration 037. Only
+    # needed when that differs from USD; leaving it null falls back to the
+    # fetched value (1.0 when the filer is USD, otherwise still null, which
+    # is what makes the DCF decline to value rather than guess).
+    statement_exchange_rate: Optional[float] = Field(None, gt=0)
 
     @field_validator("region")
     @classmethod
@@ -7868,6 +7889,10 @@ def _input_row(row: Optional[InvestmentValuationInput]) -> Optional[dict]:
         "growth_1_5": _f(row.growth_1_5),
         "discount_rate": _f(row.discount_rate),
         "region": row.region,
+        # Context only -- see VALUATION_FIELDS' comment on why this is not
+        # part of the merge/override system.
+        "statement_currency": row.statement_currency,
+        "statement_exchange_rate": _f(row.statement_exchange_rate),
         "source": row.source,
         "updated_at": row.updated_at,
     }
@@ -8203,6 +8228,16 @@ async def refresh_valuation_inputs(
                 # Left NULL so the engine derives it from beta and region.
                 # Only a user pinning a rate by hand fills this in.
                 "discount_rate": None,
+                # See migration 037. Auto-fills to 1.0 only when the filer
+                # itself reports in USD -- true for every holding in this
+                # book today (GOOGL, MSFT, META, NVDA, AMZN, UNH all file in
+                # USD). Left NULL otherwise: there is no FX provider to fetch
+                # a real rate from, so a trader supplying one by hand is
+                # required, not assumed.
+                "statement_currency": fundamentals.currency,
+                "statement_exchange_rate": (
+                    1.0 if (fundamentals.currency or "USD").upper() == "USD" else None
+                ),
                 "source": (estimate.source if estimate else "fmp")[:24],
                 "updated_at": now,
             }
@@ -8299,12 +8334,19 @@ def _value_holding(
     base_flow = merged.get("base_flow")
     shares = merged.get("shares_outstanding")
     growth = merged.get("growth_1_5")
-    if base_flow is None or not shares or growth is None:
+    # Treated exactly like a missing base_flow or shares_outstanding, not
+    # defaulted to 1.0 -- see migration 037. A holding whose filer reports
+    # in USD gets this from refresh_valuations automatically; anything else
+    # needs it supplied by hand before the DCF will run at all, because
+    # guessing 1.0 here is the bug this column exists to stop.
+    statement_rate = merged.get("statement_exchange_rate")
+    if base_flow is None or not shares or growth is None or not statement_rate:
         missing = [
             name for name, value in (
                 ("base_flow", base_flow),
                 ("shares_outstanding", shares),
                 ("growth_1_5", growth),
+                ("statement_exchange_rate", statement_rate),
             ) if value is None or value == 0
         ]
         return {"available": False, "missing": missing}
@@ -8319,6 +8361,7 @@ def _value_holding(
         cash_and_st_investments=float(merged.get("cash_and_st") or 0.0),
         region=merged.get("region") or "US",
         exchange_rate=_f(holding.exchange_rate) or 1.0,
+        statement_exchange_rate=float(statement_rate),
         discount_rate_override=_f(merged.get("discount_rate")),
     )
     result = valuation_engine.value(inputs)

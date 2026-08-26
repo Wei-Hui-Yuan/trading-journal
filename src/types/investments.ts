@@ -78,6 +78,18 @@ export interface ValuationInputRow {
   growth_1_5: number | null;
   discount_rate: number | null;
   region: ValuationRegion;
+  /** The currency the company's financial statements are filed in (e.g.
+   * "EUR" for ASML) -- context for `statement_exchange_rate` below, not
+   * itself part of the DCF math or override system. */
+  statement_currency: string | null;
+  /** 1 USD in `statement_currency` -- the FIRST of two conversion hops the
+   * DCF performs (statement currency -> USD -> this holding's own
+   * `exchange_rate` for the second). Auto-fills to 1.0 only when
+   * `statement_currency` is USD; null otherwise, since there is no live FX
+   * source to fetch a real rate from (see migration 037) -- a null here
+   * means the DCF has declined to value this holding until one is supplied
+   * by hand, not that it assumed 1.0. */
+  statement_exchange_rate: number | null;
   source: string | null;
   updated_at: string | null;
 }
@@ -287,6 +299,7 @@ export interface ValuationOverridePayload {
   growth_1_5?: number | null;
   discount_rate?: number | null;
   region?: ValuationRegion | null;
+  statement_exchange_rate?: number | null;
 }
 
 /** Per-ticker outcome of a refresh, so a partial run can explain itself. */

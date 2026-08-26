@@ -441,7 +441,8 @@ def test_a_complete_set_of_inputs_produces_a_value():
         holding(current_price=100.0),
         {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": 0.10,
          "beta": 1.2, "total_debt": 0.0, "cash_and_st": 0.0, "region": "US",
-         "discount_rate": None, "metric": "free_cash_flow"},
+         "discount_rate": None, "metric": "free_cash_flow",
+         "statement_exchange_rate": 1.0},
         [],
     )
     assert result["available"] is True
@@ -456,11 +457,50 @@ def test_a_missing_input_declines_to_value_and_names_what_is_missing():
         holding(current_price=100.0),
         {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": None,
          "beta": None, "total_debt": 0.0, "cash_and_st": 0.0, "region": "US",
-         "discount_rate": None, "metric": None},
+         "discount_rate": None, "metric": None,
+         "statement_exchange_rate": 1.0},
         [],
     )
     assert result["available"] is False
     assert "growth_1_5" in result["missing"]
+
+
+def test_a_missing_statement_exchange_rate_declines_to_value_rather_than_guessing_usd():
+    """Migration 037 (issue #5, part 2): a company that files in a non-USD
+    currency and has never had a rate supplied must NOT silently value at
+    exchange_rate=1, which is the bug this column exists to stop. Every
+    OTHER input is complete here -- statement_exchange_rate is the only gap,
+    and it alone must be enough to decline."""
+    result = main._value_holding(
+        holding(current_price=100.0),
+        {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": 0.10,
+         "beta": 1.2, "total_debt": 0.0, "cash_and_st": 0.0, "region": "US",
+         "discount_rate": None, "metric": "free_cash_flow",
+         "statement_exchange_rate": None},
+        [],
+    )
+    assert result["available"] is False
+    assert result["missing"] == ["statement_exchange_rate"]
+
+
+def test_a_supplied_statement_exchange_rate_produces_a_different_value_than_ignoring_it():
+    """The other half of the regression guard: once supplied, the rate must
+    actually be USED (see valuation.py's two-hop conversion), not merely
+    unblock availability."""
+    inputs = {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": 0.10,
+              "beta": 1.2, "total_debt": 0.0, "cash_and_st": 0.0, "region": "US",
+              "discount_rate": None, "metric": "free_cash_flow"}
+    usd_filer = main._value_holding(
+        holding(current_price=100.0), {**inputs, "statement_exchange_rate": 1.0}, []
+    )
+    eur_filer = main._value_holding(
+        holding(current_price=100.0), {**inputs, "statement_exchange_rate": 0.92}, []
+    )
+    assert usd_filer["available"] is True
+    assert eur_filer["available"] is True
+    assert eur_filer["average_intrinsic_value"] != pytest.approx(
+        usd_filer["average_intrinsic_value"]
+    )
 
 
 def test_without_a_price_there_is_no_premium_rather_than_zero_percent():
@@ -469,7 +509,8 @@ def test_without_a_price_there_is_no_premium_rather_than_zero_percent():
         holding(current_price=None),
         {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": 0.10,
          "beta": 1.2, "total_debt": 0.0, "cash_and_st": 0.0, "region": "US",
-         "discount_rate": None, "metric": "free_cash_flow"},
+         "discount_rate": None, "metric": "free_cash_flow",
+         "statement_exchange_rate": 1.0},
         [],
     )
     assert result["available"] is True
@@ -479,7 +520,8 @@ def test_without_a_price_there_is_no_premium_rather_than_zero_percent():
 def test_a_pinned_discount_rate_overrides_the_derived_one():
     inputs = {"base_flow": 1000.0, "shares_outstanding": 100.0,
               "growth_1_5": 0.10, "beta": 1.2, "total_debt": 0.0,
-              "cash_and_st": 0.0, "region": "US", "metric": "free_cash_flow"}
+              "cash_and_st": 0.0, "region": "US", "metric": "free_cash_flow",
+              "statement_exchange_rate": 1.0}
     derived = main._value_holding(holding(), {**inputs, "discount_rate": None}, [])
     pinned = main._value_holding(holding(), {**inputs, "discount_rate": 0.09}, [])
     assert pinned["discount_rate"] == pytest.approx(0.09)
@@ -491,7 +533,8 @@ def test_a_pinned_discount_rate_overrides_the_derived_one():
 def test_debt_and_cash_move_the_value_in_opposite_directions():
     base = {"base_flow": 1000.0, "shares_outstanding": 100.0, "growth_1_5": 0.10,
             "beta": 1.2, "region": "US", "discount_rate": None,
-            "metric": "free_cash_flow", "total_debt": 0.0, "cash_and_st": 0.0}
+            "metric": "free_cash_flow", "total_debt": 0.0, "cash_and_st": 0.0,
+            "statement_exchange_rate": 1.0}
     plain = main._value_holding(holding(), base, [])
     indebted = main._value_holding(holding(), {**base, "total_debt": 5000.0}, [])
     flush = main._value_holding(holding(), {**base, "cash_and_st": 5000.0}, [])

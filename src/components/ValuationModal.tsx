@@ -33,6 +33,8 @@ const FIELDS: {
     hint: 'years 6–10 and 11–20 follow from this' },
   { key: 'discount_rate', label: 'Discount rate', percent: true,
     hint: 'leave blank to derive from beta' },
+  { key: 'statement_exchange_rate', label: 'Statement FX rate',
+    hint: '1 USD in the filing currency -- only needed when it differs from USD' },
 ];
 
 function display(value: number | null | undefined, percent?: boolean): string {
@@ -243,8 +245,20 @@ export const ValuationModal: React.FC<{
                 >
                   <div>
                     <div className="text-[11px] text-slate-300">{field.label}</div>
-                    {field.hint && (
-                      <div className="text-[10px] text-slate-600">{field.hint}</div>
+                    {/* Statement FX's static hint explains WHEN it matters;
+                        this replaces it with the specific fetched currency
+                        once known, so "differs from USD" becomes "ASML
+                        files in EUR" rather than staying generic. */}
+                    {field.key === 'statement_exchange_rate' &&
+                    auto?.statement_currency &&
+                    auto.statement_currency !== 'USD' ? (
+                      <div className="text-[10px] text-amber-400/80">
+                        Files in {auto.statement_currency} -- required to value this holding
+                      </div>
+                    ) : (
+                      field.hint && (
+                        <div className="text-[10px] text-slate-600">{field.hint}</div>
+                      )
                     )}
                   </div>
 
