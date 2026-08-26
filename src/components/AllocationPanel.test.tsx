@@ -19,7 +19,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { planTileLabel } from '@/components/AllocationPanel';
+import { isDayChangeStale, planTileLabel } from '@/components/AllocationPanel';
 
 describe('planTileLabel', () => {
   it('shows the ticker and the detail line on a tile with room in both directions', () => {
@@ -150,5 +150,72 @@ describe('planTileLabel', () => {
     const plan = planTileLabel({ w: 60, h: 20 });
     expect(plan.vertical).toBe(false);
     expect(plan.showTicker).toBe(false);
+  });
+});
+
+/**
+ * isDayChangeStale: backs the treemap's "day" color mode.
+ *
+ * refresh_prices (api/main.py) advances price_updated_at on every successful
+ * quote but only advances day_change_updated_at when the provider's response
+ * actually included a day change that time -- confirmed real via
+ * fetch_quote's own docstring in api/services/market_data.py and pinned by
+ * test_a_missing_day_change_leaves_the_last_one_standing in
+ * api/tests/test_price_refresh.py. Left unguarded, the treemap would color a
+ * tile by a number that is not from today's price, with the "as of" caption
+ * next to it implying it is. These tests are the frontend half of that
+ * failsafe -- the exact match/mismatch check the audit asked for.
+ */
+describe('isDayChangeStale', () => {
+  const FRESH = '2026-06-05T13:00:00+00:00';
+  const OLDER = '2026-06-04T13:00:00+00:00';
+
+  it('is not stale when the day figure and price came from the same refresh', () => {
+    expect(
+      isDayChangeStale({
+        day_change_pct: -1.09,
+        day_change_updated_at: FRESH,
+        price_updated_at: FRESH,
+      })
+    ).toBe(false);
+  });
+
+  it('is stale when the day figure predates the current price', () => {
+    // Exactly the scenario the migration exists for: a later refresh got a
+    // new price but the provider omitted changePercentage that time, so
+    // day_change_updated_at was left at the prior refresh's stamp.
+    expect(
+      isDayChangeStale({
+        day_change_pct: -1.09,
+        day_change_updated_at: OLDER,
+        price_updated_at: FRESH,
+      })
+    ).toBe(true);
+  });
+
+  it('is never stale when there is no day figure at all', () => {
+    // "No data" and "old data" are different facts -- see PERF_UNKNOWN. A
+    // holding refresh_prices has never gotten a day change for must not be
+    // flagged as if it once had a fresher one.
+    expect(
+      isDayChangeStale({
+        day_change_pct: null,
+        day_change_updated_at: null,
+        price_updated_at: FRESH,
+      })
+    ).toBe(false);
+  });
+
+  it('treats a day figure with no recorded write time as stale', () => {
+    // Should not arise post-migration (the backfill sets it whenever
+    // day_change_pct is set), but a day figure this component cannot prove
+    // is current must not default to looking fresh.
+    expect(
+      isDayChangeStale({
+        day_change_pct: -1.09,
+        day_change_updated_at: null,
+        price_updated_at: FRESH,
+      })
+    ).toBe(true);
   });
 });

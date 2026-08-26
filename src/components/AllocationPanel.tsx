@@ -139,6 +139,24 @@ function perfFill(pct: number | null, domain: number): string {
 const signedPct = (pct: number | null) =>
   pct === null || !Number.isFinite(pct) ? '—' : `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
 
+/**
+ * Whether a holding's day_change_pct is left over from an earlier refresh
+ * than its current price -- see migration 036. refresh_prices stamps
+ * `day_change_updated_at` from the exact same `now` as `price_updated_at`
+ * whenever it writes a fresh day figure, so an exact match means "same
+ * refresh" and anything else means the provider omitted the day change on
+ * a later run and the old value is still sitting here. Exported standalone,
+ * the same way `planTileLabel` is, so this can be tested without mounting
+ * the panel.
+ */
+export function isDayChangeStale(h: {
+  day_change_pct: number | null;
+  day_change_updated_at: string | null;
+  price_updated_at: string | null;
+}): boolean {
+  return h.day_change_pct !== null && h.day_change_updated_at !== h.price_updated_at;
+}
+
 /** Height of a sector block's label strip, and the smallest block that gets
  * one -- below this a header would eat the tiles it is meant to caption. */
 const HEADER_PX = 14;
@@ -369,6 +387,9 @@ interface Tile {
    * not zero. */
   pnlPct: number | null;
   dayPct: number | null;
+  /** True when `dayPct` is not null but was left over from an earlier
+   * refresh than the current price -- see isDayChangeStale. */
+  dayStale: boolean;
   isUntargeted: boolean;
   /** LOCAL to the sector block, not to the whole canvas. */
   rect: VRect;
@@ -453,7 +474,7 @@ export const AllocationPanel: React.FC<{
     return map;
   }, [sectorColorRows]);
 
-  const { groups, dca, blocks, priceAsOf, hasDayData } = useMemo(() => {
+  const { groups, dca, blocks, priceAsOf, hasDayData, staleDayCount } = useMemo(() => {
     const funded = holdings.filter((h) => h.cost_basis > 0);
     const byTicker = new Map(funded.map((h) => [h.ticker, h]));
 
@@ -532,6 +553,7 @@ export const AllocationPanel: React.FC<{
           pctOfTotal: grandTotal > 0 ? (r.deployed / grandTotal) * 100 : 0,
           pnlPct: h?.unrealized_pnl_pct ?? null,
           dayPct: h?.day_change_pct ?? null,
+          dayStale: h ? isDayChangeStale(h) : false,
           isUntargeted: g.name === 'No Target Set',
           rect: local,
         };
@@ -548,13 +570,16 @@ export const AllocationPanel: React.FC<{
       };
     });
 
-    // Both figures come from the same refresh, so one timestamp covers the
-    // price and the day's move alike -- see migration 029.
     const stamps = funded.map((h) => h.price_updated_at).filter((s): s is string => !!s).sort();
     const priceAsOf = stamps.length ? stamps[stamps.length - 1] : null;
     const hasDayData = funded.some((h) => h.day_change_pct !== null);
+    // Not every day figure necessarily shares priceAsOf's freshness -- see
+    // migration 036 and isDayChangeStale. Counted so the legend can disclose
+    // it rather than implying every tile's color is as fresh as the newest
+    // price.
+    const staleDayCount = funded.filter((h) => isDayChangeStale(h)).length;
 
-    return { groups, dca, blocks, priceAsOf, hasDayData };
+    return { groups, dca, blocks, priceAsOf, hasDayData, staleDayCount };
   }, [holdings, colorOverrides, canvas]);
 
   if (groups.length === 0) return null;
@@ -671,12 +696,18 @@ export const AllocationPanel: React.FC<{
                         }}
                       >
                         <div
-                          title={`${t.ticker} — ${b.name} — ${money(t.deployed)} (${t.pctOfTotal.toFixed(1)}% of book) · P&L ${signedPct(t.pnlPct)} · 1D ${signedPct(t.dayPct)}`}
+                          title={`${t.ticker} — ${b.name} — ${money(t.deployed)} (${t.pctOfTotal.toFixed(1)}% of book) · P&L ${signedPct(t.pnlPct)} · 1D ${signedPct(t.dayPct)}${t.dayStale ? ' (stale — from an earlier refresh than the current price)' : ''}`}
                           className="absolute flex flex-col items-center justify-center overflow-hidden rounded-[3px] text-center"
                           style={{
                             inset: '1.5px',
                             backgroundColor: fill,
                             backgroundImage: t.isUntargeted ? HATCH_BG : undefined,
+                            // Dimmed rather than hatched -- the hatch already
+                            // means "untargeted" in every mode, and a tile can
+                            // be both, so a second cue on the same visual
+                            // channel would collide. Only meaningful in `day`
+                            // mode, where the fill actually IS dayPct.
+                            opacity: colorMode === 'day' && t.dayStale ? 0.55 : undefined,
                           }}
                         >
                           {showTicker && (
@@ -752,7 +783,14 @@ export const AllocationPanel: React.FC<{
               {colorMode === 'day'
                 ? hasDayData
                   ? priceAsOf
-                    ? `as of ${new Date(priceAsOf).toLocaleString()}`
+                    ? `as of ${new Date(priceAsOf).toLocaleString()}` +
+                      // Discloses when the newest price and the day figure it
+                      // sits next to are not actually the same refresh -- see
+                      // migration 036. Dimmed tiles above are the same fact,
+                      // this is the count.
+                      (staleDayCount > 0
+                        ? ` · ${staleDayCount} stale`
+                        : '')
                     : 'as of last refresh'
                   : 'run Refresh prices to populate'
                 : 'since purchase'}
@@ -766,7 +804,9 @@ export const AllocationPanel: React.FC<{
         <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-300">
           Progress against target
         </div>
-        <div className="text-[10px] text-obsidian-muted">Grouped by sector, most under-funded first</div>
+        <div className="text-[10px] text-obsidian-muted">
+          Sectors by size · rows within a sector by most under-funded first
+        </div>
 
         {dca && (
           <div className="mt-2 flex items-start gap-2 rounded-lg border border-sky-500/25 bg-sky-500/5 px-3 py-2.5">

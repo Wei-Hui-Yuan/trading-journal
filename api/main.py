@@ -6861,11 +6861,16 @@ class InvestmentHolding(Base):
     # column rather than re-fetching anything.
     manual_price = Column(Numeric(18, 4), nullable=True)
     manual_price_at = Column(DateTime(timezone=True), nullable=True)
-    # The day's move in whole percent, from the same response current_price
-    # came from (migration 029). Shares price_updated_at deliberately -- one
-    # call, one freshness. Never affected by manual_price: an override is a
-    # correction to the LEVEL, and says nothing about the day's move.
+    # The day's move in whole percent (migration 029). NOT guaranteed to
+    # share price_updated_at's freshness -- refresh_prices only overwrites
+    # this when the provider's response included it that time, so it can lag
+    # behind a fresher price. day_change_updated_at (migration 036) is the
+    # column that actually tracks when this was last written; compare it to
+    # price_updated_at rather than assuming they match. Never affected by
+    # manual_price: an override is a correction to the LEVEL, and says
+    # nothing about the day's move.
     day_change_pct = Column(Numeric(10, 4), nullable=True)
+    day_change_updated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -8024,9 +8029,13 @@ async def refresh_prices(session: AsyncSession = Depends(get_session)):
         holding.price_updated_at = now
         # Only overwritten when the provider actually sent one, so a
         # response missing the field leaves the last known move in place
-        # rather than blanking a populated column.
+        # rather than blanking a populated column. day_change_updated_at is
+        # stamped from the same `now` ONLY here, alongside it -- that is what
+        # lets a reader tell a fresh day figure from a stale one later by
+        # comparing it to price_updated_at (see migration 036).
         if outcome.day_change_pct is not None:
             holding.day_change_pct = outcome.day_change_pct
+            holding.day_change_updated_at = now
         updated += 1
 
     await session.commit()
@@ -8227,8 +8236,11 @@ def _holding_row(holding: InvestmentHolding) -> dict:
         "manual_price": _f(holding.manual_price),
         "manual_price_at": holding.manual_price_at,
         "price_is_manual": holding.manual_price is not None,
-        # As of price_updated_at, not live -- see migration 029.
+        # As of day_change_updated_at, which can lag price_updated_at when a
+        # later refresh's response omitted the day change -- see migration
+        # 036 and AllocationPanel.tsx's isDayChangeStale.
         "day_change_pct": _f(holding.day_change_pct),
+        "day_change_updated_at": holding.day_change_updated_at,
     }
 
 

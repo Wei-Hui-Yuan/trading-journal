@@ -120,9 +120,18 @@ export interface Holding {
   manual_price_at: string | null;
   price_is_manual: boolean;
   /** The day's move in WHOLE PERCENT (-1.09 for -1.09%), as of
-   * `price_updated_at` -- a snapshot from the last price refresh, not a live
-   * tape. Null means no refresh has fetched it yet, which is not 0. */
+   * `day_change_updated_at` -- a snapshot from a price refresh, not a live
+   * tape. Null means no refresh has fetched it yet, which is not 0. NOT
+   * guaranteed to be from the SAME refresh as `price_updated_at` -- compare
+   * the two timestamps (see `day_change_updated_at`) before presenting this
+   * as today's move. */
   day_change_pct: number | null;
+  /** When `day_change_pct` was last actually written. Equal to
+   * `price_updated_at` when both came from the same refresh; older than it
+   * when a later refresh fetched a new price but the provider omitted the
+   * day change that time, leaving the prior figure in place -- see
+   * `isDayChangeStale` in AllocationPanel.tsx. */
+  day_change_updated_at: string | null;
 
   /** Derived from the transaction ledger on read, never stored. A correction
    * (see /basis-correction) is itself a ledger entry, not a second source

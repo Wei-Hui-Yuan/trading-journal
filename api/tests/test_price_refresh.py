@@ -35,6 +35,7 @@ class FakeHolding:
         self.current_price = None
         self.price_updated_at = None
         self.day_change_pct = None
+        self.day_change_updated_at = None
 
 
 class FakeResult:
@@ -228,6 +229,8 @@ def test_a_missing_day_change_leaves_the_last_one_standing(monkeypatch):
     """
     holdings = [FakeHolding(t) for t in ("KEEP", "FLAT")]
     holdings[0].day_change_pct = -1.09
+    stale_stamp = "2020-01-01T00:00:00+00:00"
+    holdings[0].day_change_updated_at = stale_stamp
 
     async def fake(symbol, client=None):
         return quote(symbol, 10.0, change=None if symbol == "KEEP" else 0.0)
@@ -237,6 +240,15 @@ def test_a_missing_day_change_leaves_the_last_one_standing(monkeypatch):
     assert body["updated"] == 2
     assert holdings[0].day_change_pct == -1.09  # untouched
     assert holdings[1].day_change_pct == 0.0    # written
+
+    # The failsafe (migration 036): price_updated_at still advances for BOTH
+    # holdings on every successful quote, but day_change_updated_at only
+    # advances when day_change_pct itself was actually rewritten. That gap is
+    # what lets a reader detect that KEEP's day figure is now stale relative
+    # to its own fresh price, rather than silently presenting it as current.
+    assert holdings[0].day_change_updated_at == stale_stamp
+    assert holdings[0].day_change_updated_at != holdings[0].price_updated_at
+    assert holdings[1].day_change_updated_at == holdings[1].price_updated_at
 
 
 def test_an_empty_book_asks_for_nothing(monkeypatch):
