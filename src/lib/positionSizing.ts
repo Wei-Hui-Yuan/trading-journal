@@ -128,6 +128,52 @@ export function computeSizing({
   };
 }
 
+export interface PlannedRisk {
+  /** Dollars at risk on the quantity actually chosen. */
+  amount: number;
+  /** That, as a percent of the account. Null when account size is unknown. */
+  percent: number | null;
+}
+
+/**
+ * What the quantity actually chosen puts at risk — as opposed to the budget
+ * it was sized against.
+ *
+ * These are not the same number and the difference is not rounding noise.
+ * `computeSizing` floors the share count, so a $25 budget against $10 of risk
+ * per share buys two shares risking $20 — a fifth less than the budget
+ * implies. Showing only the budget overstates what is on the line, and
+ * showing only the share count leaves the reader to do the multiplication.
+ *
+ * Taking deliberate half size lands in the same place: the plan should record
+ * half the risk, not the risk the calculator originally proposed.
+ *
+ * Shared rather than derived at each call site because the Plan modal sends
+ * this figure to the server as `risk_amount` while both surfaces also render
+ * it, and a display that disagrees with what was stored is worse than either
+ * alone.
+ */
+export function computePlannedRisk({
+  riskPerShare,
+  shares,
+  accountSize,
+}: {
+  riskPerShare: number;
+  shares: number | null;
+  accountSize: number | null;
+}): PlannedRisk | null {
+  if (shares === null || !Number.isFinite(shares) || shares <= 0) return null;
+  if (!Number.isFinite(riskPerShare) || riskPerShare <= 0) return null;
+
+  const amount = shares * riskPerShare;
+  const percent =
+    accountSize !== null && Number.isFinite(accountSize) && accountSize > 0
+      ? (amount / accountSize) * 100
+      : null;
+
+  return { amount, percent };
+}
+
 export interface TakeProfitScore {
   /** Gain per share at that price. Negative when the target is backwards. */
   perShare: number;

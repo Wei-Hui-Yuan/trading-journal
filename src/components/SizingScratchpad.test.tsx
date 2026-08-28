@@ -193,6 +193,44 @@ describe('the live preview', () => {
     expect(field('Target')).toHaveValue(115);
   });
 
+  it('says what the entered quantity risks, not only the budget', async () => {
+    // Reproduces a real screenshot: $2,500 at 1% shows a $25 risk budget, but
+    // 2 shares at $10 of risk each put $20 on the line. The page showed the
+    // budget and left the trader to notice the floor had cost them $5 of it.
+    mockGetSettings.mockResolvedValue({
+      account_size: 2_500,
+      risk_percent: 1,
+      updated_at: null,
+    });
+    renderPad();
+    await waitFor(() => expect(screen.getByLabelText(/Risk percent/i)).toHaveValue(1));
+
+    fireEvent.change(field('Entry'), { target: { value: '150' } });
+    fireEvent.change(field('Stop'), { target: { value: '140' } });
+    fireEvent.change(field('Shares'), { target: { value: '2' } });
+
+    expect(await screen.findByText('$25.00')).toBeInTheDocument();
+    expect(
+      screen.getByText(/Planning 2 shares — risking/)
+    ).toBeInTheDocument();
+    expect(screen.getByText('$20.00')).toBeInTheDocument();
+    expect(screen.getByText(/0\.80% of account/)).toBeInTheDocument();
+  });
+
+  it('does not claim a scratchpad note is saved anywhere', async () => {
+    // The Plan modal's copy of this line ends "Saved with the plan." Nothing
+    // here stores a risk figure, so the sentence must not say it does.
+    renderPad();
+    await waitFor(() => expect(screen.getByLabelText(/Risk percent/i)).toHaveValue(1));
+
+    fireEvent.change(field('Entry'), { target: { value: '100' } });
+    fireEvent.change(field('Stop'), { target: { value: '95' } });
+    fireEvent.change(field('Shares'), { target: { value: '10' } });
+
+    expect(await screen.findByText(/Planning 10 shares/)).toBeInTheDocument();
+    expect(screen.queryByText(/Saved with the plan/)).not.toBeInTheDocument();
+  });
+
   it('names an inverted stop instead of silently showing nothing', async () => {
     renderPad();
     await waitFor(() => expect(screen.getByLabelText(/Risk percent/i)).toHaveValue(1));

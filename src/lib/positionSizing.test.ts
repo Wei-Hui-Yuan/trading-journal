@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   R_LADDER,
+  computePlannedRisk,
   computeSizing,
   scoreTakeProfit,
   sizingHint,
@@ -127,6 +128,87 @@ describe('computeSizing', () => {
     const result = computeSizing({ ...LONG, stop: 99.5, riskPercent: 5 })!;
 
     expect(result.accountFraction!).toBeGreaterThan(1);
+  });
+});
+
+describe('computePlannedRisk', () => {
+  it('reports what the floored share count actually risks, not the budget', () => {
+    // The real case this was added for: $2,500 at 1% is a $25 budget, but
+    // $10 of risk per share buys two shares risking $20. Showing only the
+    // budget overstates the exposure by a fifth.
+    const sizing = computeSizing({
+      side: 'BUY',
+      entry: 150,
+      stop: 140,
+      accountSize: 2_500,
+      riskPercent: 1,
+    })!;
+
+    expect(sizing.riskAmount).toBe(25);
+    expect(sizing.wholeShares).toBe(2);
+
+    const planned = computePlannedRisk({
+      riskPerShare: sizing.riskPerShare,
+      shares: sizing.wholeShares,
+      accountSize: 2_500,
+    })!;
+
+    expect(planned.amount).toBe(20);
+    expect(planned.percent).toBeCloseTo(0.8, 10);
+  });
+
+  it('follows a deliberate half size rather than the suggestion', () => {
+    const planned = computePlannedRisk({
+      riskPerShare: 5,
+      shares: 10,
+      accountSize: 10_000,
+    })!;
+
+    expect(planned.amount).toBe(50);
+    expect(planned.percent).toBeCloseTo(0.5, 10);
+  });
+
+  it('still prices the risk in dollars when the account size is unknown', () => {
+    // The dollar figure is the more important half and does not depend on
+    // knowing the balance.
+    const planned = computePlannedRisk({
+      riskPerShare: 5,
+      shares: 10,
+      accountSize: null,
+    })!;
+
+    expect(planned.amount).toBe(50);
+    expect(planned.percent).toBeNull();
+  });
+
+  it.each([
+    ['no quantity chosen', { shares: null }],
+    ['a zero quantity', { shares: 0 }],
+    ['a negative quantity', { shares: -5 }],
+    ['a zero risk per share', { riskPerShare: 0 }],
+    ['a negative risk per share', { riskPerShare: -5 }],
+    ['a NaN quantity', { shares: Number.NaN }],
+  ])('returns null for %s', (_label, override) => {
+    // Null rather than zero: "nothing chosen yet" is not "risking nothing".
+    expect(
+      computePlannedRisk({
+        riskPerShare: 5,
+        shares: 10,
+        accountSize: 10_000,
+        ...override,
+      })
+    ).toBeNull();
+  });
+
+  it('does not divide by a zero account size', () => {
+    const planned = computePlannedRisk({
+      riskPerShare: 5,
+      shares: 10,
+      accountSize: 0,
+    })!;
+
+    expect(planned.amount).toBe(50);
+    expect(planned.percent).toBeNull();
   });
 });
 

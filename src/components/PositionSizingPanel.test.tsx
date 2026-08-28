@@ -50,6 +50,8 @@ function renderPanel({
   inputs?: SizingInputs;
   takeProfit?: number | null;
   enteredQty?: number | null;
+  accountSize?: number | null;
+  plannedRiskNote?: string;
   onPickTarget?: (p: string) => void;
   onUseShares?: (n: number) => void;
   formatSharesLabel?: (n: number) => string;
@@ -268,6 +270,73 @@ describe('the typed take profit', () => {
 
     expect(screen.queryByText(/\(suggested size\)/)).not.toBeInTheDocument();
     expect(screen.getByText(/on 5 shares/)).toBeInTheDocument();
+  });
+});
+
+describe('the planned risk', () => {
+  it('says what the chosen quantity risks, not just the budget it was sized against', () => {
+    // The gap this closes. $2,500 at 1% shows a $25 budget, but two shares
+    // at $10 of risk each put $20 on the line — and the panel used to show
+    // only the first of those two numbers.
+    renderPanel({
+      inputs: { side: 'BUY', entry: 150, stop: 140, accountSize: 2_500, riskPercent: 1 },
+      enteredQty: 2,
+      accountSize: 2_500,
+    });
+
+    expect(screen.getByText('$25.00')).toBeInTheDocument(); // the budget
+    expect(
+      screen.getByText(/Planning 2 shares — risking/)
+    ).toBeInTheDocument();
+    expect(screen.getByText('$20.00')).toBeInTheDocument(); // what is at stake
+    expect(screen.getByText(/0\.80% of account/)).toBeInTheDocument();
+  });
+
+  it('stays quiet until a quantity has been chosen', () => {
+    // A suggestion is not a decision, and claiming a planned risk before one
+    // is made would put a number on something the trader has not agreed to.
+    renderPanel({ enteredQty: null, accountSize: 10_000 });
+
+    expect(screen.queryByText(/Planning/)).not.toBeInTheDocument();
+  });
+
+  it('follows a deliberate half size', () => {
+    renderPanel({ enteredQty: 10, accountSize: 10_000 });
+
+    expect(screen.getByText(/Planning 10 shares — risking/)).toBeInTheDocument();
+    expect(screen.getByText(/0\.50% of account/)).toBeInTheDocument();
+  });
+
+  it('drops the percentage, not the dollars, when the account is unknown', () => {
+    renderPanel({
+      inputs: { ...LONG, accountSize: null },
+      enteredQty: 10,
+      accountSize: null,
+    });
+
+    expect(screen.getByText(/Planning 10 shares — risking/)).toBeInTheDocument();
+    expect(screen.queryByText(/% of account/)).not.toBeInTheDocument();
+  });
+
+  it('says "1 share", not "1 shares"', () => {
+    renderPanel({ enteredQty: 1, accountSize: 10_000 });
+
+    expect(screen.getByText(/Planning 1 share —/)).toBeInTheDocument();
+  });
+
+  it('appends only the note the host supplies', () => {
+    // The Plan modal stores this figure; a scratchpad note does not, so the
+    // sentence cannot claim it was saved anywhere.
+    const { unmount } = renderPanel({
+      enteredQty: 10,
+      accountSize: 10_000,
+      plannedRiskNote: 'Saved with the plan.',
+    });
+    expect(screen.getByText(/Saved with the plan\./)).toBeInTheDocument();
+
+    unmount();
+    renderPanel({ enteredQty: 10, accountSize: 10_000 });
+    expect(screen.queryByText(/Saved with the plan\./)).not.toBeInTheDocument();
   });
 });
 

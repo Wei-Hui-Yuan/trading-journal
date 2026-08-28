@@ -3,7 +3,12 @@
 import React from 'react';
 
 import { formatPrice, formatUnsignedMoney } from '@/lib/format';
-import type { Side, SizingResult, TakeProfitScore } from '@/lib/positionSizing';
+import {
+  computePlannedRisk,
+  type Side,
+  type SizingResult,
+  type TakeProfitScore,
+} from '@/lib/positionSizing';
 
 /**
  * What a sized position works out to — the outputs half of the calculator.
@@ -48,6 +53,16 @@ export interface PositionSizingPanelProps {
    * `0.12345678999` into a field the user is about to read.
    */
   onPickTarget: (formattedPrice: string) => void;
+  /**
+   * Needed to express the planned risk as a percent of the account. Absent
+   * or null still shows the dollar figure, which is the more important half.
+   */
+  accountSize?: number | null;
+  /**
+   * Appended to the planned-risk line by a host that does something further
+   * with the figure — the Plan modal stores it, a scratchpad note does not.
+   */
+  plannedRiskNote?: string;
   /** Omitted where there is no quantity field to fill. */
   onUseShares?: (shares: number) => void;
   /**
@@ -69,6 +84,8 @@ export const PositionSizingPanel: React.FC<PositionSizingPanelProps> = ({
   takeProfit,
   takeProfitScore,
   enteredQty,
+  accountSize = null,
+  plannedRiskNote,
   onPickTarget,
   onUseShares,
   formatSharesLabel = (n) => `Use ${n} share${n === 1 ? '' : 's'}`,
@@ -79,6 +96,16 @@ export const PositionSizingPanel: React.FC<PositionSizingPanelProps> = ({
   if (sizing === null) {
     return <p className="text-[10px] text-obsidian-muted">{hint}</p>;
   }
+
+  // What the chosen quantity risks, which is not the budget above it: the
+  // share count is floored, so a $25 budget at $10 a share buys two shares
+  // risking $20. Follows the entered quantity rather than the suggestion,
+  // because taking half size is a deliberate act.
+  const plannedRisk = computePlannedRisk({
+    riskPerShare: sizing.riskPerShare,
+    shares: enteredQty,
+    accountSize,
+  });
 
   return (
     <div className="space-y-2.5">
@@ -257,6 +284,22 @@ export const PositionSizingPanel: React.FC<PositionSizingPanelProps> = ({
             {formatSharesLabel(sizing.wholeShares)}
           </button>
         )}
+
+      {/* The number actually on the line. Without it the panel shows a risk
+          budget the position does not spend — a $25 budget against two
+          shares risking $20 overstates the exposure by a fifth, and it is
+          the budget that is the less useful of the two. */}
+      {plannedRisk !== null && (
+        <p className="text-[10px] text-obsidian-muted">
+          Planning {enteredQty} share{enteredQty === 1 ? '' : 's'} — risking{' '}
+          <span className="text-slate-300">
+            {formatUnsignedMoney(plannedRisk.amount)}
+          </span>
+          {plannedRisk.percent !== null &&
+            ` (${plannedRisk.percent.toFixed(2)}% of account)`}
+          .{plannedRiskNote ? ` ${plannedRiskNote}` : ''}
+        </p>
+      )}
     </div>
   );
 };

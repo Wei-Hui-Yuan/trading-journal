@@ -18,7 +18,12 @@ import { ChartDropzone, PlanChartView } from '@/components/PlanChart';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
-import { computeSizing, scoreTakeProfit, sizingHint } from '@/lib/positionSizing';
+import {
+  computePlannedRisk,
+  computeSizing,
+  scoreTakeProfit,
+  sizingHint,
+} from '@/lib/positionSizing';
 import type { CompressedChart } from '@/lib/chartImage';
 import type { TradePlan, TradeSide } from '@/types/api';
 
@@ -256,13 +261,18 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   // Dollars at risk on the quantity actually planned, which is not necessarily
   // the quantity the calculator suggested — taking half size is a deliberate
   // act and the plan should record it as half the risk.
+  //
+  // The same call the panel makes to render this, so what is stored and what
+  // is shown cannot drift apart.
   const enteredQty = toNullableNumber(form.quantity);
   const plannedRisk =
-    sizing !== null && enteredQty !== null && enteredQty > 0
-      ? enteredQty * sizing.riskPerShare
-      : null;
-  const plannedRiskPercent =
-    plannedRisk !== null && accountSize ? (plannedRisk / accountSize) * 100 : null;
+    sizing === null
+      ? null
+      : computePlannedRisk({
+          riskPerShare: sizing.riskPerShare,
+          shares: enteredQty,
+          accountSize,
+        });
 
   // What the take profit actually typed into the form is worth, as opposed to
   // the 1R/2R/3R chips. Sized on the quantity being planned where one has been
@@ -343,8 +353,8 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
       // Only sent when a stop makes them meaningful. Without one there is no
       // risk per share, so any figure here would be invented rather than
       // measured — and a null is honest where a zero would not be.
-      risk_amount: plannedRisk,
-      risk_percent: plannedRiskPercent,
+      risk_amount: plannedRisk?.amount ?? null,
+      risk_percent: plannedRisk?.percent ?? null,
       ...optional,
       ...(checklistForPlan.length > 0 ? { disciplines } : {}),
     };
@@ -699,6 +709,10 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 takeProfit={toNullableNumber(form.takeProfitPrice)}
                 takeProfitScore={takeProfitScore}
                 enteredQty={enteredQty}
+                accountSize={accountSize}
+                // The panel renders the planned risk; this says what becomes
+                // of it here, which is the one part that is not shared.
+                plannedRiskNote="Saved with the plan."
                 onPickTarget={(picked) => patch({ takeProfitPrice: picked })}
                 onUseShares={(shares) => patch({ quantity: String(shares) })}
                 formatSharesLabel={(n) =>
@@ -706,21 +720,6 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 }
                 disabled={isSaving}
               />
-
-              {/* What will actually be recorded, which follows the quantity
-                  field rather than the suggestion above it. */}
-              {plannedRisk !== null && (
-                <p className="mt-2.5 text-[10px] text-obsidian-muted">
-                  Planning {enteredQty} share{enteredQty === 1 ? '' : 's'} —
-                  risking{' '}
-                  <span className="text-slate-300">
-                    {formatUnsignedMoney(plannedRisk)}
-                  </span>
-                  {plannedRiskPercent !== null &&
-                    ` (${plannedRiskPercent.toFixed(2)}% of account)`}
-                  . Saved with the plan.
-                </p>
-              )}
             </div>
           </fieldset>
 

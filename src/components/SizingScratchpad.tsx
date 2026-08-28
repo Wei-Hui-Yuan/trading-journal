@@ -726,6 +726,7 @@ export const SizingScratchpad: React.FC = () => {
               takeProfit={takeProfitNum}
               takeProfitScore={tpScore}
               enteredQty={qtyNum}
+              accountSize={accountSize}
               onPickTarget={(picked) => patch({ takeProfit: picked })}
               onUseShares={(shares) => patch({ quantity: String(shares) })}
               disabled={createMutation.isPending}
