@@ -16,6 +16,8 @@ import {
 } from '@/hooks/useTradeInbox';
 import { ChartDropzone, PlanChartView } from '@/components/PlanChart';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { PositionSizingPanel } from '@/components/PositionSizingPanel';
+import { formatUnsignedMoney } from '@/lib/format';
 import { computeSizing, scoreTakeProfit, sizingHint } from '@/lib/positionSizing';
 import type { CompressedChart } from '@/lib/chartImage';
 import type { TradePlan, TradeSide } from '@/types/api';
@@ -111,18 +113,6 @@ const formFrom = (plan: TradePlan): FormState => ({
     plan.disciplines.map((d) => [d.discipline_id, d.followed])
   ),
 });
-
-/** Money, to the cent. */
-const money = (n: number) =>
-  n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-
-/**
- * A price, at the precision the instrument warrants.
- *
- * Sub-dollar tickers need more than two decimals or every R target rounds to
- * the same number and the ladder reads as though it has no spacing.
- */
-const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
 
 /**
  * Everything you decide before entering a trade — and nothing you cannot know yet.
@@ -651,7 +641,9 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 </span>
                 <div className="mt-1 flex h-[38px] items-center justify-between rounded-lg border border-obsidian-border bg-obsidian-bg/60 px-3">
                   <span className="font-mono text-xs text-slate-300">
-                    {accountSize === null ? 'not set' : money(accountSize)}
+                    {accountSize === null
+                      ? 'not set'
+                      : formatUnsignedMoney(accountSize)}
                   </span>
                   <Link
                     href="/settings"
@@ -696,199 +688,40 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
               </p>
             )}
 
-            {/* Outputs. A reason is shown rather than an empty panel — an
-                inverted stop is a mistake worth naming, not hiding. */}
-            {sizing === null ? (
-              <p className="mt-2.5 text-[10px] text-obsidian-muted">{hint}</p>
-            ) : (
-              <div className="mt-2.5 space-y-2.5">
-                <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
-                  <div className="flex justify-between">
-                    <span className="text-obsidian-muted">1R / share</span>
-                    <span className="font-mono text-slate-200">
-                      {money(sizing.riskPerShare)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-obsidian-muted">Risk budget</span>
-                    <span className="font-mono text-slate-200">
-                      {sizing.riskAmount === null ? '—' : money(sizing.riskAmount)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-obsidian-muted">Shares</span>
-                    <span className="font-mono text-slate-200">
-                      {sizing.wholeShares === null ? '—' : sizing.wholeShares}
-                      {sizing.exactShares !== null && (
-                        <span className="ml-1 text-obsidian-muted">
-                          ({sizing.exactShares.toFixed(2)})
-                        </span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-obsidian-muted">Cost</span>
-                    <span className="font-mono text-slate-200">
-                      {sizing.positionCost === null ? '—' : money(sizing.positionCost)}
-                      {sizing.accountFraction !== null && (
-                        <span
-                          className={`ml-1 ${
-                            sizing.accountFraction > 1 ? 'text-loss' : 'text-obsidian-muted'
-                          }`}
-                        >
-                          ({(sizing.accountFraction * 100).toFixed(0)}%)
-                        </span>
-                      )}
-                    </span>
-                  </div>
-                </div>
+            {/* Outputs, shared with the sizing scratchpad. Two surfaces that
+                disagree about what a trade risks is the one failure this
+                calculator cannot be allowed to have. */}
+            <div className="mt-2.5">
+              <PositionSizingPanel
+                sizing={sizing}
+                hint={hint}
+                side={form.side}
+                takeProfit={toNullableNumber(form.takeProfitPrice)}
+                takeProfitScore={takeProfitScore}
+                enteredQty={enteredQty}
+                onPickTarget={(picked) => patch({ takeProfitPrice: picked })}
+                onUseShares={(shares) => patch({ quantity: String(shares) })}
+                formatSharesLabel={(n) =>
+                  `Use ${n} share${n === 1 ? '' : 's'} as planned quantity`
+                }
+                disabled={isSaving}
+              />
 
-                {/* Above 100% of the account the position needs margin. Not an
-                    error — the account has it — but it should be a decision
-                    rather than a surprise noticed after the fill. */}
-                {sizing.accountFraction !== null && sizing.accountFraction > 1 && (
-                  <p className="text-[10px] text-loss">
-                    Costs more than the account holds — needs margin.
-                  </p>
-                )}
-
-                {sizing.wholeShares === 0 && (
-                  <p className="text-[10px] text-loss">
-                    Risk budget is smaller than one share&apos;s risk. Widen the
-                    account size, raise the risk %, or tighten the stop.
-                  </p>
-                )}
-
-                {/* The R ladder. Clicking one writes it into Take Profit
-                    above, because a plan stores a single target — these are
-                    the options, and the field records which was chosen. */}
-                <div>
-                  <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                    Take Profit Targets
+              {/* What will actually be recorded, which follows the quantity
+                  field rather than the suggestion above it. */}
+              {plannedRisk !== null && (
+                <p className="mt-2.5 text-[10px] text-obsidian-muted">
+                  Planning {enteredQty} share{enteredQty === 1 ? '' : 's'} —
+                  risking{' '}
+                  <span className="text-slate-300">
+                    {formatUnsignedMoney(plannedRisk)}
                   </span>
-                  <div className="mt-1 grid grid-cols-3 gap-2">
-                    {sizing.targets.map((t) => {
-                      const chosen =
-                        toNullableNumber(form.takeProfitPrice) !== null &&
-                        Math.abs(
-                          (toNullableNumber(form.takeProfitPrice) as number) - t.price
-                        ) < 0.005;
-                      return (
-                        <button
-                          key={t.r}
-                          type="button"
-                          onClick={() => patch({ takeProfitPrice: price(t.price) })}
-                          disabled={isSaving}
-                          aria-pressed={chosen}
-                          // The visible label is three separate spans of
-                          // numbers, which reads as an unnamed button to a
-                          // screen reader. Spelled out here instead.
-                          aria-label={`Set take profit to ${price(t.price)} (${t.r}R)`}
-                          className={`rounded-lg border px-2 py-1.5 text-left transition-colors disabled:opacity-50 ${
-                            chosen
-                              ? 'border-win/50 bg-win/15'
-                              : 'border-obsidian-border bg-obsidian-bg hover:border-slate-600'
-                          }`}
-                        >
-                          <span
-                            className={`block text-[10px] font-semibold ${
-                              chosen ? 'text-win' : 'text-obsidian-muted'
-                            }`}
-                          >
-                            {t.r}R
-                          </span>
-                          <span className="block font-mono text-[11px] text-slate-200">
-                            {price(t.price)}
-                          </span>
-                          {t.profit !== null && (
-                            <span className="block font-mono text-[10px] text-obsidian-muted">
-                              +{money(t.profit)}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* What the take profit in the form above is worth.
-                    The ladder answers "where is 2R?"; this answers the
-                    question you actually arrive with — "I want out at 25,
-                    what does that pay?" — which otherwise means eyeballing
-                    where 25 falls between two chips and interpolating. */}
-                {takeProfitScore !== null && (
-                  <div
-                    className={`rounded-lg border px-2.5 py-2 ${
-                      takeProfitScore.isBackwards
-                        ? 'border-loss/40 bg-loss/5'
-                        : 'border-obsidian-border bg-obsidian-bg/60'
-                    }`}
-                  >
-                    {takeProfitScore.isBackwards ? (
-                      // Named as the typo it is rather than rendered as a
-                      // negative R, which would read like a deliberate choice.
-                      <p className="text-[10px] leading-relaxed text-loss">
-                        Take profit {price(toNullableNumber(form.takeProfitPrice) as number)}{' '}
-                        is on the losing side of your entry
-                        {form.side === 'BUY'
-                          ? ' — for a long it has to sit above it.'
-                          : ' — for a short it has to sit below it.'}
-                      </p>
-                    ) : (
-                      <>
-                        <div className="flex items-baseline justify-between">
-                          <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                            Your take profit
-                          </span>
-                          <span className="font-mono text-[11px] text-slate-200">
-                            {takeProfitScore.rMultiple.toFixed(2)}R
-                            {takeProfitScore.profit !== null && (
-                              <span className="ml-1.5 text-win">
-                                +{money(takeProfitScore.profit)}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 text-[10px] text-obsidian-muted">
-                          {money(takeProfitScore.perShare)} per share
-                          {takeProfitScore.shares !== null &&
-                            ` on ${takeProfitScore.shares} share${
-                              takeProfitScore.shares === 1 ? '' : 's'
-                            }`}
-                          {enteredQty === null &&
-                            takeProfitScore.shares !== null &&
-                            ' (suggested size)'}
-                        </p>
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {sizing.wholeShares !== null && sizing.wholeShares > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => patch({ quantity: String(sizing.wholeShares) })}
-                    disabled={isSaving}
-                    className="w-full rounded-lg border border-obsidian-border bg-obsidian-bg px-3 py-1.5 text-[11px] text-slate-300 hover:border-slate-600 hover:text-slate-100 transition-colors disabled:opacity-50"
-                  >
-                    Use {sizing.wholeShares} shares as planned quantity
-                  </button>
-                )}
-
-                {/* What will actually be recorded, which follows the quantity
-                    field rather than the suggestion above it. */}
-                {plannedRisk !== null && (
-                  <p className="text-[10px] text-obsidian-muted">
-                    Planning {enteredQty} share{enteredQty === 1 ? '' : 's'} —
-                    risking{' '}
-                    <span className="text-slate-300">{money(plannedRisk)}</span>
-                    {plannedRiskPercent !== null &&
-                      ` (${plannedRiskPercent.toFixed(2)}% of account)`}
-                    . Saved with the plan.
-                  </p>
-                )}
-              </div>
-            )}
+                  {plannedRiskPercent !== null &&
+                    ` (${plannedRiskPercent.toFixed(2)}% of account)`}
+                  . Saved with the plan.
+                </p>
+              )}
+            </div>
           </fieldset>
 
           {/* The idea. Captured now, before the outcome is known — a thesis

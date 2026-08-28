@@ -19,6 +19,7 @@ import {
   useUpdateSizingEntry,
 } from '@/hooks/useSizingScratchpad';
 import { useSettings } from '@/hooks/useTradeInbox';
+import { formatUnsignedMoney } from '@/lib/format';
 import {
   computeSizing,
   scoreTakeProfit,
@@ -26,15 +27,6 @@ import {
   type Side,
 } from '@/lib/positionSizing';
 import type { SizingScratchpadEntry } from '@/types/sizing';
-
-/** Money, to the cent — unsigned, matching the Plan modal's own local
- * formatter rather than the app-wide signed one, which is for P&L. */
-const money = (n: number) =>
-  n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-
-/** A price, at the precision the instrument warrants — sub-dollar tickers
- * need more than two decimals or every target rounds to the same number. */
-const price = (n: number) => (n < 1 ? n.toFixed(4) : n.toFixed(2));
 
 function toNullableNumber(raw: string): number | null {
   const trimmed = raw.trim();
@@ -276,7 +268,7 @@ const ScratchpadRow: React.FC<{ entry: SizingScratchpadEntry }> = ({ entry }) =>
 
           {riskAmount !== null && (
             <span className="text-slate-300">
-              risk <span className="text-slate-100">{money(riskAmount)}</span>
+              risk <span className="text-slate-100">{formatUnsignedMoney(riskAmount)}</span>
             </span>
           )}
 
@@ -287,7 +279,7 @@ const ScratchpadRow: React.FC<{ entry: SizingScratchpadEntry }> = ({ entry }) =>
               {tpScore.rMultiple.toFixed(2)}R
               {tpScore.profit !== null && (
                 <span className="ml-1 text-slate-100">
-                  {money(tpScore.profit)}
+                  {formatUnsignedMoney(tpScore.profit)}
                 </span>
               )}
               {tpScore.isBackwards && ' — target is backwards'}
@@ -599,14 +591,14 @@ export const SizingScratchpad: React.FC = () => {
                 <span className="text-obsidian-muted">
                   1R{' '}
                   <span className="text-slate-200">
-                    {money(sizing.riskPerShare)}
+                    {formatUnsignedMoney(sizing.riskPerShare)}
                   </span>
                 </span>
                 {sizing.riskAmount !== null && (
                   <span className="text-obsidian-muted">
                     risk budget{' '}
                     <span className="text-slate-200">
-                      {money(sizing.riskAmount)}
+                      {formatUnsignedMoney(sizing.riskAmount)}
                     </span>
                   </span>
                 )}
@@ -636,7 +628,7 @@ export const SizingScratchpad: React.FC = () => {
                     >
                       {tpScore.rMultiple.toFixed(2)}R
                       {tpScore.profit !== null &&
-                        ` (${money(tpScore.profit)})`}
+                        ` (${formatUnsignedMoney(tpScore.profit)})`}
                     </span>
                     {tpScore.isBackwards && ' — backwards'}
                   </span>

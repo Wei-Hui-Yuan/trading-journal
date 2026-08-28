@@ -7,8 +7,8 @@
  *  1. The sheet is long-only. `Entry - Stop` goes negative on a short and the
  *     share count silently comes back negative, so direction is explicit here.
  *  2. The sheet computes one target at the chosen risk/reward ratio. This
- *     returns the whole 1R/2R/3R ladder, because deciding where to take profit
- *     is easier against the alternatives than in isolation.
+ *     returns the whole R ladder (see `R_LADDER`), because deciding where to
+ *     take profit is easier against the alternatives than in isolation.
  *
  * The `risk per share` denominator is deliberately identical to the one
  * services/analytics.py uses to score realised R. That is what makes a planned
@@ -27,7 +27,7 @@ export interface SizingInputs {
 }
 
 export interface RTarget {
-  /** 1, 2, 3 — the multiple of risk this target represents. */
+  /** The multiple of risk this target represents — one of `R_LADDER`. */
   r: number;
   /** The price at which the trade is up this many R. */
   price: number;
@@ -51,8 +51,15 @@ export interface SizingResult {
   targets: RTarget[];
 }
 
-/** The R multiples the calculator surfaces. */
-export const R_LADDER = [1, 2, 3] as const;
+/**
+ * The R multiples the calculator surfaces.
+ *
+ * 5R is not a rung you climb to from 3R — it is a different kind of trade, and
+ * the gap in the sequence is the point. A ladder of 1/2/3 quietly frames three
+ * as the ceiling; including one target that only a runner reaches keeps the
+ * question "am I cutting this at 2R out of habit?" on screen.
+ */
+export const R_LADDER = [1, 2, 3, 5] as const;
 
 /**
  * Compute the ladder, or null if the inputs cannot support one.

@@ -101,7 +101,7 @@ describe('computeSizing', () => {
     expect(result.positionCost).toBeNull();
     expect(result.accountFraction).toBeNull();
     // Prices stay knowable; only the money columns go blank.
-    expect(result.targets.map((t) => t.price)).toEqual([105, 110, 115]);
+    expect(result.targets.map((t) => t.price)).toEqual([105, 110, 115, 125]);
     expect(result.targets.every((t) => t.profit === null)).toBe(true);
   });
 
@@ -109,15 +109,15 @@ describe('computeSizing', () => {
     const long = computeSizing(LONG)!;
     const short = computeSizing({ ...LONG, side: 'SELL', entry: 100, stop: 105 })!;
 
-    expect(long.targets.map((t) => t.price)).toEqual([105, 110, 115]);
-    expect(short.targets.map((t) => t.price)).toEqual([95, 90, 85]);
+    expect(long.targets.map((t) => t.price)).toEqual([105, 110, 115, 125]);
+    expect(short.targets.map((t) => t.price)).toEqual([95, 90, 85, 75]);
   });
 
   it('scales profit with the multiple, on the shares actually bought', () => {
     const { targets } = computeSizing({ ...LONG, stop: 85 })!;
 
     // Six whole shares, not the 6.67 the risk budget would have paid for.
-    expect(targets.map((t) => t.profit)).toEqual([90, 180, 270]);
+    expect(targets.map((t) => t.profit)).toEqual([90, 180, 270, 450]);
     expect(targets.map((t) => t.r)).toEqual([...R_LADDER]);
   });
 

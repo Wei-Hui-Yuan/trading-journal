@@ -29,6 +29,38 @@ export function formatMoney(value: number): string {
 }
 
 /**
+ * Money with no explicit `+` on a gain — for figures that have a magnitude but
+ * no direction.
+ *
+ * A position's cost, a risk budget, the profit at a 2R target: none of these
+ * are P&L, and signing them the way `formatMoney` does would read as though
+ * `+$2,000.00` of cost were somehow the good outcome. The sizing calculator
+ * and the Plan modal each grew a private copy of this for exactly that reason;
+ * this is that copy, made shared so the two cannot drift.
+ *
+ * A negative still prints its minus. Nothing the sizing panel renders through
+ * this can be negative — a backwards take profit is caught and named before it
+ * reaches a currency figure — but swallowing the sign would be the wrong way
+ * to fail if one ever did.
+ */
+export function formatUnsignedMoney(value: number): string {
+  return value.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+}
+
+/**
+ * A price, at the precision the instrument warrants.
+ *
+ * Sub-dollar tickers need more than two decimals or every rung of the R ladder
+ * rounds to the same number and the ladder reads as though it has no spacing.
+ * Deliberately not `formatUnsignedMoney`: a price sits in a field the user
+ * types into, so it is rendered bare, without a currency symbol or thousands
+ * separators that would not survive being read back.
+ */
+export function formatPrice(value: number): string {
+  return value < 1 ? value.toFixed(4) : value.toFixed(2);
+}
+
+/**
  * A percentage that signs itself.
  *
  * `toFixed` already emits the minus, so only the plus is ever added — adding
