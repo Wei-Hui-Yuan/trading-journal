@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   R_LADDER,
+  breakevenWinRate,
   computePlannedRisk,
   computeSizing,
   scoreTakeProfit,
@@ -209,6 +210,42 @@ describe('computePlannedRisk', () => {
 
     expect(planned.amount).toBe(50);
     expect(planned.percent).toBeNull();
+  });
+});
+
+describe('breakevenWinRate', () => {
+  it.each([
+    [1, 50],
+    [2, 100 / 3],
+    [3, 25],
+    [5, 100 / 6],
+  ])('puts %sR at %s%%', (r, expected) => {
+    // The whole R ladder, since these are the four figures that will be read
+    // off the screen most often.
+    expect(breakevenWinRate(r)!).toBeCloseTo(expected, 10);
+  });
+
+  it('needs more than half the time below 1R', () => {
+    // Risking one to make half means winning twice for every loss just to
+    // stand still. Worth pinning: it is the direction people misjudge.
+    expect(breakevenWinRate(0.5)!).toBeCloseTo(66.667, 3);
+  });
+
+  it('never reaches zero, however large the target', () => {
+    // An asymptote, not a floor. A 99R target still has to be right sometimes.
+    expect(breakevenWinRate(99)!).toBeGreaterThan(0);
+    expect(breakevenWinRate(99)!).toBeCloseTo(1, 1);
+  });
+
+  it.each([
+    ['a zero R', 0],
+    ['a negative R', -2],
+    ['a NaN R', Number.NaN],
+    ['an infinite R', Number.POSITIVE_INFINITY],
+  ])('returns null for %s', (_label, r) => {
+    // A target at or behind entry has no breakeven win rate. Returning 100%
+    // would be a wrong answer rather than a demanding one.
+    expect(breakevenWinRate(r)).toBeNull();
   });
 });
 

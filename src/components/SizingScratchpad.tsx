@@ -19,6 +19,7 @@ import {
   useUpdateSizingEntry,
 } from '@/hooks/useSizingScratchpad';
 import { useSettings } from '@/hooks/useTradeInbox';
+import { BreakevenCheck } from '@/components/BreakevenCheck';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
 import {
@@ -731,6 +732,15 @@ export const SizingScratchpad: React.FC = () => {
               onUseShares={(shares) => patch({ quantity: String(shares) })}
               disabled={createMutation.isPending}
             />
+
+            {/* Scored against the target actually typed, not the ladder --
+                the ladder offers four answers and this question only has
+                meaning once one of them has been chosen. */}
+            {tpScore !== null && !tpScore.isBackwards && (
+              <div className="mt-2.5">
+                <BreakevenCheck rMultiple={tpScore.rMultiple} />
+              </div>
+            )}
           </div>
         )}
 

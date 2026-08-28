@@ -174,6 +174,28 @@ export function computePlannedRisk({
   return { amount, percent };
 }
 
+/**
+ * The win rate at which a given R multiple breaks even, as a percent.
+ *
+ * `1 / (1 + R)`: risking one unit to make R, you need to win often enough
+ * that `wins x R` covers `losses x 1`. A 2R target needs 33%, a 3R needs 25%,
+ * a 1R needs 50%.
+ *
+ * This is the arithmetic floor and nothing more. It assumes every loss is a
+ * full 1R and every win reaches the target exactly, and it ignores
+ * commissions and slippage — the journal measures real slippage separately
+ * (`AdvancedMetrics.avg_slippage`) precisely because it is not zero. The real
+ * bar is always somewhat higher than this number, so it is labelled as being
+ * before costs wherever it is shown.
+ *
+ * Null for a non-positive R: a target at or behind the entry has no breakeven
+ * win rate, and 100% would be a wrong answer rather than a demanding one.
+ */
+export function breakevenWinRate(rMultiple: number): number | null {
+  if (!Number.isFinite(rMultiple) || rMultiple <= 0) return null;
+  return (1 / (1 + rMultiple)) * 100;
+}
+
 export interface TakeProfitScore {
   /** Gain per share at that price. Negative when the target is backwards. */
   perShare: number;
