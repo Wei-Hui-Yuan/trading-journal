@@ -19,6 +19,7 @@ import {
   useUpdateSizingEntry,
 } from '@/hooks/useSizingScratchpad';
 import { useSettings } from '@/hooks/useTradeInbox';
+import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
 import {
   computeSizing,
@@ -50,6 +51,15 @@ function relativeAge(iso: string): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+/**
+ * One-click risk levels, either side of the usual 1%.
+ *
+ * Not a replacement for the free field beside them — the point is that
+ * halving risk on a marginal setup should cost one click, or it does not
+ * happen at the moment it matters.
+ */
+const RISK_PRESETS = [0.5, 1, 2] as const;
 
 const inputClass =
   'w-full rounded-lg bg-obsidian-bg border border-obsidian-border px-2.5 py-1.5 text-xs text-slate-200 ' +
@@ -148,10 +158,21 @@ const EditableTicker: React.FC<{
   );
 };
 
-/** What one saved note computes to, using the exact same library the Plan
- * modal does — the scratchpad and a real plan must never disagree about
- * what a given entry/stop/quantity means. */
-function useRowSizing(entry: SizingScratchpadEntry) {
+/**
+ * What one saved note computes to, using the exact same library the Plan
+ * modal does — the scratchpad and a real plan must never disagree about what
+ * a given entry/stop/quantity means.
+ *
+ * The account size and risk % are handed in rather than read from settings
+ * here, so a row is priced against the same risk the page header is currently
+ * showing. Both used to be hard-coded null, which is why a saved note could
+ * only ever report the risk of a quantity already typed and never suggest one.
+ */
+function useRowSizing(
+  entry: SizingScratchpadEntry,
+  accountSize: number | null,
+  riskPercent: number | null
+) {
   const side = entry.direction as Side;
   const sizing = useMemo(
     () =>
@@ -159,10 +180,10 @@ function useRowSizing(entry: SizingScratchpadEntry) {
         side,
         entry: entry.entry,
         stop: entry.stop_loss,
-        accountSize: null,
-        riskPercent: null,
+        accountSize,
+        riskPercent,
       }),
-    [side, entry.entry, entry.stop_loss]
+    [side, entry.entry, entry.stop_loss, accountSize, riskPercent]
   );
 
   const riskAmount =
@@ -186,13 +207,21 @@ function useRowSizing(entry: SizingScratchpadEntry) {
   return { sizing, riskAmount, tpScore };
 }
 
-const ScratchpadRow: React.FC<{ entry: SizingScratchpadEntry }> = ({ entry }) => {
+const ScratchpadRow: React.FC<{
+  entry: SizingScratchpadEntry;
+  accountSize: number | null;
+  riskPercent: number | null;
+}> = ({ entry, accountSize, riskPercent }) => {
   const updateMutation = useUpdateSizingEntry();
   const deleteMutation = useDeleteSizingEntry();
   const promoteMutation = usePromoteSizingEntry();
   const [promoteError, setPromoteError] = useState<string | null>(null);
 
-  const { sizing, riskAmount, tpScore } = useRowSizing(entry);
+  const { sizing, riskAmount, tpScore } = useRowSizing(
+    entry,
+    accountSize,
+    riskPercent
+  );
 
   const patch = (
     fields: Partial<{
@@ -271,6 +300,22 @@ const ScratchpadRow: React.FC<{ entry: SizingScratchpadEntry }> = ({ entry }) =>
               risk <span className="text-slate-100">{formatUnsignedMoney(riskAmount)}</span>
             </span>
           )}
+
+          {/* Only worth offering while it would change something. A note
+              already holding the suggested quantity does not need to be told
+              to adopt it. */}
+          {sizing?.wholeShares != null &&
+            sizing.wholeShares > 0 &&
+            sizing.wholeShares !== entry.quantity && (
+              <button
+                type="button"
+                onClick={() => patch({ quantity: sizing.wholeShares })}
+                className="text-obsidian-muted underline decoration-dotted transition-colors hover:text-slate-200"
+              >
+                suggested{' '}
+                <span className="text-slate-200">{sizing.wholeShares} sh</span>
+              </button>
+            )}
 
           {tpScore !== null && (
             <span
@@ -370,6 +415,27 @@ export const SizingScratchpad: React.FC = () => {
 
   const [draft, setDraft] = useState<QuickAddDraft>(BLANK_DRAFT);
   const [formError, setFormError] = useState<string | null>(null);
+  /**
+   * Risk for whatever is being sized right now, defaulting to the saved
+   * account figure but editable — a lower-conviction setup gets sized smaller
+   * without changing the default, the same way the Plan modal already allows.
+   *
+   * Held as an OVERRIDE rather than as seeded state. The obvious shape is
+   * `useState('')` plus an effect that fills it in once settings arrive, but
+   * that has to guard against clobbering a value typed while the request was
+   * still in flight, and it trips `react-hooks/set-state-in-effect` for
+   * exactly the cascading-render reason the rule exists. Deriving it needs no
+   * effect and no guard: null means "nobody has chosen", which reads as the
+   * account default the moment one is known, and any typed value — including
+   * an empty string — wins from then on.
+   *
+   * Deliberately NOT persisted with the note. Nothing in the scratchpad table
+   * records a risk %, and adding a column would make a scratch note carry a
+   * claim about conviction it was never asked for.
+   */
+  const [riskOverride, setRiskOverride] = useState<string | null>(null);
+  const riskPercentText =
+    riskOverride ?? (settings ? String(settings.risk_percent) : '');
 
   const patch = (fields: Partial<QuickAddDraft>) =>
     setDraft((prev) => ({ ...prev, ...fields }));
@@ -379,16 +445,19 @@ export const SizingScratchpad: React.FC = () => {
   const takeProfitNum = toNullableNumber(draft.takeProfit);
   const qtyNum = toNullableNumber(draft.quantity);
 
+  const accountSize = settings?.account_size ?? null;
+  const riskPercentNum = toNullableNumber(riskPercentText);
+
   const sizing = useMemo(
     () =>
       computeSizing({
         side: draft.side,
         entry: entryNum,
         stop: stopNum,
-        accountSize: settings?.account_size ?? null,
-        riskPercent: settings?.risk_percent ?? null,
+        accountSize,
+        riskPercent: riskPercentNum,
       }),
-    [draft.side, entryNum, stopNum, settings]
+    [draft.side, entryNum, stopNum, accountSize, riskPercentNum]
   );
 
   const hint = useMemo(
@@ -570,73 +639,100 @@ export const SizingScratchpad: React.FC = () => {
           </label>
         </div>
 
+        {/* The two figures the sizing answers against, side by side, so it is
+            never ambiguous which balance and which conviction produced the
+            share count below. Account size is read-only here: it belongs to
+            the account rather than to a trade, so it is set once on /settings
+            instead of retyped for every idea. */}
+        <div className="mt-3 grid grid-cols-1 gap-2.5 border-t border-obsidian-border pt-3 sm:grid-cols-2">
+          <div>
+            <span className="text-[10px] uppercase tracking-wider text-obsidian-muted">
+              Account
+            </span>
+            <div className="mt-1 flex h-[34px] items-center justify-between rounded-lg border border-obsidian-border bg-obsidian-bg/60 px-2.5">
+              <span className="font-mono text-xs text-slate-300">
+                {accountSize === null
+                  ? 'not set'
+                  : formatUnsignedMoney(accountSize)}
+              </span>
+              <Link
+                href="/settings"
+                className="text-[10px] text-obsidian-muted transition-colors hover:text-slate-200"
+              >
+                Edit
+              </Link>
+            </div>
+          </div>
+
+          <div>
+            <span className="text-[10px] uppercase tracking-wider text-obsidian-muted">
+              Risk this trade
+            </span>
+            <div className="mt-1 flex h-[34px] items-center gap-1">
+              {RISK_PRESETS.map((preset) => {
+                const active = riskPercentNum === preset;
+                return (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setRiskOverride(String(preset))}
+                    aria-pressed={active}
+                    className={`h-full rounded-lg border px-2 text-[10px] font-semibold transition-colors ${
+                      active
+                        ? 'border-win/50 bg-win/15 text-win'
+                        : 'border-obsidian-border bg-obsidian-bg text-obsidian-muted hover:text-slate-200'
+                    }`}
+                  >
+                    {preset}%
+                  </button>
+                );
+              })}
+              {/* 0.01, matching the Plan modal's own field and the two
+                  decimals trades.risk_percent keeps. `any` would accept a
+                  1.234 that is not representable downstream. */}
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.01"
+                min="0"
+                value={riskPercentText}
+                onChange={(e) => setRiskOverride(e.target.value)}
+                aria-label="Risk percent for this trade"
+                placeholder="1"
+                className={`${inputClass} h-full flex-1`}
+              />
+            </div>
+          </div>
+        </div>
+
         {settings?.account_size === null && (
           <p className="mt-2 text-[10px] text-obsidian-muted">
             <Link href="/settings" className="text-slate-300 underline">
               Set your account size
             </Link>{' '}
-            to get a suggested share count.
+            to get a suggested share count. Target prices work without it.
           </p>
         )}
 
-        {/* Live preview — entirely client-side, the same computeSizing/
-            scoreTakeProfit the Plan modal itself uses, so nothing is saved
-            just to find out what a number means. */}
+        {/* Live preview — entirely client-side, and the same panel the Plan
+            modal renders, so nothing has to be saved just to find out what a
+            number means. */}
         {entryNum !== null && stopNum !== null && (
           <div className="mt-3 border-t border-obsidian-border pt-3">
-            {sizing === null ? (
-              <p className="text-[11px] text-loss">{hint}</p>
-            ) : (
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono">
-                <span className="text-obsidian-muted">
-                  1R{' '}
-                  <span className="text-slate-200">
-                    {formatUnsignedMoney(sizing.riskPerShare)}
-                  </span>
-                </span>
-                {sizing.riskAmount !== null && (
-                  <span className="text-obsidian-muted">
-                    risk budget{' '}
-                    <span className="text-slate-200">
-                      {formatUnsignedMoney(sizing.riskAmount)}
-                    </span>
-                  </span>
-                )}
-                {sizing.wholeShares !== null && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      patch({ quantity: String(sizing.wholeShares) })
-                    }
-                    className="text-obsidian-muted underline decoration-dotted hover:text-slate-200"
-                  >
-                    suggested{' '}
-                    <span className="text-slate-200">
-                      {sizing.wholeShares} sh
-                    </span>
-                  </button>
-                )}
-                {tpScore !== null && (
-                  <span
-                    className={
-                      tpScore.isBackwards ? 'text-loss' : 'text-obsidian-muted'
-                    }
-                  >
-                    at target{' '}
-                    <span
-                      className={tpScore.isBackwards ? 'text-loss' : 'text-slate-200'}
-                    >
-                      {tpScore.rMultiple.toFixed(2)}R
-                      {tpScore.profit !== null &&
-                        ` (${formatUnsignedMoney(tpScore.profit)})`}
-                    </span>
-                    {tpScore.isBackwards && ' — backwards'}
-                  </span>
-                )}
-              </div>
-            )}
+            <PositionSizingPanel
+              sizing={sizing}
+              hint={hint}
+              side={draft.side}
+              takeProfit={takeProfitNum}
+              takeProfitScore={tpScore}
+              enteredQty={qtyNum}
+              onPickTarget={(picked) => patch({ takeProfit: picked })}
+              onUseShares={(shares) => patch({ quantity: String(shares) })}
+              disabled={createMutation.isPending}
+            />
           </div>
         )}
+
 
         {formError && (
           <div className="mt-3 flex items-center text-xs text-loss">
@@ -699,7 +795,12 @@ export const SizingScratchpad: React.FC = () => {
 
         <div className="space-y-2">
           {(entries ?? []).map((entry) => (
-            <ScratchpadRow key={entry.id} entry={entry} />
+            <ScratchpadRow
+              key={entry.id}
+              entry={entry}
+              accountSize={accountSize}
+              riskPercent={riskPercentNum}
+            />
           ))}
         </div>
       </div>
