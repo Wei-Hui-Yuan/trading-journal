@@ -141,9 +141,10 @@ const CurveTooltip: React.FC<{
  * Cumulative realised P&L over time, and the drawdown it went through.
  *
  * Labelled "realised P&L", never "account equity": true equity needs a
- * starting balance plus every deposit and withdrawal, none of which the broker
- * feed carries. Open positions are not in here either — this is money that has
- * actually been booked.
+ * starting balance plus every deposit and withdrawal, none of which the
+ * broker feed carries. It also is not unrealised value — a position still
+ * open contributes only the money already banked scaling out of it, never
+ * its current mark-to-market.
  *
  * The underwater strip below the curve is not decoration. Depth of drawdown
  * and speed of recovery are the two things a cumulative line renders badly on
@@ -211,7 +212,7 @@ export const EquityCurveChart: React.FC<EquityCurveChartProps> = ({
           label="Net Realised"
           value={money(s.net_pnl)}
           tone={s.net_pnl >= 0 ? 'win' : 'loss'}
-          hint="Sum of every closed round trip. Open positions are not included."
+          hint="Every dollar realised in the window, including money banked scaling out of positions still open — not just round trips that fully closed."
         />
         <Stat
           label="Peak"
@@ -382,10 +383,11 @@ export const EquityCurveChart: React.FC<EquityCurveChartProps> = ({
 
       <p className="mt-3 text-[10px] leading-relaxed text-obsidian-muted">
         Cumulative <span className="text-slate-400">realised</span> P&amp;L, dated
-        by when each round trip closed — {s.closed_trades} trades over{' '}
-        {s.trading_days} trading days within {s.calendar_days} calendar days.
-        Open positions are not included, and this is not account equity: the
-        broker feed carries no deposits or withdrawals to anchor one to.
+        by when each dollar was booked — {s.closed_trades} round trips closed
+        over {s.trading_days} trading days within {s.calendar_days} calendar
+        days. Money banked scaling out of positions still open is included,
+        and this is not account equity: the broker feed carries no deposits
+        or withdrawals to anchor one to.
       </p>
     </>
   );

@@ -311,10 +311,17 @@ function DisciplineBreakdown({ metrics }: { metrics: AdvancedMetrics }) {
   // avg_r and r_sample are two separate fields on the wire, checked
   // together rather than assumed to always agree -- the same defensive
   // shape ComplianceBuckets below already uses for the identical pairing.
+  //
+  // The sample size is appended rather than hidden behind the number: `r_sample`
+  // exists specifically (per its own backend docstring) so one scored trade
+  // does not "look like a verdict on twenty" -- trade_count in the column next
+  // to it can be far larger, since not every trade carries a stop to score R
+  // against. Shown always, not just when small, so a reader learns the two
+  // counts can differ rather than discovering it only on the row where it bites.
   const r = (value: number | null, sample: number) =>
     value === null || sample === 0
       ? '—'
-      : `${value >= 0 ? '+' : ''}${value.toFixed(2)}R`;
+      : `${value >= 0 ? '+' : ''}${value.toFixed(2)}R (n=${sample})`;
 
   return (
     <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
@@ -472,11 +479,15 @@ function ComplianceBuckets({ metrics }: { metrics: AdvancedMetrics }) {
                   {/* r_sample can be smaller than trade_count -- not every
                       trade carries a stop to score R against -- so a
                       near-empty sample is shown as a dash rather than a
-                      confident-looking number. */}
+                      confident-looking number, and the sample size is
+                      appended whenever a number IS shown, matching
+                      DisciplineBreakdown's identical pairing above: this
+                      column's own "Trades" count can be far larger than
+                      how many of them actually back the R figure. */}
                   <td className="py-2 text-right font-mono text-slate-300">
                     {row.avg_r === null || row.r_sample === 0
                       ? '—'
-                      : `${row.avg_r >= 0 ? '+' : ''}${row.avg_r.toFixed(2)}R`}
+                      : `${row.avg_r >= 0 ? '+' : ''}${row.avg_r.toFixed(2)}R (n=${row.r_sample})`}
                   </td>
                 </tr>
               ))}

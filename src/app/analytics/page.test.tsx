@@ -899,8 +899,11 @@ describe('DisciplineBreakdown', () => {
     );
     await mountPage();
     const card = sectionHeading('Does Following Your Rules Pay?');
-    expect(within(card).getByText('+1.10R')).toBeInTheDocument();
-    expect(within(card).getByText('-0.50R')).toBeInTheDocument();
+    // Sample size appended -- r_sample can be smaller than trade_count, and
+    // the figure exists precisely so a reader can't mistake a tiny sample
+    // for a confident average (see the ComplianceBuckets equivalent below).
+    expect(within(card).getByText('+1.10R (n=8)')).toBeInTheDocument();
+    expect(within(card).getByText('-0.50R (n=2)')).toBeInTheDocument();
   });
 
   it("falls back to '—' for a side's avg R when r_sample is 0, even if avg_r is somehow non-null", async () => {
@@ -959,8 +962,8 @@ describe('ComplianceBuckets', () => {
   it.each<[number | null, number, string]>([
     [null, 5, '—'],
     [1.5, 0, '—'],
-    [1.5, 10, '+1.50R'],
-  ])('avg_r=%s, r_sample=%s -> "%s" (both null and zero-sample reasons render a dash)', async (avg_r, r_sample, expected) => {
+    [1.5, 10, '+1.50R (n=10)'],
+  ])('avg_r=%s, r_sample=%s -> "%s" (both null and zero-sample reasons render a dash; a real value carries its sample size)', async (avg_r, r_sample, expected) => {
     mocked.getAdvancedMetrics.mockResolvedValue(
       advancedMetrics({
         compliance_buckets: [complianceRow({ avg_r, r_sample, trade_count: 5 })],
@@ -1687,8 +1690,8 @@ describe('additional branch coverage', () => {
     );
     await mountPage();
     const card = sectionHeading('Does Overall Compliance Pay?');
-    expect(within(card).getByText('-1.25R')).toBeInTheDocument();
-    expect(within(card).queryByText('+-1.25R')).not.toBeInTheDocument();
+    expect(within(card).getByText('-1.25R (n=5)')).toBeInTheDocument();
+    expect(within(card).queryByText('+-1.25R (n=5)')).not.toBeInTheDocument();
   });
 
   it('backdrop click while NOT saving closes the drawer (the live half of the isSaving guard)', async () => {
