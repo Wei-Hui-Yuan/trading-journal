@@ -326,9 +326,11 @@ const dateFmt = new Intl.DateTimeFormat('en-US', {
  * counting it as "missing" would make the coverage figure worse than the
  * refresh actually is.
  */
-const ValuationStatusCard: React.FC<{
+/** Exported for its own test -- the wiring that decides whether a
+ * refresh honours the freshness guard is worth asserting directly. */
+export const ValuationStatusCard: React.FC<{
   holdings: Holding[];
-  onRunNow: () => void;
+  onRunNow: (force: boolean) => void;
   running: boolean;
 }> = ({ holdings, onRunNow, running }) => {
   const valuable = holdings.filter((h) => h.is_valuable);
@@ -376,15 +378,38 @@ const ValuationStatusCard: React.FC<{
             the scheduled job is the primary path now, and this is the
             escape hatch for what it cannot yet cover, not an alternative to
             it. Loud styling here would put the two on equal footing. */}
-        <button
-          type="button"
-          disabled={running}
-          onClick={onRunNow}
-          title="Re-fetches fundamentals and growth for the whole book right now, ahead of the scheduled run. Takes about ninety seconds."
-          className="mt-1.5 text-[10px] text-slate-500 underline decoration-dotted transition-colors hover:text-slate-300 disabled:opacity-50"
-        >
-          {running ? 'Refreshing (~90s)…' : 'Run now'}
-        </button>
+        <div className="mt-1.5 flex items-center gap-2">
+          <button
+            type="button"
+            disabled={running}
+            onClick={() => onRunNow(false)}
+            title="Re-fetches fundamentals and growth for the whole book right now, ahead of the scheduled run. Takes about ninety seconds."
+            className="text-[10px] text-slate-500 underline decoration-dotted transition-colors hover:text-slate-300 disabled:opacity-50"
+          >
+            {running ? 'Refreshing (~90s)…' : 'Run now'}
+          </button>
+
+          {/* The escape hatch's own escape hatch, and quieter still.
+              "Run now" skips anything fetched inside REFRESH_MAX_AGE, which
+              is what keeps a monthly job idempotent -- but it also means a
+              row that was fetched recently and stored something WRONG cannot
+              be corrected by pressing it. That is not hypothetical: when the
+              filing currency began being read off the statements rather than
+              the price quote, every row already held a plausible-looking
+              currency and a rate, so nothing was due and TSM kept reporting
+              an intrinsic value 32x too high with no way to ask for a
+              re-fetch. */}
+          {!running && (
+            <button
+              type="button"
+              onClick={() => onRunNow(true)}
+              title="Ignores the freshness guard and re-fetches every holding, including ones refreshed recently. Use after a change to how the data is read; it spends the same provider budget as a full run."
+              className="text-[10px] text-slate-600 underline decoration-dotted transition-colors hover:text-slate-400"
+            >
+              Force
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -667,9 +692,9 @@ export const InvestmentTable: React.FC = () => {
       {portfolio && (
         <ValuationStatusCard
           holdings={holdings}
-          onRunNow={() => {
+          onRunNow={(force) => {
             setNotice(null);
-            refreshValuations.mutate(false, {
+            refreshValuations.mutate(force, {
               onSuccess: (r) =>
                 setNotice(
                   `Valuations: ${r.refreshed} refreshed, ${r.skipped} still fresh` +
