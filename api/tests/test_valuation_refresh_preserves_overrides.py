@@ -84,13 +84,14 @@ class RecordingSession:
         self._holdings = holdings
         self._selects = 0
         self.statements = []
+        self._existing = []
 
     async def execute(self, stmt):
         self.statements.append(stmt)
         name = type(stmt).__name__
         if name == "Select":
             self._selects += 1
-            return FakeResult(self._holdings if self._selects == 1 else [])
+            return FakeResult(self._holdings if self._selects == 1 else self._existing)
         return FakeResult([])
 
     async def commit(self):
@@ -210,3 +211,92 @@ def test_the_refresh_reads_only_auto_rows_when_judging_staleness(monkeypatch):
 
     assert main.VARIANT_AUTO in params.values()
     assert main.VARIANT_OVERRIDE not in params.values()
+
+
+class FakeAutoRow:
+    """An existing auto row, as the staleness check reads it."""
+
+    def __init__(self, updated_at, statement_currency=None, statement_exchange_rate=None):
+        self.ticker = "MSFT"
+        self.variant = "auto"
+        self.updated_at = updated_at
+        self.statement_currency = statement_currency
+        self.statement_exchange_rate = statement_exchange_rate
+
+
+def run_refresh_with_existing(monkeypatch, row):
+    """One refresh where an auto row already exists, and may be skipped."""
+
+    async def go():
+        session = RecordingSession([FakeHolding()])
+        session._existing = [row]
+
+        from services import growth as growth_service
+        from services import market_data
+
+        async def fake_growth_many(tickers):
+            return {}
+
+        async def fake_fundamentals(ticker, client=None):
+            return FakeFundamentals()
+
+        monkeypatch.setattr(growth_service, "fetch_growth_many", fake_growth_many)
+        monkeypatch.setattr(market_data, "fetch_fundamentals", fake_fundamentals)
+        monkeypatch.setattr(market_data, "region_for", lambda *a, **k: "US")
+
+        return await main.refresh_valuation_inputs(session=session)
+
+    return asyncio.run(go())
+
+
+def test_a_row_that_cannot_be_valued_is_due_however_recently_it_was_fetched(monkeypatch):
+    """The bug that left every intrinsic value blank with no way back.
+
+    Migration 037 added an input the DCF requires. Every existing row lacked
+    it instantly -- unusable, but fetched days ago, so the staleness check
+    called it fresh and skipped it. The book showed "0 refreshed, 24 still
+    fresh" while every valuation read "no model", and would have kept saying
+    so until the rows aged past 25 days.
+    """
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    result = run_refresh_with_existing(
+        monkeypatch,
+        FakeAutoRow(yesterday, statement_currency=None, statement_exchange_rate=None),
+    )
+
+    assert result["refreshed"] == 1
+    assert result["skipped"] == 0
+
+
+def test_a_usable_recent_row_is_still_skipped(monkeypatch):
+    """The guard that makes a monthly schedule idempotent has to survive.
+
+    Without this the fix above would re-fetch the whole book on every run,
+    against a 250-call daily allowance.
+    """
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    result = run_refresh_with_existing(
+        monkeypatch,
+        FakeAutoRow(yesterday, statement_currency="USD", statement_exchange_rate=1.0),
+    )
+
+    assert result["refreshed"] == 0
+    assert result["skipped"] == 1
+
+
+def test_a_foreign_filer_awaiting_a_manual_rate_is_not_re_fetched_forever(monkeypatch):
+    """ASML files in EUR and lists as a USD ADR.
+
+    Its rate is NULL on purpose -- there is no FX provider here, so a human
+    supplies it. That NULL must not read as "never fetched", or every run
+    spends calls re-learning a currency it already knows and can do nothing
+    about.
+    """
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    result = run_refresh_with_existing(
+        monkeypatch,
+        FakeAutoRow(yesterday, statement_currency="EUR", statement_exchange_rate=None),
+    )
+
+    assert result["refreshed"] == 0
+    assert result["skipped"] == 1

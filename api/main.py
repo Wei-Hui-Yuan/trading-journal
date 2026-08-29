@@ -8168,10 +8168,30 @@ async def refresh_valuation_inputs(
 
     for holding in valuable:
         row = existing.get(holding.ticker)
+        # A row fetched before migration 037 carries NEITHER statement field,
+        # and _value_holding refuses to value without the rate -- so it is
+        # recently-fetched and unusable at the same time. Age alone called
+        # that "fresh" and skipped it, which is why adding the column blanked
+        # every intrinsic value in the book and the refresh then declined to
+        # fix them for another 25 days.
+        #
+        # Both fields NULL is what identifies those rows exactly. After any
+        # successful fetch the pair cannot be empty: a USD filer (or one
+        # whose currency the provider omits) gets rate 1.0, and a foreign
+        # filer gets a real statement_currency with a NULL rate on purpose --
+        # so ASML is fetched once, learns it files in EUR, and then stops
+        # being due rather than being re-fetched forever for a rate no
+        # provider here can supply.
+        never_fetched_statement_currency = (
+            row is not None
+            and row.statement_exchange_rate is None
+            and row.statement_currency is None
+        )
         fresh_enough = (
             row is not None
             and row.updated_at is not None
             and now - row.updated_at < REFRESH_MAX_AGE
+            and not never_fetched_statement_currency
         )
         if fresh_enough and not force:
             outcomes.append({
