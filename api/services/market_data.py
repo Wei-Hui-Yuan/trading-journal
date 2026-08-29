@@ -104,7 +104,19 @@ class Fundamentals:
     sector: Optional[str] = None
     industry: Optional[str] = None
     country: Optional[str] = None
+    # The QUOTE currency, from the profile -- what the share price is in.
+    # For an ADR that is USD regardless of where the company files.
     currency: str = "USD"
+    # The FILING currency, from the statements' own `reportedCurrency`.
+    #
+    # Deliberately separate from `currency` above, because for an ADR the two
+    # differ and conflating them is what made TSM -- TSMC files in TWD and
+    # lists on the NYSE in USD -- value at roughly 32x its real intrinsic
+    # value. The profile said USD, so the DCF read TWD cash flows as dollars.
+    #
+    # None when the provider did not say. The caller decides what to do with
+    # that; this module does not guess.
+    statement_currency: Optional[str] = None
 
     price: Optional[float] = None
     beta: Optional[float] = None
@@ -522,6 +534,12 @@ async def fetch_fundamentals(
             logger.info("FMP has no statements for %s; trying Finnhub.", symbol)
 
         if statements == "fmp":
+            # Off the statements, NOT the profile: this is the currency the
+            # figures below are denominated in, and it is the only field that
+            # distinguishes a USD filer from an ADR of a foreign one.
+            reported_ccy = cash_flow.get("reportedCurrency") or balance.get(
+                "reportedCurrency"
+            )
             total_debt_m = _millions(balance, "totalDebt")
             leases_m = _millions(balance, "capitalLeaseObligations")
             fcf_years_m = [_num(row, "freeCashFlow") for row in cash_flow_years]
@@ -534,6 +552,7 @@ async def fetch_fundamentals(
                 industry=profile.get("industry"),
                 country=profile.get("country"),
                 currency=profile.get("currency") or "USD",
+                statement_currency=reported_ccy,
                 price=price,
                 beta=_num(profile, "beta"),
                 shares_outstanding_m=shares_m,

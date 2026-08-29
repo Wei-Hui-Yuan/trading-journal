@@ -8233,6 +8233,10 @@ async def refresh_valuation_inputs(
                 fundamentals.country or holding.country, fundamentals.currency
             )
 
+            # See the statement_currency entry below for why this is not
+            # fundamentals.currency.
+            statement_ccy = fundamentals.statement_currency or fundamentals.currency
+
             values = {
                 # The workbook's definition, not FMP's headline: its input is
                 # labelled "Total Debt (excl. Lease Obligations)" and FMP's
@@ -8254,9 +8258,29 @@ async def refresh_valuation_inputs(
                 # USD). Left NULL otherwise: there is no FX provider to fetch
                 # a real rate from, so a trader supplying one by hand is
                 # required, not assumed.
-                "statement_currency": fundamentals.currency,
+                # The statements' own reportedCurrency where the provider
+                # gave one, because the profile's currency is the QUOTE
+                # currency and for an ADR the two differ. TSM lists in USD
+                # and files in TWD; reading the profile made the DCF treat
+                # TWD cash flows as dollars and value it at roughly 32x.
+                #
+                # Falls back to the profile currency when reportedCurrency
+                # is absent, which is exactly today's behaviour. That
+                # fallback changes the outcome in one case only, and it is
+                # worth having for it: a holding QUOTED in a non-USD currency
+                # whose statements did not say. Without the fallback the
+                # `or "USD"` below would read that as a USD filer and pin the
+                # rate at 1.0; with it, the quote currency stands in, the
+                # rate goes NULL, and the model declines rather than treating
+                # HKD as dollars.
+                #
+                # Note what the fallback does NOT do: it cannot blank the
+                # book. `or "USD"` means an unknown currency already resolves
+                # to 1.0 for a USD-quoted holding, so a missing field costs
+                # one ADR, never every holding.
+                "statement_currency": statement_ccy,
                 "statement_exchange_rate": (
-                    1.0 if (fundamentals.currency or "USD").upper() == "USD" else None
+                    1.0 if (statement_ccy or "USD").upper() == "USD" else None
                 ),
                 "source": (estimate.source if estimate else "fmp")[:24],
                 "updated_at": now,

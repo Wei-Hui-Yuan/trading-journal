@@ -641,3 +641,69 @@ def test_only_the_stable_api_is_used():
     """FMP's v3 endpoints are retired and answer 403 for this key."""
     assert md.BASE_URL.endswith("/stable")
     assert "/api/v3" not in md.BASE_URL
+
+
+# ---------------------------------------------------------------------------
+# Filing currency vs quote currency
+# ---------------------------------------------------------------------------
+
+
+def test_the_filing_currency_is_read_off_the_statements():
+    """TSM lists in USD and files in TWD, and the DCF needs the second.
+
+    `Fundamentals.currency` is the PROFILE's currency -- the price quote,
+    which for an ADR is USD whatever the company files in. Reading that as
+    the statement currency made the valuation treat TWD cash flows as
+    dollars and report an intrinsic value roughly 32x too high (17,017
+    against a share price of 417).
+
+    `reportedCurrency` rides on the statement responses already being
+    fetched, so this costs no extra call.
+    """
+    result = fundamentals(
+        bodies={
+            "profile": [PROFILE],
+            "cash-flow-statement": [{**CASH_FLOW, "reportedCurrency": "TWD"}],
+            "balance-sheet-statement": [{**BALANCE, "reportedCurrency": "TWD"}],
+        }
+    )
+
+    # The quote stays USD -- that part was never wrong.
+    assert result.currency == "USD"
+    # The filing currency is now its own answer.
+    assert result.statement_currency == "TWD"
+
+
+def test_a_domestic_filer_reports_the_same_currency_twice():
+    """The common case, and proof the split did not break it."""
+    result = fundamentals(
+        bodies={
+            "profile": [PROFILE],
+            "cash-flow-statement": [{**CASH_FLOW, "reportedCurrency": "USD"}],
+            "balance-sheet-statement": [{**BALANCE, "reportedCurrency": "USD"}],
+        }
+    )
+
+    assert result.currency == "USD"
+    assert result.statement_currency == "USD"
+
+
+def test_an_absent_reported_currency_is_none_rather_than_guessed():
+    """This module does not guess; the caller decides.
+
+    There is no FMP key outside the deployed environment, so whether every
+    statement response really carries `reportedCurrency` could not be
+    confirmed before shipping. Returning None here keeps that uncertainty
+    visible at the boundary instead of laundering it into a claim -- main.py
+    is where the fallback to the profile currency lives, and it says why.
+    """
+    result = fundamentals(
+        bodies={
+            "profile": [PROFILE],
+            "cash-flow-statement": [CASH_FLOW],
+            "balance-sheet-statement": [BALANCE],
+        }
+    )
+
+    assert result.statement_currency is None
+    assert result.currency == "USD"

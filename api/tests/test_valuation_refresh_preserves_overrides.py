@@ -50,7 +50,9 @@ class FakeFundamentals:
     """What market_data.fetch_fundamentals returns, in the fields read."""
 
     country = "US"
+    # The quote currency and the filing currency, which differ for an ADR.
     currency = "USD"
+    statement_currency = "USD"
     free_cash_flow_m = 70_000.0
     shares_outstanding_m = 7_400.0
     total_debt_ex_leases_m = 45_000.0
@@ -300,3 +302,112 @@ def test_a_foreign_filer_awaiting_a_manual_rate_is_not_re_fetched_forever(monkey
 
     assert result["refreshed"] == 0
     assert result["skipped"] == 1
+
+
+def written_values(session) -> dict:
+    """The bound parameters of the auto-row upsert."""
+    for stmt in session.statements:
+        if type(stmt).__name__ != "Insert":
+            continue
+        params = stmt.compile().params
+        if params.get("variant") == main.VARIANT_AUTO:
+            return params
+    raise AssertionError("the refresh wrote no auto row")
+
+
+def run_refresh_with_currency(monkeypatch, statement_currency, quote_currency="USD"):
+    """One refresh where the provider reports these two currencies."""
+
+    class Fundamentals(FakeFundamentals):
+        pass
+
+    Fundamentals.currency = quote_currency
+    Fundamentals.statement_currency = statement_currency
+
+    async def go():
+        session = RecordingSession([FakeHolding()])
+
+        from services import growth as growth_service
+        from services import market_data
+
+        async def fake_growth_many(tickers):
+            return {}
+
+        async def fake_fundamentals(ticker, client=None):
+            return Fundamentals()
+
+        monkeypatch.setattr(growth_service, "fetch_growth_many", fake_growth_many)
+        monkeypatch.setattr(market_data, "fetch_fundamentals", fake_fundamentals)
+        monkeypatch.setattr(market_data, "region_for", lambda *a, **k: "US")
+
+        await main.refresh_valuation_inputs(session=session)
+        return session
+
+    return asyncio.run(go())
+
+
+def test_a_foreign_filer_listed_in_usd_declines_to_value(monkeypatch):
+    """TSM: quoted in USD on the NYSE, filed in TWD.
+
+    The profile says USD and the statements say TWD. Taking the profile made
+    the DCF read TWD cash flows as dollars and report an intrinsic value
+    roughly 32x too high -- 17,017 against a share price of 417 -- which is
+    the exact conflation migration 037 was written to prevent and did not,
+    because it was reading the wrong field.
+
+    A NULL rate is the correct outcome: there is no FX provider here, so the
+    trader supplies the rate and the model stays silent until they do.
+    """
+    values = written_values(
+        run_refresh_with_currency(monkeypatch, statement_currency="TWD")
+    )
+
+    assert values["statement_currency"] == "TWD"
+    assert values["statement_exchange_rate"] is None
+
+
+def test_a_usd_filer_is_valued_as_before(monkeypatch):
+    values = written_values(
+        run_refresh_with_currency(monkeypatch, statement_currency="USD")
+    )
+
+    assert values["statement_currency"] == "USD"
+    assert values["statement_exchange_rate"] == 1.0
+
+
+def test_a_non_usd_quote_with_no_reported_currency_declines_to_value(monkeypatch):
+    """The one case the profile-currency fallback actually decides.
+
+    Written after a mutation exposed the first version of this test as
+    worthless: it asserted the fallback prevented "blanking the book", which
+    removing the fallback did not change, because `or "USD"` already resolves
+    an unknown currency to 1.0. The fallback's real and only effect is here --
+    a holding quoted in HKD whose statements did not report a currency. With
+    it the rate goes NULL and the model stays silent; without it the holding
+    is pinned at 1.0 and HKD is read as dollars.
+    """
+    values = written_values(
+        run_refresh_with_currency(
+            monkeypatch, statement_currency=None, quote_currency="HKD"
+        )
+    )
+
+    assert values["statement_exchange_rate"] is None
+
+
+def test_a_missing_reported_currency_cannot_blank_a_usd_quoted_holding(monkeypatch):
+    """The safety property, correctly attributed.
+
+    There is no FMP key outside the deployed environment, so whether every
+    statement response carries reportedCurrency could not be confirmed before
+    shipping. What guarantees a missing field is survivable is not the
+    fallback but the `or "USD"` default on the rate: a USD-quoted holding
+    still resolves to 1.0 and keeps its valuation.
+    """
+    values = written_values(
+        run_refresh_with_currency(
+            monkeypatch, statement_currency=None, quote_currency="USD"
+        )
+    )
+
+    assert values["statement_exchange_rate"] == 1.0
