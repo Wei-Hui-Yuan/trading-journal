@@ -220,7 +220,7 @@ export const ValuationModal: React.FC<{
 
         {/* ---------------- fetched vs yours ---------------- */}
         <div className="px-5 py-4">
-          <div className="mb-2 grid grid-cols-[1fr,120px,140px] gap-3 text-[10px] uppercase tracking-wide text-obsidian-muted">
+          <div className="mb-2 grid grid-cols-[1fr_110px_130px] gap-3 text-[10px] uppercase tracking-wide text-obsidian-muted">
             <span>Input</span>
             <span className="text-right">
               Fetched
@@ -241,7 +241,7 @@ export const ValuationModal: React.FC<{
               return (
                 <div
                   key={field.key}
-                  className="grid grid-cols-[1fr,120px,140px] items-center gap-3"
+                  className="grid grid-cols-[1fr_110px_130px] items-center gap-3"
                 >
                   <div>
                     <div className="text-[11px] text-slate-300">{field.label}</div>
