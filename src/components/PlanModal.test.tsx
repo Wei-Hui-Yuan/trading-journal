@@ -715,3 +715,59 @@ describe('closing', () => {
 function mockAccountSize(accountSize: number) {
   mocked.getSettings.mockResolvedValue({ ...SETTINGS, account_size: accountSize });
 }
+
+describe('the per-trade risk %, derived rather than seeded', () => {
+  /** The risk field, by the placeholder only it carries. */
+  const riskField = () => screen.getByPlaceholderText('1');
+
+  it('shows the account default when the plan carries none', async () => {
+    mocked.getSettings.mockResolvedValue({ ...SETTINGS, risk_percent: 1.5 });
+    mountModal();
+    await ready();
+
+    await waitFor(() => expect(riskField()).toHaveValue(1.5));
+  });
+
+  it("keeps an existing plan's own risk % instead of the default", async () => {
+    // A plan that recorded 0.5% was sized deliberately small. The account
+    // default must not overwrite that on open.
+    mocked.getSettings.mockResolvedValue({ ...SETTINGS, risk_percent: 1.5 });
+    mountModal({ plan: plan({ risk_percent: 0.5 }) });
+    await ready();
+
+    await waitFor(() => expect(riskField()).toHaveValue(0.5));
+  });
+
+  it('lets a typed value survive settings arriving late', async () => {
+    // The race the deleted effect existed to guard against: settings resolve
+    // after typing has started, and refilling would discard the keystroke.
+    // Deriving from an override needs no guard -- a typed value already
+    // outranks the default.
+    let resolveSettings!: (s: unknown) => void;
+    mocked.getSettings.mockReturnValue(
+      new Promise((r) => {
+        resolveSettings = r as (s: unknown) => void;
+      })
+    );
+    mountModal();
+    await screen.findByText('Ticker');
+
+    fireEvent.change(riskField(), { target: { value: '0.25' } });
+    resolveSettings({ ...SETTINGS, risk_percent: 1.5 });
+
+    await waitFor(() => expect(riskField()).toHaveValue(0.25));
+  });
+
+  it('leaves the field empty when cleared, rather than refilling it', async () => {
+    // An effect that fills '' from the default cannot tell "not set yet"
+    // from "deliberately cleared". An override can.
+    mocked.getSettings.mockResolvedValue({ ...SETTINGS, risk_percent: 1.5 });
+    mountModal();
+    await ready();
+    await waitFor(() => expect(riskField()).toHaveValue(1.5));
+
+    fireEvent.change(riskField(), { target: { value: '' } });
+
+    expect(riskField()).toHaveValue(null);
+  });
+});

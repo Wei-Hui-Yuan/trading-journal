@@ -53,14 +53,6 @@ interface FormState {
   strategyId: string; // '' means none chosen
   thesis: string;
   /**
-   * Risk for THIS trade, seeded from the saved default but editable — a
-   * lower-conviction setup gets sized smaller without changing the default.
-   *
-   * Account size is deliberately absent: it belongs to the account, not to a
-   * trade, so it is read from Settings rather than retyped here.
-   */
-  riskPercent: string;
-  /**
    * Pre-trade checklist answers, keyed by discipline id. Every rule visible
    * when the plan is saved gets a real entry here (unticked -> false) --
    * see handleSubmit, and the same "an unticked box is a real answer"
@@ -93,16 +85,15 @@ const blankForm = (): FormState => ({
   takeProfitPrice: '',
   strategyId: '',
   thesis: '',
-  riskPercent: '',
   disciplinesChecked: {},
 });
 
 /**
  * An existing plan's fields, back into the string-held form shape.
  *
- * `riskPercent` is left '' when the plan never had one -- the settings-seed
- * effect below fills that in from the account default, same as a fresh plan,
- * rather than this function guessing at a number the plan does not carry.
+ * Risk % is NOT here: it lives in its own `riskOverride` state so that "the
+ * plan did not carry one" can fall through to the account default without an
+ * effect having to notice and fill it in. See the declaration below.
  */
 const formFrom = (plan: TradePlan): FormState => ({
   symbol: plan.ticker,
@@ -113,7 +104,6 @@ const formFrom = (plan: TradePlan): FormState => ({
   takeProfitPrice: plan.take_profit === null ? '' : String(plan.take_profit),
   strategyId: plan.strategy_id ?? '',
   thesis: plan.thesis ?? '',
-  riskPercent: plan.risk_percent === null ? '' : String(plan.risk_percent),
   disciplinesChecked: Object.fromEntries(
     plan.disciplines.map((d) => [d.discipline_id, d.followed])
   ),
@@ -147,6 +137,22 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   const isEdit = Boolean(plan);
 
   const [form, setForm] = useState<FormState>(blankForm);
+  /**
+   * Risk for THIS trade -- a lower-conviction setup gets sized smaller
+   * without changing the account default.
+   *
+   * Held as an override rather than as form state seeded by an effect. The
+   * effect version had to guard against clobbering a value typed while
+   * settings were still in flight, and it tripped
+   * `react-hooks/set-state-in-effect` for the cascading-render reason that
+   * rule exists. Null means "nobody has chosen", which reads as the account
+   * default the moment one is known; any typed value, including an empty
+   * string, wins from then on. Same shape as SizingScratchpad's.
+   *
+   * Account size is deliberately not here: it belongs to the account, not to
+   * a trade, so it is read from Settings rather than retyped per plan.
+   */
+  const [riskOverride, setRiskOverride] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
@@ -201,6 +207,13 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   useEffect(() => {
     if (open) {
       setForm(plan ? formFrom(plan) : blankForm());
+      // A plan that carried its own risk % keeps it; one that did not falls
+      // through to the account default below, rather than being filled in.
+      setRiskOverride(
+        plan?.risk_percent === null || plan?.risk_percent === undefined
+          ? null
+          : String(plan.risk_percent)
+      );
       setError(null);
       setSavedSummary(null);
       // Or the previous plan's screenshot would be attached to the next one.
@@ -214,20 +227,6 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, plan?.id]);
-
-  // Seed the per-trade risk from the saved default once settings arrive.
-  // Guarded on the field being untouched, because settings can resolve after
-  // the user has started typing and overwriting mid-keystroke would be worse
-  // than not prefilling. Runs in edit mode too: a plan saved before it had a
-  // risk % still deserves the account default rather than staying blank.
-  useEffect(() => {
-    if (!open || !settings) return;
-    setForm((prev) =>
-      prev.riskPercent === ''
-        ? { ...prev, riskPercent: String(settings.risk_percent) }
-        : prev
-    );
-  }, [open, settings]);
 
   const isSaving = createMutation.isPending || updateMutation.isPending;
 
@@ -245,15 +244,18 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   // could disagree with the first, and you would size against one while
   // recording the other.
   const accountSize = settings?.account_size ?? null;
+  // Null override reads as the account default the moment settings land.
+  const riskPercentText =
+    riskOverride ?? (settings ? String(settings.risk_percent) : '');
   const sizingInputs = useMemo(
     () => ({
       side: form.side,
       entry: toNullableNumber(form.plannedEntry),
       stop: toNullableNumber(form.plannedStopLoss),
       accountSize,
-      riskPercent: toNullableNumber(form.riskPercent),
+      riskPercent: toNullableNumber(riskPercentText),
     }),
-    [form.side, form.plannedEntry, form.plannedStopLoss, accountSize, form.riskPercent]
+    [form.side, form.plannedEntry, form.plannedStopLoss, accountSize, riskPercentText]
   );
   const sizing = useMemo(() => computeSizing(sizingInputs), [sizingInputs]);
   const hint = useMemo(() => sizingHint(sizingInputs), [sizingInputs]);
@@ -680,8 +682,12 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                   inputMode="decimal"
                   step="0.01"
                   min="0"
-                  value={form.riskPercent}
-                  onChange={(e) => patch({ riskPercent: e.target.value })}
+                  value={riskPercentText}
+                  onChange={(e) => {
+                    setRiskOverride(e.target.value);
+                    setError(null);
+                    setSavedSummary(null);
+                  }}
                   disabled={isSaving}
                   placeholder="1"
                   className={`mt-1 font-mono text-xs ${fieldClass}`}
