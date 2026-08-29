@@ -276,3 +276,142 @@ export function sizingHint({ side, entry, stop }: SizingInputs): string | null {
   }
   return null;
 }
+
+export interface ExitTranche {
+  /** Share of the position taken off here, 0–100. */
+  percent: number;
+  /** The price this slice exits at. Free-form, not a rung of the ladder. */
+  price: number;
+}
+
+export interface ScaledExitLeg extends ExitTranche {
+  /**
+   * Whole shares this leg sells. Floored, and null when the position is
+   * unsized — you cannot sell a third of a share, and pretending otherwise
+   * is what makes a three-way split of five shares look workable.
+   */
+  shares: number | null;
+  rMultiple: number;
+  profit: number | null;
+  isBackwards: boolean;
+}
+
+export interface ScaledExitPlan {
+  legs: ScaledExitLeg[];
+  /**
+   * Weighted average R across the ALLOCATED portion, normalised to it.
+   *
+   * "Of what you have planned, the average exit is 1.75R." Deliberately not
+   * spread over the whole position: a plan covering 80% with a runner left
+   * over would otherwise report 1.4R, which is neither the average exit nor
+   * what the position makes, and reads as though the runner scored zero.
+   * `unallocatedPercent` carries the rest of the story.
+   */
+  blendedR: number | null;
+  /** Dollars from the allocated legs. Null when the position is unsized. */
+  totalProfit: number | null;
+  /** How much of the position has been given an exit. */
+  allocatedPercent: number;
+  /** The remainder — a runner, or simply undecided. Never assumed to be either. */
+  unallocatedPercent: number;
+  /**
+   * Shares left over after every leg is floored, plus the unallocated slice.
+   * Null when unsized. Surfaced because flooring silently strands shares on
+   * a small position: three even legs of 5 shares sell 1 each and leave 2.
+   */
+  residualShares: number | null;
+  /** True when any leg is allocated shares it cannot fill. */
+  hasEmptyLeg: boolean;
+}
+
+/**
+ * Score a staged exit — several slices out at prices of the trader's own
+ * choosing, rather than one target.
+ *
+ * The R ladder answers "where is 2R?" and `scoreTakeProfit` answers "what is
+ * 25 worth?". Neither can answer the question a position is actually managed
+ * by, which is "half off at 160, a quarter at 175, let the rest run" — and
+ * the blended result is not something the other two can be eyeballed into.
+ *
+ * Every leg is scored through `scoreTakeProfit`, so a single exit and one
+ * leg of a staged exit are priced by identical arithmetic.
+ *
+ * Returns null only when the inputs cannot support any answer. A plan with
+ * no legs is empty, not an error.
+ */
+export function planScaledExit({
+  side,
+  entry,
+  riskPerShare,
+  shares,
+  tranches,
+}: {
+  side: Side;
+  entry: number;
+  riskPerShare: number;
+  shares: number | null;
+  tranches: ExitTranche[];
+}): ScaledExitPlan | null {
+  if (!Number.isFinite(entry) || entry <= 0) return null;
+  if (!Number.isFinite(riskPerShare) || riskPerShare <= 0) return null;
+
+  const legs: ScaledExitLeg[] = [];
+  for (const tranche of tranches) {
+    const { percent, price } = tranche;
+    if (!Number.isFinite(percent) || percent <= 0) continue;
+    if (!Number.isFinite(price) || price <= 0) continue;
+
+    // Floored per leg, never rounded — the same direction computeSizing errs
+    // in. Rounding up would sell shares the position does not hold.
+    const legShares =
+      shares === null ? null : Math.floor((shares * percent) / 100);
+    // scoreTakeProfit returns null only for a non-finite/non-positive entry,
+    // takeProfit or riskPerShare. All three are already guaranteed positive
+    // and finite here -- entry and riskPerShare by the checks at the top of
+    // this function, price by the `continue` just above -- so this call
+    // cannot return null. The assertion documents that invariant rather than
+    // bypassing a real one; a runtime `if (score === null) continue` here
+    // would be dead code no test could honestly reach.
+    const score = scoreTakeProfit({
+      side,
+      entry,
+      takeProfit: price,
+      riskPerShare,
+      shares: legShares,
+    })!;
+
+    legs.push({
+      percent,
+      price,
+      shares: legShares,
+      rMultiple: score.rMultiple,
+      profit: score.profit,
+      isBackwards: score.isBackwards,
+    });
+  }
+
+  const allocatedPercent = legs.reduce((sum, leg) => sum + leg.percent, 0);
+  const blendedR =
+    allocatedPercent > 0
+      ? legs.reduce((sum, leg) => sum + leg.percent * leg.rMultiple, 0) /
+        allocatedPercent
+      : null;
+
+  const soldShares = legs.reduce((sum, leg) => sum + (leg.shares ?? 0), 0);
+  const totalProfit =
+    shares === null || legs.some((leg) => leg.profit === null)
+      ? null
+      : legs.reduce((sum, leg) => sum + (leg.profit as number), 0);
+
+  return {
+    legs,
+    blendedR,
+    totalProfit,
+    allocatedPercent,
+    // Clamped: over-allocating is caught by the caller as the input error it
+    // is, and a negative remainder would render as a nonsense figure.
+    unallocatedPercent: Math.max(0, 100 - allocatedPercent),
+    residualShares: shares === null ? null : shares - soldShares,
+    hasEmptyLeg: legs.some((leg) => leg.shares === 0),
+  };
+}

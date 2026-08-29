@@ -300,3 +300,108 @@ describe('a saved note', () => {
     expect(await screen.findByText('$50.00')).toBeInTheDocument();
   });
 });
+
+describe('the scaled exit planner', () => {
+  /** Get the quick-add form into a state where sizing exists. */
+  async function sized(qty = '100') {
+    renderPad();
+    await waitFor(() => expect(screen.getByLabelText(/Risk percent/i)).toHaveValue(1));
+    fireEvent.change(field('Entry'), { target: { value: '100' } });
+    fireEvent.change(field('Stop'), { target: { value: '95' } });
+    fireEvent.change(field('Shares'), { target: { value: qty } });
+    await screen.findByText('Scaled exit');
+  }
+
+  it('appears once there is something to scale out of', async () => {
+    await sized();
+
+    expect(screen.getByText('Scaled exit')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Add a slice/ })).toBeInTheDocument();
+  });
+
+  it('blends two slices into one average, in R and dollars', async () => {
+    // 50% out at 105 is 1R, 50% at 115 is 3R. Blended 2R, and on 100 shares
+    // that is 50x$5 + 50x$15 = $1,000.
+    await sized();
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    fireEvent.change(screen.getByLabelText('Percent out, slice 1'), {
+      target: { value: '50' },
+    });
+    fireEvent.change(screen.getByLabelText('Exit price, slice 1'), {
+      target: { value: '105' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    fireEvent.change(screen.getByLabelText('Percent out, slice 2'), {
+      target: { value: '50' },
+    });
+    fireEvent.change(screen.getByLabelText('Exit price, slice 2'), {
+      target: { value: '115' },
+    });
+
+    expect(await screen.findByText('2.00R')).toBeInTheDocument();
+    expect(screen.getByText(/\$1,000\.00/)).toBeInTheDocument();
+    expect(screen.getByText(/across 100% of the position/)).toBeInTheDocument();
+  });
+
+  it('says how much is still running when the plan does not cover it all', async () => {
+    // Without this the blended figure reads as the whole position's outcome.
+    await sized();
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    fireEvent.change(screen.getByLabelText('Percent out, slice 1'), {
+      target: { value: '60' },
+    });
+    fireEvent.change(screen.getByLabelText('Exit price, slice 1'), {
+      target: { value: '110' },
+    });
+
+    expect(await screen.findByText(/40% still running/)).toBeInTheDocument();
+  });
+
+  it('refuses to let a plan sell more than the position holds', async () => {
+    await sized();
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    fireEvent.change(screen.getByLabelText('Percent out, slice 1'), {
+      target: { value: '130' },
+    });
+    fireEvent.change(screen.getByLabelText('Exit price, slice 1'), {
+      target: { value: '110' },
+    });
+
+    expect(
+      await screen.findByText(/130% of a position you only hold 100% of/)
+    ).toBeInTheDocument();
+  });
+
+  it('warns when a slice is too small to sell a whole share', async () => {
+    // The case a small account actually hits: 10% of 2 shares is 0.2, which
+    // sells nothing, yet still counts towards the blend.
+    await sized('2');
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    fireEvent.change(screen.getByLabelText('Percent out, slice 1'), {
+      target: { value: '10' },
+    });
+    fireEvent.change(screen.getByLabelText('Exit price, slice 1'), {
+      target: { value: '110' },
+    });
+
+    expect(
+      await screen.findByText(/sells no whole shares at 2 shares/)
+    ).toBeInTheDocument();
+  });
+
+  it('removes a slice', async () => {
+    await sized();
+
+    fireEvent.click(screen.getByRole('button', { name: /Add a slice/ }));
+    expect(screen.getByLabelText('Percent out, slice 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove slice 1' }));
+
+    expect(screen.queryByLabelText('Percent out, slice 1')).not.toBeInTheDocument();
+  });
+});

@@ -14,6 +14,7 @@ import {
   R_LADDER,
   breakevenWinRate,
   computePlannedRisk,
+  planScaledExit,
   computeSizing,
   scoreTakeProfit,
   sizingHint,
@@ -362,5 +363,204 @@ describe('sizingHint', () => {
       expect(computeSizing(inputs)).toBeNull();
       expect(sizingHint(inputs)).not.toBeNull();
     }
+  });
+});
+
+describe('planScaledExit', () => {
+  const base = { side: 'BUY' as const, entry: 100, riskPerShare: 5, shares: 100 };
+
+  it('blends the R of every slice by its weight', () => {
+    // Half off at 1R, a third at 2R, the rest at 4R.
+    // (50x1 + 30x2 + 20x4) / 100 = 1.9
+    const plan = planScaledExit({
+      ...base,
+      tranches: [
+        { percent: 50, price: 105 },
+        { percent: 30, price: 110 },
+        { percent: 20, price: 120 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.rMultiple)).toEqual([1, 2, 4]);
+    expect(plan.blendedR!).toBeCloseTo(1.9, 10);
+    expect(plan.allocatedPercent).toBe(100);
+    expect(plan.unallocatedPercent).toBe(0);
+  });
+
+  it('normalises the blend to what is allocated, not the whole position', () => {
+    // 60% at 2R with a runner left over. The average EXIT is 2R; spreading
+    // it over the whole position would report 1.2R, which is neither the
+    // average exit nor what the position makes, and reads as though the
+    // runner scored zero.
+    const plan = planScaledExit({
+      ...base,
+      tranches: [{ percent: 60, price: 110 }],
+    })!;
+
+    expect(plan.blendedR!).toBeCloseTo(2, 10);
+    expect(plan.allocatedPercent).toBe(60);
+    expect(plan.unallocatedPercent).toBe(40);
+  });
+
+  it('sums dollars only over the shares actually sold', () => {
+    // 50 shares at +$5, 50 at +$10.
+    const plan = planScaledExit({
+      ...base,
+      tranches: [
+        { percent: 50, price: 105 },
+        { percent: 50, price: 110 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.shares)).toEqual([50, 50]);
+    expect(plan.totalProfit).toBe(50 * 5 + 50 * 10);
+    expect(plan.residualShares).toBe(0);
+  });
+
+  it('floors each leg rather than selling shares the position lacks', () => {
+    // Five shares split three ways is 1.67 each. Rounding up sells six.
+    const plan = planScaledExit({
+      ...base,
+      shares: 5,
+      tranches: [
+        { percent: 34, price: 105 },
+        { percent: 33, price: 110 },
+        { percent: 33, price: 115 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.shares)).toEqual([1, 1, 1]);
+    // Two shares stranded by the flooring, which is the point of reporting it.
+    expect(plan.residualShares).toBe(2);
+  });
+
+  it('flags a leg too small to fill a single share', () => {
+    // A 10% slice of two shares is 0.2, which sells nothing. The blend still
+    // counts it, so without this flag the plan reads as achievable.
+    const plan = planScaledExit({
+      ...base,
+      shares: 2,
+      tranches: [
+        { percent: 90, price: 105 },
+        { percent: 10, price: 120 },
+      ],
+    })!;
+
+    expect(plan.hasEmptyLeg).toBe(true);
+    expect(plan.legs[1].shares).toBe(0);
+  });
+
+  it('does not flag empty legs on a position that fills them all', () => {
+    const plan = planScaledExit({
+      ...base,
+      tranches: [
+        { percent: 50, price: 105 },
+        { percent: 50, price: 110 },
+      ],
+    })!;
+
+    expect(plan.hasEmptyLeg).toBe(false);
+  });
+
+  it('carries a backwards slice as backwards rather than dropping it', () => {
+    // A long taking profit below entry is a typo, and silently discarding
+    // the leg would make the blend look better than the plan actually is.
+    const plan = planScaledExit({
+      ...base,
+      tranches: [
+        { percent: 50, price: 110 },
+        { percent: 50, price: 95 },
+      ],
+    })!;
+
+    expect(plan.legs[1].isBackwards).toBe(true);
+    expect(plan.legs[1].rMultiple).toBeLessThan(0);
+    // (50x2 + 50x-1) / 100 = 0.5
+    expect(plan.blendedR!).toBeCloseTo(0.5, 10);
+  });
+
+  it('reads a short in the direction it profits', () => {
+    const plan = planScaledExit({
+      ...base,
+      side: 'SELL',
+      tranches: [
+        { percent: 50, price: 95 },
+        { percent: 50, price: 90 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.rMultiple)).toEqual([1, 2]);
+    expect(plan.blendedR!).toBeCloseTo(1.5, 10);
+  });
+
+  it('still blends when the position is unsized', () => {
+    // Where the exits sit does not depend on how many shares are held.
+    const plan = planScaledExit({
+      ...base,
+      shares: null,
+      tranches: [
+        { percent: 50, price: 105 },
+        { percent: 50, price: 110 },
+      ],
+    })!;
+
+    expect(plan.blendedR!).toBeCloseTo(1.5, 10);
+    expect(plan.totalProfit).toBeNull();
+    expect(plan.residualShares).toBeNull();
+    expect(plan.legs.every((l) => l.shares === null)).toBe(true);
+  });
+
+  it.each([
+    ['a zero percent', { percent: 0, price: 105 }],
+    ['a negative percent', { percent: -10, price: 105 }],
+    ['a zero price', { percent: 50, price: 0 }],
+    ['a NaN price', { percent: 50, price: Number.NaN }],
+  ])('skips %s rather than scoring it', (_label, bad) => {
+    const plan = planScaledExit({
+      ...base,
+      tranches: [{ percent: 50, price: 110 }, bad],
+    })!;
+
+    expect(plan.legs).toHaveLength(1);
+    expect(plan.allocatedPercent).toBe(50);
+  });
+
+  it('returns an empty plan, not null, when nothing is allocated', () => {
+    // No legs is a plan not yet made, which is different from inputs that
+    // cannot be scored at all.
+    const plan = planScaledExit({ ...base, tranches: [] })!;
+
+    expect(plan.legs).toEqual([]);
+    expect(plan.blendedR).toBeNull();
+    expect(plan.unallocatedPercent).toBe(100);
+  });
+
+  it('never reports a negative remainder when over-allocated', () => {
+    // 130% is an input error the caller surfaces; a -30% remainder would
+    // render as a nonsense figure beside it.
+    const plan = planScaledExit({
+      ...base,
+      tranches: [
+        { percent: 80, price: 105 },
+        { percent: 50, price: 110 },
+      ],
+    })!;
+
+    expect(plan.allocatedPercent).toBe(130);
+    expect(plan.unallocatedPercent).toBe(0);
+  });
+
+  it.each([
+    ['a zero risk per share', { riskPerShare: 0 }],
+    ['a zero entry', { entry: 0 }],
+    ['a NaN entry', { entry: Number.NaN }],
+  ])('returns null for %s', (_label, override) => {
+    expect(
+      planScaledExit({
+        ...base,
+        ...override,
+        tranches: [{ percent: 50, price: 110 }],
+      })
+    ).toBeNull();
   });
 });

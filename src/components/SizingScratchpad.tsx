@@ -20,12 +20,14 @@ import {
 } from '@/hooks/useSizingScratchpad';
 import { useSettings } from '@/hooks/useTradeInbox';
 import { BreakevenCheck } from '@/components/BreakevenCheck';
+import { ScaledExitPlanner } from '@/components/ScaledExitPlanner';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
 import {
   computeSizing,
   scoreTakeProfit,
   sizingHint,
+  type ExitTranche,
   type Side,
 } from '@/lib/positionSizing';
 import type { SizingScratchpadEntry } from '@/types/sizing';
@@ -435,6 +437,15 @@ export const SizingScratchpad: React.FC = () => {
    * claim about conviction it was never asked for.
    */
   const [riskOverride, setRiskOverride] = useState<string | null>(null);
+  /**
+   * Slices of a staged exit, at prices the trader picks.
+   *
+   * Client-only like the risk % beside it. The scratchpad table records what
+   * a trade might cost; how it would be managed on the way out is a thought
+   * about that trade, not part of the record, and giving it a column would
+   * make every note carry a plan it was never asked for.
+   */
+  const [tranches, setTranches] = useState<ExitTranche[]>([]);
   const riskPercentText =
     riskOverride ?? (settings ? String(settings.risk_percent) : '');
 
@@ -739,6 +750,22 @@ export const SizingScratchpad: React.FC = () => {
             {tpScore !== null && !tpScore.isBackwards && (
               <div className="mt-2.5">
                 <BreakevenCheck rMultiple={tpScore.rMultiple} />
+              </div>
+            )}
+
+            {/* Below the single-target scorecard, because it answers the
+                question you reach only after that one: not "what is this
+                target worth" but "what does the whole way out average". */}
+            {sizing !== null && entryNum !== null && (
+              <div className="mt-2.5">
+                <ScaledExitPlanner
+                  side={draft.side}
+                  entry={entryNum}
+                  riskPerShare={sizing.riskPerShare}
+                  shares={qtyNum ?? sizing.wholeShares}
+                  tranches={tranches}
+                  onChange={setTranches}
+                />
               </div>
             )}
           </div>
