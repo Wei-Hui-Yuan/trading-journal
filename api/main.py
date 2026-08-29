@@ -8233,9 +8233,31 @@ async def refresh_valuation_inputs(
                 fundamentals.country or holding.country, fundamentals.currency
             )
 
-            # See the statement_currency entry below for why this is not
-            # fundamentals.currency.
-            statement_ccy = fundamentals.statement_currency or fundamentals.currency
+            # The filing currency, and it is allowed to be unknown.
+            #
+            # `reportedCurrency` when the statements carried one. When they
+            # did not, the profile currency is only trustworthy for a
+            # US-domiciled company, which files in USD by definition. For
+            # anything else "unknown" is the honest answer and the DCF
+            # declines rather than guessing.
+            #
+            # The gap this closes: FMP returns NO statements at all for a
+            # foreign private issuer -- ASML files a 20-F, see
+            # market_data.py's module docstring -- so there is no
+            # reportedCurrency to read, and taking the profile's USD pinned
+            # the rate at 1.0 and read ASML's EUR figures as dollars. TSM was
+            # caught because its statements arrived and said TWD; ASML was
+            # not, because nothing arrived at all. Same conflation, different
+            # route in.
+            filer_country = (
+                fundamentals.country or holding.country or ""
+            ).strip().upper()
+            files_in_usd_by_domicile = filer_country in {
+                "US", "USA", "UNITED STATES",
+            }
+            statement_ccy = fundamentals.statement_currency or (
+                fundamentals.currency if files_in_usd_by_domicile else None
+            )
 
             values = {
                 # The workbook's definition, not FMP's headline: its input is
@@ -8279,8 +8301,15 @@ async def refresh_valuation_inputs(
                 # to 1.0 for a USD-quoted holding, so a missing field costs
                 # one ADR, never every holding.
                 "statement_currency": statement_ccy,
+                # No `or "USD"` here any more. That default was what turned
+                # "we do not know" into "it is dollars" -- silently, and for
+                # exactly the foreign holdings where it is most likely to be
+                # wrong. Unknown now means NULL, which means _value_holding
+                # declines and the modal asks for the rate.
                 "statement_exchange_rate": (
-                    1.0 if (statement_ccy or "USD").upper() == "USD" else None
+                    1.0
+                    if statement_ccy and statement_ccy.upper() == "USD"
+                    else None
                 ),
                 "source": (estimate.source if estimate else "fmp")[:24],
                 "updated_at": now,

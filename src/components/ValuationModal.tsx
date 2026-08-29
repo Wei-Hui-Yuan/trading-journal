@@ -255,6 +255,20 @@ export const ValuationModal: React.FC<{
                       <div className="text-[10px] text-amber-400/80">
                         Files in {auto.statement_currency} -- required to value this holding
                       </div>
+                    ) : /* The provider told us nothing. FMP returns no
+                          statements at all for a foreign private issuer, so
+                          there is no reported currency to name -- and
+                          assuming USD is what read ASML's EUR figures as
+                          dollars. Asked for rather than guessed. */
+                    field.key === 'statement_exchange_rate' &&
+                      auto !== null &&
+                      auto !== undefined &&
+                      !auto.statement_currency &&
+                      auto.statement_exchange_rate === null ? (
+                      <div className="text-[10px] text-amber-400/80">
+                        Filing currency unknown -- enter 1 USD in whatever
+                        currency this company reports in
+                      </div>
                     ) : (
                       field.hint && (
                         <div className="text-[10px] text-slate-600">{field.hint}</div>

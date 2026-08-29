@@ -411,3 +411,93 @@ def test_a_missing_reported_currency_cannot_blank_a_usd_quoted_holding(monkeypat
     )
 
     assert values["statement_exchange_rate"] == 1.0
+
+
+def run_refresh_for_filer(
+    monkeypatch, statement_currency, quote_currency="USD", country="US"
+):
+    """One refresh for a company with this domicile and these currencies."""
+
+    class Fundamentals(FakeFundamentals):
+        pass
+
+    Fundamentals.currency = quote_currency
+    Fundamentals.statement_currency = statement_currency
+    Fundamentals.country = country
+
+    async def go():
+        holding = FakeHolding()
+        holding.country = country
+        session = RecordingSession([holding])
+
+        from services import growth as growth_service
+        from services import market_data
+
+        async def fake_growth_many(tickers):
+            return {}
+
+        async def fake_fundamentals(ticker, client=None):
+            return Fundamentals()
+
+        monkeypatch.setattr(growth_service, "fetch_growth_many", fake_growth_many)
+        monkeypatch.setattr(market_data, "fetch_fundamentals", fake_fundamentals)
+        monkeypatch.setattr(market_data, "region_for", lambda *a, **k: "US")
+
+        await main.refresh_valuation_inputs(session=session)
+        return session
+
+    return asyncio.run(go())
+
+
+def test_a_foreign_filer_with_no_statements_asks_rather_than_assuming(monkeypatch):
+    """ASML: files a 20-F, so FMP returns no statements at all.
+
+    There is no reportedCurrency to read, and the profile says USD because
+    the ADR trades in USD. Taking that pinned the rate at 1.0 and read ASML's
+    EUR figures as dollars -- understating it by the whole EUR/USD factor
+    with no warning anywhere on screen.
+
+    TSM was caught because its statements arrived and said TWD. ASML was not,
+    because nothing arrived. Unknown is now recorded as unknown.
+    """
+    values = written_values(
+        run_refresh_for_filer(
+            monkeypatch, statement_currency=None, quote_currency="USD", country="NL"
+        )
+    )
+
+    assert values["statement_currency"] is None
+    assert values["statement_exchange_rate"] is None
+
+
+def test_a_us_filer_with_no_statements_is_still_valued(monkeypatch):
+    """A US company files in USD by definition, so the profile can stand in.
+
+    Without this the guardrail would blank most of the book: the Finnhub
+    branch supplies no reportedCurrency at all, and it is the fallback for
+    every domestic holding FMP declines to serve statements for.
+    """
+    values = written_values(
+        run_refresh_for_filer(
+            monkeypatch, statement_currency=None, quote_currency="USD", country="US"
+        )
+    )
+
+    assert values["statement_currency"] == "USD"
+    assert values["statement_exchange_rate"] == 1.0
+
+
+def test_reported_currency_still_wins_over_domicile(monkeypatch):
+    """A US-domiciled company that reports in another currency is believed.
+
+    The domicile rule is a fallback for silence, not an override of what the
+    statements actually said.
+    """
+    values = written_values(
+        run_refresh_for_filer(
+            monkeypatch, statement_currency="EUR", quote_currency="USD", country="US"
+        )
+    )
+
+    assert values["statement_currency"] == "EUR"
+    assert values["statement_exchange_rate"] is None
