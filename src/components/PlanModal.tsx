@@ -7,15 +7,14 @@ import { AlertCircle, Calculator, Check, ClipboardList, Loader2, X } from 'lucid
 
 import {
   useCreatePlan,
-  useDeletePlanChart,
   useDisciplines,
   useSettings,
   useStrategies,
   useUpdatePlan,
   useUploadPlanChart,
 } from '@/hooks/useTradeInbox';
-import { ChartDropzone, PlanChartView } from '@/components/PlanChart';
-import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { ChartDropzone } from '@/components/PlanChart';
+import { PlanChartManager } from '@/components/PlanChartManager';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
 import {
@@ -162,21 +161,14 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
   // populated in create mode -- see the module comment above.
   const [chart, setChart] = useState<CompressedChart | null>(null);
   const uploadChart = useUploadPlanChart();
-  // Edit mode only, below. The dropzone is reused as the "pick a
-  // replacement" picker, but the upload it produces is sent immediately on
-  // its own button rather than deferred to the form's Save Changes -- an
-  // existing plan already has an id, so there is no reason to hold it.
-  const [showChartPicker, setShowChartPicker] = useState(false);
-  const [chartError, setChartError] = useState<string | null>(null);
-  const [confirmingChartDelete, setConfirmingChartDelete] = useState(false);
   // Tracked locally rather than read off `plan.has_chart` directly. `plan` is
   // a snapshot the dock captured when Edit was clicked; a successful upload
-  // or delete inside this modal invalidates the dock's query, but that
-  // refetch does not reach back in and replace the prop this instance is
-  // still holding. Without this, the section would revert to "no chart" for
-  // the rest of the session even though the upload had already succeeded.
+  // or delete inside `PlanChartManager` invalidates the dock's query, but
+  // that refetch does not reach back in and replace the prop this instance
+  // is still holding. Without this, the section would revert to "no chart"
+  // for the rest of the session even though the upload had already
+  // succeeded. Passed to `PlanChartManager` as its controlled `hasChart`.
   const [hasChart, setHasChart] = useState(false);
-  const deleteChart = useDeletePlanChart();
   const symbolRef = useRef<HTMLInputElement>(null);
 
   const createMutation = useCreatePlan();
@@ -217,10 +209,10 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
       setError(null);
       setSavedSummary(null);
       // Or the previous plan's screenshot would be attached to the next one.
+      // PlanChartManager owns its own picker/error/confirm state and starts
+      // fresh on every mount, so only its two controlled inputs need
+      // resetting here.
       setChart(null);
-      setShowChartPicker(false);
-      setChartError(null);
-      setConfirmingChartDelete(false);
       setHasChart(plan?.has_chart ?? false);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
@@ -408,43 +400,6 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
       },
       onError: (err) => setError(err.message),
     });
-  };
-
-  // Edit mode: attach or replace the chart on its own, independent of the
-  // form's Save Changes. `useUploadPlanChart` is keyed by plan id and
-  // upserts in place server-side, so this never leaves an orphaned object in
-  // storage behind a replacement -- see services/storage.py's upload().
-  const saveChart = async () => {
-    if (!plan || !chart) return;
-    setChartError(null);
-    try {
-      await uploadChart.mutateAsync({
-        planId: plan.id,
-        image: chart.blob,
-        filename: `${plan.ticker}-chart.${chart.mime === 'image/webp' ? 'webp' : 'png'}`,
-      });
-      setChart(null);
-      setShowChartPicker(false);
-      setHasChart(true);
-    } catch (err) {
-      setChartError(err instanceof Error ? err.message : 'Upload failed.');
-    }
-  };
-
-  // The DELETE endpoint removes the object from storage before clearing the
-  // plan's chart columns -- confirmed here because that is real and
-  // irreversible, unlike replacing it.
-  const confirmDeleteChart = async () => {
-    if (!plan) return;
-    setChartError(null);
-    try {
-      await deleteChart.mutateAsync(plan.id);
-      setHasChart(false);
-    } catch (err) {
-      setChartError(err instanceof Error ? err.message : 'Could not remove the chart.');
-    } finally {
-      setConfirmingChartDelete(false);
-    }
   };
 
   const fieldClass =
@@ -824,95 +779,30 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 actually there is a picture, and reviewing the trade later
                 without it grades the sentence rather than the decision.
 
-                Managed independently of the rest of the form in edit mode --
-                replacing or removing the chart is its own action with its
-                own button, not something that waits on Save Changes. */}
+                Edit mode delegates entirely to PlanChartManager -- attaching,
+                replacing or removing is its own action there, independent of
+                Save Changes, the same as before this was extracted. Create
+                mode has no plan id to upload against yet, so it keeps the
+                bare dropzone, held until the plan itself is saved. */}
             <div className="mt-3">
-              <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
-                Chart at entry
-              </span>
-
               {isEdit && plan ? (
-                <div className="mt-1">
-                  {hasChart && !showChartPicker ? (
-                    <div className="flex items-start gap-3">
-                      <PlanChartView planId={plan.id} />
-                      <div className="flex shrink-0 flex-col gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => setShowChartPicker(true)}
-                          disabled={uploadChart.isPending || deleteChart.isPending}
-                          className="rounded-lg border border-obsidian-border bg-obsidian-bg px-2.5 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:border-slate-600 hover:text-slate-200 disabled:opacity-50"
-                        >
-                          Replace
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmingChartDelete(true)}
-                          disabled={uploadChart.isPending || deleteChart.isPending}
-                          className="rounded-lg border border-obsidian-border bg-obsidian-bg px-2.5 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:border-loss/40 hover:text-loss disabled:opacity-50"
-                        >
-                          {deleteChart.isPending ? 'Removing…' : 'Remove'}
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <ChartDropzone value={chart} onChange={setChart} disabled={uploadChart.isPending} />
-                      <div className="mt-2 flex gap-2">
-                        {chart && (
-                          <button
-                            type="button"
-                            onClick={saveChart}
-                            disabled={uploadChart.isPending}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[10px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-60"
-                          >
-                            {uploadChart.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
-                            {uploadChart.isPending
-                              ? 'Uploading…'
-                              : hasChart
-                                ? 'Save replacement'
-                                : 'Attach chart'}
-                          </button>
-                        )}
-                        {hasChart && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShowChartPicker(false);
-                              setChart(null);
-                              setChartError(null);
-                            }}
-                            disabled={uploadChart.isPending}
-                            className="rounded-lg border border-obsidian-border px-3 py-1.5 text-[10px] text-obsidian-muted transition-colors hover:text-slate-200 disabled:opacity-50"
-                          >
-                            Cancel
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  )}
-                  {chartError && <p className="mt-1.5 text-[11px] text-loss">{chartError}</p>}
-                </div>
+                <PlanChartManager
+                  planId={plan.id}
+                  ticker={plan.ticker}
+                  hasChart={hasChart}
+                  onHasChartChange={setHasChart}
+                />
               ) : (
-                <div className="mt-1">
-                  <ChartDropzone value={chart} onChange={setChart} disabled={isSaving} />
-                </div>
+                <>
+                  <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                    Chart at entry
+                  </span>
+                  <div className="mt-1">
+                    <ChartDropzone value={chart} onChange={setChart} disabled={isSaving} />
+                  </div>
+                </>
               )}
             </div>
-
-            {isEdit && plan && (
-              <ConfirmDialog
-                open={confirmingChartDelete}
-                title="Remove this chart?"
-                confirmLabel={deleteChart.isPending ? 'Removing…' : 'Remove'}
-                confirmDisabled={deleteChart.isPending}
-                onConfirm={confirmDeleteChart}
-                onCancel={() => setConfirmingChartDelete(false)}
-              >
-                Deletes it from storage. This can&apos;t be undone.
-              </ConfirmDialog>
-            )}
           </fieldset>
 
           {error && (

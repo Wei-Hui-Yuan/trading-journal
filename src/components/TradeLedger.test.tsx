@@ -18,13 +18,18 @@
  * then dispatch `onCommitted`/`onError` -- so the mutation underneath still
  * runs for real.
  *
- * `PlanChartView` (from `@/components/PlanChart`) is stubbed for the same
- * reason `PlanModal.test.tsx` stubs it: its real implementation calls
- * `URL.createObjectURL`, which jsdom does not implement. `ConfirmDialog` and
- * `RepairFillModal` are NOT mocked -- both work fine in jsdom, and
- * `RepairFillModal` is only ever opened by name in the one test that checks
- * the "Add a missing fill" button prefills it; its own deeper behaviour
- * belongs to a suite of its own.
+ * `PlanChartView` and `ChartDropzone` (from `@/components/PlanChart`) are
+ * stubbed for the same reason `PlanModal.test.tsx` stubs them: their real
+ * implementations call `URL.createObjectURL` and, on an actual file,
+ * `createImageBitmap` and a canvas 2D context, none of which jsdom
+ * implements. `PlanChartManager` (from `@/components/PlanChartManager`) is
+ * NOT mocked -- it is its own module now, imports `ChartDropzone`/
+ * `PlanChartView` as a normal cross-module import, and so renders for real
+ * here against the two stubs above, the same way it does inside
+ * `PlanModal.test.tsx`. `ConfirmDialog` and `RepairFillModal` are NOT mocked
+ * -- both work fine in jsdom, and `RepairFillModal` is only ever opened by
+ * name in the one test that checks the "Add a missing fill" button prefills
+ * it; its own deeper behaviour belongs to a suite of its own.
  *
  * `TradeLedger.tsx` has no recharts, canvas, or other jsdom-unimplemented
  * browser API of its own -- verified by reading the file in full, not
@@ -48,6 +53,8 @@ vi.mock('@/lib/api', async (importOriginal) => ({
   attachPlan: vi.fn(),
   detachPlan: vi.fn(),
   createManualTrade: vi.fn(),
+  uploadPlanChart: vi.fn(),
+  deletePlanChart: vi.fn(),
 }));
 
 const pendingActions = vi.hoisted(() => ({
@@ -64,12 +71,26 @@ vi.mock('@/components/PendingActionProvider', () => ({
   }),
 }));
 
+const chartDropzoneProps = vi.hoisted(() => ({ current: null as unknown }));
+
 vi.mock('@/components/PlanChart', () => ({
+  ChartDropzone: (props: {
+    value: unknown;
+    onChange: (v: unknown) => void;
+    disabled?: boolean;
+  }) => {
+    chartDropzoneProps.current = props;
+    return React.createElement(
+      'button',
+      { type: 'button', 'data-testid': 'fake-dropzone', disabled: props.disabled },
+      'fake dropzone'
+    );
+  },
   PlanChartView: () => React.createElement('div', { 'data-testid': 'fake-chart-view' }),
 }));
 
 import * as api from '@/lib/api';
-import { TradeLedger } from '@/components/TradeLedger';
+import { RoundTripChart, TradeLedger } from '@/components/TradeLedger';
 import type {
   ExecutionUpdateResult,
   PositionFill,
@@ -940,19 +961,103 @@ describe('plan section', () => {
       expect(within(summary).getByText('-1.25R')).toHaveClass('text-loss');
     });
 
-    it('renders the chart only when plan_has_chart is true', async () => {
+    it('shows the stored chart when plan_has_chart is true, the dropzone otherwise', async () => {
+      // Not "no section at all" when there is no chart yet -- that was the
+      // bug this replaced. An attached plan with nothing to show still gets
+      // a way to add one, since it is otherwise permanently unreachable: the
+      // Plan modal's edit mode only ever queries OPEN plans, and an attached
+      // plan can never be OPEN again short of unlinking it.
       await mountLedger([roundTrip({ plan_id: 'plan-1', plan_has_chart: true })]);
       await expandRow('AAPL');
 
       expect(screen.getByTestId('fake-chart-view')).toBeInTheDocument();
+      expect(screen.queryByTestId('fake-dropzone')).toBeNull();
 
       cleanup();
       client.clear();
       await mountLedger([roundTrip({ plan_id: 'plan-1', plan_has_chart: false })]);
       await expandRow('AAPL');
       expect(screen.queryByTestId('fake-chart-view')).toBeNull();
+      expect(screen.getByTestId('fake-dropzone')).toBeInTheDocument();
     });
 
+    it('uploads a chart for a plan that had none, keyed by its symbol', async () => {
+      mocked.uploadPlanChart.mockResolvedValue({} as TradePlan);
+      await mountLedger([
+        roundTrip({ plan_id: 'plan-3', symbol: 'NVDA', plan_has_chart: false }),
+      ]);
+      await expandRow('NVDA');
+
+      const onChange = (chartDropzoneProps.current as { onChange: (v: unknown) => void })
+        .onChange;
+      act(() => {
+        onChange({
+          blob: new Blob(['fake'], { type: 'image/webp' }),
+          mime: 'image/webp',
+          width: 10,
+          height: 10,
+          encodedBytes: 4,
+          originalBytes: 4,
+          lossless: true,
+        });
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Attach chart' }));
+
+      await waitFor(() => expect(mocked.uploadPlanChart).toHaveBeenCalled());
+      const [planId, , filename] = mocked.uploadPlanChart.mock.calls[0];
+      expect(planId).toBe('plan-3');
+      expect(filename).toBe('NVDA-chart.webp');
+
+      // The Replace/Remove pair replaces the dropzone once the upload
+      // resolves -- RoundTripChart's own local override, updating without
+      // waiting on a refetch.
+      expect(await screen.findByRole('button', { name: 'Replace' })).toBeInTheDocument();
+    });
+  });
+
+  describe('RoundTripChart', () => {
+    it('seeds a fresh override from the prop rather than resyncing an effect', () => {
+      const { rerender } = render(
+        <RoundTripChart planId="plan-a" ticker="AAPL" initialHasChart={true} />,
+        { wrapper }
+      );
+      expect(screen.getByTestId('fake-chart-view')).toBeInTheDocument();
+
+      // Same instance, same key: React re-renders in place rather than
+      // remounting, so a prop change alone must NOT retroactively override
+      // whatever this instance's own state already committed to -- there is
+      // deliberately no effect watching initialHasChart for exactly that
+      // reason. Confirmed here by changing it to false and expecting no
+      // change: the seed is read once, on mount, not resynced.
+      rerender(<RoundTripChart planId="plan-a" ticker="AAPL" initialHasChart={false} />);
+      expect(screen.getByTestId('fake-chart-view')).toBeInTheDocument();
+    });
+
+    it('discards a stale override when a different plan is keyed in', () => {
+      // The property key={rt.plan_id} exists to guarantee, in TradeLedger:
+      // unlinking a plan and later attaching a DIFFERENT one to the same row
+      // must not carry the old plan's chart-status override into the new
+      // plan's. Simulated here the same way TradeLedger's own key does it --
+      // a real React key change forces an unmount and a fresh mount, not a
+      // prop update on the same instance.
+      const { rerender } = render(
+        <RoundTripChart key="plan-a" planId="plan-a" ticker="AAPL" initialHasChart={true} />,
+        { wrapper }
+      );
+      expect(screen.getByTestId('fake-chart-view')).toBeInTheDocument();
+
+      rerender(
+        <RoundTripChart key="plan-b" planId="plan-b" ticker="MSFT" initialHasChart={false} />
+      );
+
+      // plan-b's own seed (false), not plan-a's stale true.
+      expect(screen.queryByTestId('fake-chart-view')).toBeNull();
+      expect(screen.getByTestId('fake-dropzone')).toBeInTheDocument();
+    });
+  });
+
+  describe('unlinking a plan', () => {
     it('unlinks by calling detachPlan with the leading trade id argument only', async () => {
       await mountLedger([roundTrip({ plan_id: 'plan-1', plan_trade_id: 'trade-open-1' })]);
       await expandRow('AAPL');

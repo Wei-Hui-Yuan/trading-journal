@@ -41,7 +41,7 @@ import type {
 } from '@/types/api';
 import { computeDisciplineScore } from '@/lib/discipline';
 import { RepairFillModal } from './RepairFillModal';
-import { PlanChartView } from './PlanChart';
+import { PlanChartManager } from './PlanChartManager';
 import { ConfirmDialog } from './ConfirmDialog';
 import { usePendingActions } from './PendingActionProvider';
 
@@ -483,6 +483,42 @@ const PnlBreakdown: React.FC<{ rt: RoundTrip }> = ({ rt }) => {
   );
 };
 
+/**
+ * `PlanChartManager`, holding the local override its `hasChart` prop needs.
+ *
+ * The override is what makes the Replace/Remove buttons flip the instant an
+ * upload or delete succeeds, without waiting on `useUploadPlanChart`'s
+ * invalidation to round-trip a refetch and re-render this row with a fresh
+ * `rt.plan_has_chart` -- the same "the parent's cache invalidation cannot
+ * reach in and replace a value this instance already committed to" problem
+ * `PlanModal`'s own `hasChart` state solves, one level down.
+ *
+ * `initialHasChart` seeds `useState` on mount ONLY; it is not resynced by an
+ * effect. Callers key this component by `planId` instead (see
+ * `PlanVsExecution` below), so a different plan gets a fresh mount -- and a
+ * fresh, correctly-seeded override -- rather than carrying a stale one
+ * forward across a change an effect would otherwise have to watch for.
+ */
+// Exported for its own test -- the wiring that decides whether a plan swap
+// on the same row discards the previous plan's chart-status override is
+// worth asserting directly, rather than only through a full unlink/reattach
+// integration flow.
+export const RoundTripChart: React.FC<{
+  planId: string;
+  ticker: string;
+  initialHasChart: boolean;
+}> = ({ planId, ticker, initialHasChart }) => {
+  const [hasChart, setHasChart] = useState(initialHasChart);
+  return (
+    <PlanChartManager
+      planId={planId}
+      ticker={ticker}
+      hasChart={hasChart}
+      onHasChartChange={setHasChart}
+    />
+  );
+};
+
 const PlanVsExecution: React.FC<{
   rt: RoundTrip;
   onUnlink: () => void;
@@ -579,13 +615,24 @@ const PlanVsExecution: React.FC<{
           whether you followed the plan; this is the only thing that says
           whether the plan was reasonable — and it is why it sits inside the
           "planned before entry" block rather than beside the review, which
-          was written afterwards. */}
-      {rt.plan_has_chart && rt.plan_id && (
+          was written afterwards.
+
+          Gated on plan_id alone, not plan_has_chart -- a plan attached with
+          no chart yet still gets the dropzone. The Plan modal is the only
+          other place a chart could ever be attached, and it stops being
+          reachable the moment a plan attaches to a fill: OpenPlansDock only
+          ever queries OPEN plans, so an attached plan's edit mode is gone for
+          good. Without this, a trade planned in a hurry with no screenshot
+          handy had no way back to one. Backend upload/delete endpoints carry
+          no status check either way, so nothing here is bypassing a rule the
+          server enforces. */}
+      {rt.plan_id && (
         <div className="mt-3 border-t border-amber-500/15 pt-3">
-          <p className="mb-1.5 text-[10px] uppercase tracking-wide text-obsidian-muted">
-            Chart at entry
-          </p>
-          <PlanChartView planId={rt.plan_id} />
+          {/* Keyed by plan_id so unlinking this plan and later attaching a
+              DIFFERENT one to the same row mounts a fresh instance rather
+              than carrying the old plan's local chart-status override into
+              the new one's. */}
+          <RoundTripChart key={rt.plan_id} planId={rt.plan_id} ticker={rt.symbol} initialHasChart={rt.plan_has_chart} />
         </div>
       )}
     </section>
