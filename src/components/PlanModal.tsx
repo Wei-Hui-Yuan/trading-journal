@@ -16,12 +16,14 @@ import {
 import { ChartDropzone } from '@/components/PlanChart';
 import { PlanChartManager } from '@/components/PlanChartManager';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
+import { ScaledEntryPlanner } from '@/components/ScaledEntryPlanner';
 import { formatUnsignedMoney } from '@/lib/format';
 import {
   computePlannedRisk,
   computeSizing,
   scoreTakeProfit,
   sizingHint,
+  type EntryTranche,
 } from '@/lib/positionSizing';
 import type { CompressedChart } from '@/lib/chartImage';
 import type { TradePlan, TradeSide } from '@/types/api';
@@ -152,6 +154,17 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
    * a trade, so it is read from Settings rather than retyped per plan.
    */
   const [riskOverride, setRiskOverride] = useState<string | null>(null);
+  /**
+   * Rungs of a laddered entry.
+   *
+   * Not persisted, and nothing here reaches the payload. A ladder resolves to
+   * a single blended entry and a single quantity -- losslessly, see
+   * `EntryBlend.entry` -- and those are the two fields the plan already has,
+   * so the rungs are a way of ARRIVING at them rather than a second record of
+   * them. Storing them would need a migration to say something the blend
+   * already says.
+   */
+  const [entryTranches, setEntryTranches] = useState<EntryTranche[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [savedSummary, setSavedSummary] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
@@ -214,6 +227,9 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
       // resetting here.
       setChart(null);
       setHasChart(plan?.has_chart ?? false);
+      // Or the last plan's ladder would still be on screen, sized
+      // against this plan's stop.
+      setEntryTranches([]);
       // Focus the first field so the form is keyboard-ready.
       window.setTimeout(() => symbolRef.current?.focus(), 0);
     }
@@ -657,6 +673,28 @@ export function PlanModal({ open, onClose, plan }: PlanModalProps) {
                 </Link>{' '}
                 to get a share count. Target prices work without it.
               </p>
+            )}
+
+            {/* Above the outputs, and gated on the stop ALONE: a ladder has
+                no single entry yet, since working out what its blended entry
+                should BE is the reason to open it. Applying it fills the
+                entry and quantity fields above, and everything below then
+                prices the blend like any other single entry. */}
+            {toNullableNumber(form.plannedStopLoss) !== null && (
+              <div className="mt-2.5">
+                <ScaledEntryPlanner
+                  side={form.side}
+                  stop={toNullableNumber(form.plannedStopLoss)}
+                  accountSize={accountSize}
+                  riskPercent={toNullableNumber(riskPercentText)}
+                  tranches={entryTranches}
+                  onChange={setEntryTranches}
+                  onApply={(entry, shares) =>
+                    patch({ plannedEntry: entry, quantity: String(shares) })
+                  }
+                  disabled={isSaving}
+                />
+              </div>
             )}
 
             {/* Outputs, shared with the sizing scratchpad. Two surfaces that

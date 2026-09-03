@@ -14,6 +14,8 @@ import {
   R_LADDER,
   breakevenWinRate,
   computePlannedRisk,
+  blendedSizingResult,
+  planScaledEntry,
   planScaledExit,
   computeSizing,
   scoreTakeProfit,
@@ -562,5 +564,310 @@ describe('planScaledExit', () => {
         tranches: [{ percent: 50, price: 110 }],
       })
     ).toBeNull();
+  });
+});
+
+/**
+ * A laddered entry, sized backwards from one risk budget.
+ *
+ * The case that motivated it: ARM, three entries at 236.80 / 226 / 216 against
+ * one hard stop at 210, "total risking 1.5%". Each rung risks a different
+ * amount per share -- 26.80, 16.00, 6.00 -- so this cannot be sized by
+ * dividing a budget once, and the arithmetic that gets it wrong looks
+ * plausible either way.
+ *
+ * The identity test below is the load-bearing one. A laddered plan is STORED
+ * as a single blended entry and a single quantity, and that is only lossless
+ * because `(blend - stop) x totalShares` is exactly the sum of the rungs'
+ * risk. If that ever stops holding, every laddered plan in the journal starts
+ * misreporting its own R.
+ */
+
+const LADDER = {
+  side: 'BUY' as const,
+  stop: 90,
+  accountSize: 10_000,
+  riskPercent: 1,
+  tranches: [
+    { percent: 50, price: 100 },
+    { percent: 50, price: 95 },
+  ],
+};
+
+describe('planScaledEntry', () => {
+  it('sizes every rung off its own distance to the shared stop', () => {
+    const plan = planScaledEntry(LADDER)!;
+
+    // 10 and 5 a share -- the whole reason a ladder is not one division.
+    expect(plan.legs.map((l) => l.riskPerShare)).toEqual([10, 5]);
+
+    // riskPerUnit = 0.5(10) + 0.5(5) = 7.5, so floor(100/7.5) = 13 notional,
+    // floored again to 6 a rung.
+    expect(plan.legs.map((l) => l.shares)).toEqual([6, 6]);
+    expect(plan.totalShares).toBe(12);
+    expect(plan.legs.map((l) => l.riskAmount)).toEqual([60, 30]);
+    expect(plan.legs.map((l) => l.cost)).toEqual([600, 570]);
+  });
+
+  it('blends to one entry whose 1R reproduces the ladder exactly', () => {
+    const plan = planScaledEntry(LADDER)!;
+
+    expect(plan.blend).toEqual({ entry: 97.5, riskPerShare: 7.5 });
+    // The identity the whole storage decision rests on.
+    expect(plan.blend!.riskPerShare * plan.totalShares!).toBeCloseTo(
+      plan.totalRisk!,
+      10
+    );
+  });
+
+  it('lands under the budget rather than over it, and says by how much', () => {
+    const plan = planScaledEntry(LADDER)!;
+
+    // Flooring twice costs $10 of a $100 budget. Reported, not implied.
+    expect(plan.riskBudget).toBe(100);
+    expect(plan.totalRisk).toBe(90);
+    expect(plan.totalRisk!).toBeLessThan(plan.riskBudget!);
+    expect(plan.totalRiskPercent).toBeCloseTo(0.9, 10);
+    expect(plan.totalCost).toBe(1170);
+    expect(plan.accountFraction).toBeCloseTo(0.117, 10);
+    expect(plan.allocatedPercent).toBe(100);
+  });
+
+  it('holds the ARM ladder that motivated it to its stated 1.5%', () => {
+    const plan = planScaledEntry({
+      side: 'BUY',
+      stop: 210,
+      accountSize: 100_000,
+      riskPercent: 1.5,
+      tranches: [
+        { percent: 50, price: 236.8 },
+        { percent: 30, price: 226 },
+        { percent: 20, price: 216 },
+      ],
+    })!;
+
+    // toBeCloseTo per rung: 236.8 - 210 lands on 26.80000000000001 in
+    // binary floating point. Real noise, and the display layer rounds it
+    // away, but an exact assertion here would be asserting the noise.
+    expect(plan.legs[0].riskPerShare).toBeCloseTo(26.8, 10);
+    expect(plan.legs.map((l) => l.riskPerShare).slice(1)).toEqual([16, 6]);
+    expect(plan.legs.map((l) => l.shares)).toEqual([38, 23, 15]);
+    expect(plan.totalRisk).toBeCloseTo(1476.4, 6);
+    // Never over the 1.5% that was asked for.
+    expect(plan.totalRiskPercent!).toBeLessThanOrEqual(1.5);
+    expect(plan.blend!.entry).toBeCloseTo(229.4263, 4);
+    expect(plan.blend!.riskPerShare * plan.totalShares!).toBeCloseTo(
+      plan.totalRisk!,
+      6
+    );
+  });
+
+  it('mirrors onto a short, where the rungs sit below the stop', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      side: 'SELL',
+      stop: 110,
+      tranches: [
+        { percent: 50, price: 100 },
+        { percent: 50, price: 105 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.riskPerShare)).toEqual([10, 5]);
+    expect(plan.blend).toEqual({ entry: 102.5, riskPerShare: 7.5 });
+    expect(plan.totalRisk).toBe(90);
+  });
+
+  it('refuses to size when a rung is on the wrong side of the stop', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      tranches: [
+        { percent: 50, price: 100 },
+        // A long buying at 85 with the stop at 90: already stopped out.
+        { percent: 50, price: 85 },
+      ],
+    })!;
+
+    expect(plan.hasBackwardsLeg).toBe(true);
+    expect(plan.legs.map((l) => l.isBackwards)).toEqual([false, true]);
+    // Nothing sized -- a negative risk per share would have SUBTRACTED from
+    // the ladder's cost and bought more shares than the budget allows.
+    expect(plan.totalShares).toBeNull();
+    expect(plan.totalRisk).toBeNull();
+    expect(plan.totalRiskPercent).toBeNull();
+    expect(plan.totalCost).toBeNull();
+    expect(plan.accountFraction).toBeNull();
+    expect(plan.legs.map((l) => l.shares)).toEqual([null, null]);
+    expect(plan.legs.map((l) => l.riskAmount)).toEqual([null, null]);
+    expect(plan.legs.map((l) => l.cost)).toEqual([null, null]);
+    // The rungs still render, so the bad one can be found and fixed.
+    expect(plan.legs).toHaveLength(2);
+  });
+
+  it('is empty rather than an error with no rungs', () => {
+    const plan = planScaledEntry({ ...LADDER, tranches: [] })!;
+
+    expect(plan.legs).toEqual([]);
+    expect(plan.blend).toBeNull();
+    expect(plan.totalShares).toBeNull();
+    expect(plan.allocatedPercent).toBe(0);
+    expect(plan.hasEmptyLeg).toBe(false);
+    expect(plan.hasBackwardsLeg).toBe(false);
+  });
+
+  it('drops rows that cannot be read rather than sizing them as zero', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      tranches: [
+        { percent: 50, price: 100 },
+        { percent: Number.POSITIVE_INFINITY, price: 99 },
+        { percent: 0, price: 98 },
+        { percent: 25, price: Number.NaN },
+        { percent: 25, price: 0 },
+      ],
+    })!;
+
+    // Only the readable rung survives; a half-typed row is not a rung.
+    expect(plan.legs).toHaveLength(1);
+    expect(plan.legs[0].price).toBe(100);
+    expect(plan.allocatedPercent).toBe(50);
+  });
+
+  it('reports a blend and no size when there is no account to size against', () => {
+    for (const accountSize of [null, Number.POSITIVE_INFINITY, 0]) {
+      const plan = planScaledEntry({ ...LADDER, accountSize })!;
+
+      expect(plan.riskBudget).toBeNull();
+      expect(plan.totalShares).toBeNull();
+      expect(plan.accountFraction).toBeNull();
+      // Percent-weighted, because there are no share counts to weight by.
+      expect(plan.blend).toEqual({ entry: 97.5, riskPerShare: 7.5 });
+    }
+  });
+
+  it('reports a blend and no size when there is no risk percent', () => {
+    for (const riskPercent of [null, Number.NaN]) {
+      const plan = planScaledEntry({ ...LADDER, riskPercent })!;
+
+      expect(plan.riskBudget).toBeNull();
+      expect(plan.totalShares).toBeNull();
+      expect(plan.blend!.entry).toBe(97.5);
+    }
+  });
+
+  it('names a rung too small to buy a whole share', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      tranches: [
+        { percent: 99, price: 100 },
+        { percent: 1, price: 95 },
+      ],
+    })!;
+
+    expect(plan.legs.map((l) => l.shares)).toEqual([9, 0]);
+    expect(plan.totalShares).toBe(9);
+    expect(plan.hasEmptyLeg).toBe(true);
+  });
+
+  it('still prices a ladder the budget cannot afford one share of', () => {
+    const plan = planScaledEntry({ ...LADDER, riskPercent: 0.01 })!;
+
+    // $1 of budget against $7.50 a unit buys nothing at all.
+    expect(plan.totalShares).toBe(0);
+    expect(plan.totalRisk).toBe(0);
+    expect(plan.totalCost).toBe(0);
+    expect(plan.accountFraction).toBe(0);
+    expect(plan.hasEmptyLeg).toBe(true);
+    // Falls back to the percent-weighted average rather than dividing by
+    // zero shares and reporting NaN as a price.
+    expect(plan.blend).toEqual({ entry: 97.5, riskPerShare: 7.5 });
+  });
+
+  it('carries an over-allocated ladder through for the caller to flag', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      tranches: [
+        { percent: 70, price: 100 },
+        { percent: 70, price: 95 },
+      ],
+    })!;
+
+    expect(plan.allocatedPercent).toBe(140);
+  });
+
+  it('has nothing to size against without a usable stop', () => {
+    for (const stop of [null, Number.POSITIVE_INFINITY, 0, -5]) {
+      expect(planScaledEntry({ ...LADDER, stop })).toBeNull();
+    }
+  });
+});
+
+describe('blendedSizingResult', () => {
+  it('shapes the ladder as the one sized-position type the panel renders', () => {
+    const plan = planScaledEntry(LADDER)!;
+    const result = blendedSizingResult(plan, 'BUY')!;
+
+    expect(result.riskPerShare).toBe(7.5);
+    expect(result.riskAmount).toBe(100);
+    expect(result.wholeShares).toBe(12);
+    expect(result.positionCost).toBe(1170);
+    expect(result.accountFraction).toBeCloseTo(0.117, 10);
+    // No single fractional count exists for a doubly-floored ladder, so none
+    // is claimed.
+    expect(result.exactShares).toBeNull();
+  });
+
+  it('puts the R ladder above the blend on a long', () => {
+    const result = blendedSizingResult(planScaledEntry(LADDER)!, 'BUY')!;
+
+    expect(result.targets.map((t) => t.r)).toEqual([...R_LADDER]);
+    expect(result.targets.map((t) => t.price)).toEqual([105, 112.5, 120, 135]);
+    // 12 shares x 7.5 x R.
+    expect(result.targets.map((t) => t.profit)).toEqual([90, 180, 270, 450]);
+  });
+
+  it('puts it below the blend on a short', () => {
+    const plan = planScaledEntry({
+      ...LADDER,
+      side: 'SELL',
+      stop: 110,
+      tranches: [
+        { percent: 50, price: 100 },
+        { percent: 50, price: 105 },
+      ],
+    })!;
+    const result = blendedSizingResult(plan, 'SELL')!;
+
+    expect(result.targets.map((t) => t.price)).toEqual([95, 87.5, 80, 65]);
+  });
+
+  it('prices targets with no profit figure when the ladder is unsized', () => {
+    const plan = planScaledEntry({ ...LADDER, accountSize: null })!;
+    const result = blendedSizingResult(plan, 'BUY')!;
+
+    expect(result.wholeShares).toBeNull();
+    expect(result.targets.map((t) => t.price)).toEqual([105, 112.5, 120, 135]);
+    expect(result.targets.map((t) => t.profit)).toEqual([null, null, null, null]);
+  });
+
+  it('declines an empty ladder', () => {
+    const plan = planScaledEntry({ ...LADDER, tranches: [] })!;
+
+    expect(blendedSizingResult(plan, 'BUY')).toBeNull();
+  });
+
+  it('declines a ladder whose blend sits on the wrong side of the stop', () => {
+    // Every rung backwards, so the blend is too -- there is no positive 1R to
+    // measure an R ladder against.
+    const plan = planScaledEntry({
+      ...LADDER,
+      tranches: [
+        { percent: 50, price: 85 },
+        { percent: 50, price: 80 },
+      ],
+    })!;
+
+    expect(plan.blend!.riskPerShare).toBeLessThan(0);
+    expect(blendedSizingResult(plan, 'BUY')).toBeNull();
   });
 });

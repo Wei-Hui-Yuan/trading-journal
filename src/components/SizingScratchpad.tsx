@@ -20,6 +20,7 @@ import {
 } from '@/hooks/useSizingScratchpad';
 import { useSettings } from '@/hooks/useTradeInbox';
 import { BreakevenCheck } from '@/components/BreakevenCheck';
+import { ScaledEntryPlanner } from '@/components/ScaledEntryPlanner';
 import { ScaledExitPlanner } from '@/components/ScaledExitPlanner';
 import { PositionSizingPanel } from '@/components/PositionSizingPanel';
 import { formatUnsignedMoney } from '@/lib/format';
@@ -27,6 +28,7 @@ import {
   computeSizing,
   scoreTakeProfit,
   sizingHint,
+  type EntryTranche,
   type ExitTranche,
   type Side,
 } from '@/lib/positionSizing';
@@ -446,6 +448,15 @@ export const SizingScratchpad: React.FC = () => {
    * make every note carry a plan it was never asked for.
    */
   const [tranches, setTranches] = useState<ExitTranche[]>([]);
+  /**
+   * Rungs of a laddered entry -- several buys into one position.
+   *
+   * Client-only for the same reason as the exit slices above, and with one
+   * more: the scratchpad stores a single `entry`, and a ladder resolves to
+   * exactly that once blended, so there is nothing here a column could hold
+   * that the existing one does not already.
+   */
+  const [entryTranches, setEntryTranches] = useState<EntryTranche[]>([]);
   const riskPercentText =
     riskOverride ?? (settings ? String(settings.risk_percent) : '');
 
@@ -724,6 +735,29 @@ export const SizingScratchpad: React.FC = () => {
             </Link>{' '}
             to get a suggested share count. Target prices work without it.
           </p>
+        )}
+
+        {/* Deliberately ABOVE the preview below, and gated on the stop
+            ALONE. A ladder has no single entry yet -- working out what its
+            blended entry should BE is the reason to open it -- so requiring
+            one here would hide the tool behind the number it produces.
+            Applying it fills the entry field, and the full panel then
+            appears underneath. */}
+        {stopNum !== null && (
+          <div className="mt-3">
+            <ScaledEntryPlanner
+              side={draft.side}
+              stop={stopNum}
+              accountSize={accountSize}
+              riskPercent={riskPercentNum}
+              tranches={entryTranches}
+              onChange={setEntryTranches}
+              onApply={(entry, shares) =>
+                patch({ entry, quantity: String(shares) })
+              }
+              disabled={createMutation.isPending}
+            />
+          </div>
         )}
 
         {/* Live preview — entirely client-side, and the same panel the Plan

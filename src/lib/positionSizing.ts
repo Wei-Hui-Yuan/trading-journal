@@ -415,3 +415,312 @@ export function planScaledExit({
     hasEmptyLeg: legs.some((leg) => leg.shares === 0),
   };
 }
+
+export interface EntryTranche {
+  /** Share of the whole position bought here, 0–100. */
+  percent: number;
+  /** The price this slice buys at. Free-form, not a rung of the ladder. */
+  price: number;
+}
+
+export interface ScaledEntryLeg extends EntryTranche {
+  /**
+   * Risk per share on THIS rung — its own distance to the shared stop.
+   *
+   * The number that makes a laddered entry a different problem from a single
+   * one. Three entries at 236.80 / 226 / 216 against one stop at 210 risk
+   * 26.80, 16.00 and 6.00 a share: the rungs are not interchangeable, and
+   * sizing them all off one figure would over-risk the top and under-risk
+   * the bottom.
+   */
+  riskPerShare: number;
+  /** Whole shares this rung buys. Floored, and null when unsized. */
+  shares: number | null;
+  /** Dollars this rung alone puts at risk. Null when unsized. */
+  riskAmount: number | null;
+  /** What filling this rung costs. Null when unsized. */
+  cost: number | null;
+  /**
+   * True when the rung sits on the losing side of the stop — a long buying at
+   * or below where it would stop out. Surfaced rather than sized: a negative
+   * risk per share would make the ladder look CHEAPER than it is and buy
+   * shares the budget does not cover.
+   */
+  isBackwards: boolean;
+}
+
+/**
+ * The single entry the whole ladder is equivalent to.
+ *
+ * One nullable object rather than two nullable numbers on purpose: the price
+ * and its 1R are known together or not at all, and as separate fields every
+ * caller would carry a second null check that can never fire.
+ */
+export interface EntryBlend {
+  /**
+   * Share-weighted across the rungs, so that
+   *
+   *   (entry - stop) x totalShares  ===  Σ shares_i x (price_i - stop)
+   *
+   * exactly rather than approximately. That identity is what lets a laddered
+   * plan be STORED as one entry and one quantity with nothing lost: the R a
+   * ladder plans for and the R the journal later scores stay the same unit,
+   * which is the whole reason `planned_entry` is a single column.
+   *
+   * Percent-weighted instead when the ladder is unsized — there are no share
+   * counts to weight by, and the intent is the only answer available. The two
+   * coincide whenever flooring does not bite.
+   */
+  entry: number;
+  /**
+   * 1R for the blended position. Can be non-positive, when a rung sits on the
+   * wrong side of the stop — which is exactly the case sizing is refused for,
+   * so it is reported rather than hidden behind a null.
+   */
+  riskPerShare: number;
+}
+
+export interface ScaledEntryPlan {
+  legs: ScaledEntryLeg[];
+  /** The one entry this ladder averages to. Null only for an empty ladder. */
+  blend: EntryBlend | null;
+  /** Shares actually bought across every rung. Null when unsized. */
+  totalShares: number | null;
+  /** Dollars at risk once every rung fills. Null when unsized. */
+  totalRisk: number | null;
+  /** That, against the account. Null when unsized. */
+  totalRiskPercent: number | null;
+  /** What the filled ladder costs. Null when unsized. */
+  totalCost: number | null;
+  /** Position cost as a share of the account, e.g. 2.14 for 214%. */
+  accountFraction: number | null;
+  /**
+   * The budget the ladder was sized against, so the gap flooring leaves can
+   * be shown. Double-flooring (the position, then each rung) always lands
+   * UNDER budget, and that difference is worth stating rather than implying
+   * the budget was spent.
+   */
+  riskBudget: number | null;
+  /** How much of the position the rungs account for. Should be 100. */
+  allocatedPercent: number;
+  /** True when a rung is allocated too little of the position to buy a share. */
+  hasEmptyLeg: boolean;
+  /** True when any rung is on the wrong side of the stop, so nothing is sized. */
+  hasBackwardsLeg: boolean;
+}
+
+/**
+ * Size a laddered entry — several buys on the way into one position, against
+ * one stop and one total risk budget.
+ *
+ * The inverse of `planScaledExit`, and not a mirror of it. A staged exit
+ * divides a position that already exists; a staged entry has to be solved
+ * BACKWARDS from the risk budget, because every rung's risk per share is
+ * different and it is the TOTAL that has to come out at 1.5%.
+ *
+ * The solve, for rung fractions f_i = percent_i / 100:
+ *
+ *   riskPerUnit    = Σ f_i x riskPerShare_i      (risk per unit of position)
+ *   notionalShares = floor(riskBudget / riskPerUnit)
+ *   shares_i       = floor(notionalShares x f_i)
+ *
+ * Floored twice, and floored both times: rounding either step up buys risk
+ * the rule does not allow, which is the one direction this file must never
+ * err in. The cost is that a ladder lands slightly under budget — reported as
+ * `riskBudget` beside `totalRisk` rather than hidden.
+ *
+ * Returns null only when there is no stop to size against. An empty ladder is
+ * empty, not an error — the same reading `planScaledExit` takes.
+ */
+export function planScaledEntry({
+  side,
+  stop,
+  accountSize,
+  riskPercent,
+  tranches,
+}: {
+  side: Side;
+  stop: number | null;
+  accountSize: number | null;
+  riskPercent: number | null;
+  tranches: EntryTranche[];
+}): ScaledEntryPlan | null {
+  if (stop === null || !Number.isFinite(stop) || stop <= 0) return null;
+
+  // Resolved once, before the budget that depends on it, so that
+  // `riskBudget !== null` IMPLIES a usable account size. Two independent
+  // account checks would leave the percent figures below needing a null test
+  // that can never fire. Equivalent to computeSizing's inline guard, only
+  // factored — a ladder and a single entry agree about when a budget exists.
+  const usableAccount =
+    accountSize !== null && Number.isFinite(accountSize) && accountSize > 0
+      ? accountSize
+      : null;
+
+  const riskBudget =
+    usableAccount !== null &&
+    riskPercent !== null &&
+    Number.isFinite(riskPercent)
+      ? (usableAccount * riskPercent) / 100
+      : null;
+
+  // Unreadable rungs are dropped rather than shown as zeros: a half-typed row
+  // is not a rung risking nothing, it is a row still being typed. Same
+  // reasoning as planScaledExit's `continue`.
+  const priced = tranches
+    .filter(
+      (t) =>
+        Number.isFinite(t.percent) &&
+        t.percent > 0 &&
+        Number.isFinite(t.price) &&
+        t.price > 0
+    )
+    .map((t) => ({
+      ...t,
+      riskPerShare: side === 'BUY' ? t.price - stop : stop - t.price,
+    }));
+
+  const allocatedPercent = priced.reduce((sum, p) => sum + p.percent, 0);
+  const hasBackwardsLeg = priced.some((p) => p.riskPerShare <= 0);
+  const riskPerUnit = priced.reduce(
+    (sum, p) => sum + (p.percent / 100) * p.riskPerShare,
+    0
+  );
+
+  // Sizing is REFUSED, not approximated, when any rung is on the wrong side of
+  // the stop. Its negative risk per share would subtract from riskPerUnit and
+  // hand back a LARGER share count than the budget allows — a wrong answer
+  // pointing the one way this must never point. The legs still render, so the
+  // offending rung can be seen and fixed.
+  //
+  // riskPerUnit is zero rather than negative for an empty ladder, which the
+  // same test catches: no rungs means nothing to divide the budget by.
+  const notionalShares =
+    riskBudget === null || hasBackwardsLeg || riskPerUnit <= 0
+      ? null
+      : Math.floor(riskBudget / riskPerUnit);
+
+  const legs: ScaledEntryLeg[] = priced.map((p) => {
+    const shares =
+      notionalShares === null
+        ? null
+        : Math.floor((notionalShares * p.percent) / 100);
+    return {
+      percent: p.percent,
+      price: p.price,
+      riskPerShare: p.riskPerShare,
+      shares,
+      riskAmount: shares === null ? null : shares * p.riskPerShare,
+      cost: shares === null ? null : shares * p.price,
+      isBackwards: p.riskPerShare <= 0,
+    };
+  });
+
+  const totalShares =
+    notionalShares === null
+      ? null
+      : legs.reduce((sum, l) => sum + (l.shares as number), 0);
+  const totalRisk =
+    notionalShares === null
+      ? null
+      : legs.reduce((sum, l) => sum + (l.riskAmount as number), 0);
+  const totalCost =
+    notionalShares === null
+      ? null
+      : legs.reduce((sum, l) => sum + (l.cost as number), 0);
+
+  // Share-weighted where there are shares, percent-weighted where there are
+  // not. See `EntryBlend.entry`. The zero-share case falls through to the
+  // percentages on purpose: a budget too small to buy one share still has a
+  // meaningful average price, where dividing by zero would report NaN.
+  let blendedEntry: number | null = null;
+  if (totalShares !== null && totalShares > 0) {
+    blendedEntry = (totalCost as number) / totalShares;
+  } else if (allocatedPercent > 0) {
+    blendedEntry =
+      priced.reduce((sum, p) => sum + p.percent * p.price, 0) / allocatedPercent;
+  }
+
+  return {
+    legs,
+    blend:
+      blendedEntry === null
+        ? null
+        : {
+            entry: blendedEntry,
+            riskPerShare:
+              side === 'BUY' ? blendedEntry - stop : stop - blendedEntry,
+          },
+    totalShares,
+    totalRisk,
+    // `usableAccount` is asserted rather than tested. totalRisk and totalCost
+    // are non-null only when notionalShares is, which requires riskBudget,
+    // which above requires a usable account size -- so a null test here would
+    // be dead code no test could honestly reach. Same reasoning as the
+    // assertion on scoreTakeProfit inside planScaledExit.
+    totalRiskPercent:
+      totalRisk === null ? null : (totalRisk / usableAccount!) * 100,
+    totalCost,
+    accountFraction: totalCost === null ? null : totalCost / usableAccount!,
+    riskBudget,
+    allocatedPercent,
+    hasEmptyLeg: legs.some((l) => l.shares === 0),
+    hasBackwardsLeg,
+  };
+}
+
+/**
+ * The blended ladder, shaped as an ordinary `SizingResult`.
+ *
+ * `PositionSizingPanel` renders exactly one type, and it is the only place in
+ * the app that renders a sized position — "two surfaces that disagree about
+ * what a trade risks is the one failure this calculator cannot be allowed to
+ * have". A laddered entry is a sized position too, so it is adapted to that
+ * type here rather than given a second renderer free to drift from it.
+ *
+ * The adaptation is honest because of the identity documented on
+ * `EntryBlend.entry`: the blend's risk per share times its share count IS the
+ * ladder's total risk, so the R ladder, the take-profit scorecard and the
+ * planned R all come out of the blend unchanged.
+ *
+ * Null when the ladder has no usable blend — empty, or holding a rung on the
+ * wrong side of the stop.
+ */
+export function blendedSizingResult(
+  plan: ScaledEntryPlan,
+  side: Side
+): SizingResult | null {
+  const { blend } = plan;
+  if (blend === null) return null;
+  // The divisor every R below is measured against. Non-positive exactly when
+  // a rung is backwards, which is the case sizing was already refused for.
+  if (blend.riskPerShare <= 0) return null;
+
+  return {
+    riskPerShare: blend.riskPerShare,
+    riskAmount: plan.riskBudget,
+    // Null rather than a repeat of the whole count. For a single entry
+    // `exactShares` is the fractional figure the whole count was floored
+    // from; a ladder floors twice and at different levels, so there is no one
+    // fractional count to report, and printing "(90.00)" beside 90 would
+    // claim there was.
+    exactShares: null,
+    wholeShares: plan.totalShares,
+    positionCost: plan.totalCost,
+    accountFraction: plan.accountFraction,
+    targets: R_LADDER.map((r) => ({
+      r,
+      // Direction-aware, exactly as computeSizing does it: on a short the
+      // targets sit BELOW the blend, and riskPerShare is already
+      // sign-corrected, so adding it would put every target backwards.
+      price:
+        side === 'BUY'
+          ? blend.entry + r * blend.riskPerShare
+          : blend.entry - r * blend.riskPerShare,
+      profit:
+        plan.totalShares === null
+          ? null
+          : plan.totalShares * r * blend.riskPerShare,
+    })),
+  };
+}
