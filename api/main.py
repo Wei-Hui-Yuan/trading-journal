@@ -684,6 +684,12 @@ class Position(Base):
         UUID(as_uuid=True), ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
     )
     review_status = Column(String(20), default=ReviewStatus.pending.value)
+    # When a GENUINE review completed (migration 038) -- set once, by
+    # review_position the first time mark_reviewed actually transitions this
+    # row, and never by dismiss_position. review_status alone cannot answer
+    # "when", and treats a dismissal and a real write-up identically; this
+    # column is what a journaling-lag metric measures against instead.
+    journaled_at = Column(DateTime(timezone=True), nullable=True)
     tag_hard_sl = Column(Boolean, default=False)
     tag_retest = Column(Boolean, default=False)
     tag_plan_compliant = Column(Boolean, default=False)
@@ -5751,7 +5757,10 @@ async def dismiss_position(
     Marking it reviewed is what empties the queue, and leaving the review
     fields empty is what keeps it out of discipline and grade breakdowns --
     absence of an answer is not the same as a bad answer, which is the same
-    distinction position_disciplines was built on.
+    distinction position_disciplines was built on. `journaled_at` (migration
+    038) is never set here for the same reason: dismissing is explicitly NOT
+    journaling, and a journal-lag average that dismissals could feed would
+    reward skipping the write-up instead of measuring it.
     """
     position = await session.get(Position, position_id)
     if position is None:
@@ -6536,6 +6545,14 @@ async def review_position(
         )
 
     if params.mark_reviewed:
+        # Set on the review that actually completes it -- first write wins,
+        # so a later edit (another mark_reviewed=True save, correcting a
+        # typo) never pushes it forward. `journaled_at is None` also covers
+        # a position dismiss_position already marked reviewed with nothing
+        # written: if it genuinely gets journaled later, THAT is when it was
+        # journaled, and this still records it correctly.
+        if position.journaled_at is None:
+            position.journaled_at = datetime.now(timezone.utc)
         position.review_status = ReviewStatus.reviewed.value
 
     await session.commit()

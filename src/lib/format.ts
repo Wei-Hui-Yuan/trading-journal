@@ -69,3 +69,19 @@ export function formatPrice(value: number): string {
 export function formatSignedPercent(value: number, digits = 2): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(digits)}%`;
 }
+
+/**
+ * An hours figure, in whichever unit reads as a real answer at that size.
+ *
+ * A journal-lag average anywhere from minutes to weeks is a plausible real
+ * number, and "38.4h" beside "0.3h" makes the reader do the arithmetic that
+ * this function exists to skip. Three bands rather than one fixed unit:
+ * under an hour reads as minutes, under two days as hours, and beyond that
+ * as days -- each the unit the number would actually be THOUGHT in at that
+ * size, not a unit chosen for display uniformity.
+ */
+export function formatDuration(hours: number): string {
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  if (hours < 48) return `${hours.toFixed(1)}h`;
+  return `${(hours / 24).toFixed(1)}d`;
+}

@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  formatDuration,
   formatMoney,
   formatPrice,
   formatSignedPercent,
@@ -138,5 +139,30 @@ describe('formatSignedPercent', () => {
     // the displayed magnitude is zero. Pinned as the current behaviour rather
     // than asserted as ideal -- the alternative is claiming a loss was a gain.
     expect(formatSignedPercent(-0.001)).toBe('-0.00%');
+  });
+});
+
+describe('formatDuration', () => {
+  it('renders sub-hour figures as rounded minutes', () => {
+    expect(formatDuration(0.5)).toBe('30m');
+    // Rounds rather than truncates -- 59.4 minutes reads as "an hour" more
+    // honestly than "59m" would, and truncating loses that.
+    expect(formatDuration(0.99)).toBe('59m');
+  });
+
+  it('renders zero as zero minutes rather than nothing', () => {
+    expect(formatDuration(0)).toBe('0m');
+  });
+
+  it('renders one hour up to two days as hours, one decimal', () => {
+    expect(formatDuration(1)).toBe('1.0h');
+    expect(formatDuration(6.25)).toBe('6.3h');
+    expect(formatDuration(47.9)).toBe('47.9h');
+  });
+
+  it('renders two days and beyond as days, one decimal', () => {
+    expect(formatDuration(48)).toBe('2.0d');
+    expect(formatDuration(72)).toBe('3.0d');
+    expect(formatDuration(240)).toBe('10.0d');
   });
 });

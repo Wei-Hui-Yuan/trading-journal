@@ -15,6 +15,7 @@ from services.analytics import (
     compute_advanced_metrics,
     compute_core_stats,
     compute_expectancy,
+    compute_journal_lag,
     compute_r_multiple,
     compute_slippage,
     load_reviewed_trades,
@@ -22,7 +23,14 @@ from services.analytics import (
 
 
 def make_trade(
-    direction="BUY", entry="100", exit_=None, stop=None, planned=None, mistakes=None
+    direction="BUY",
+    entry="100",
+    exit_=None,
+    stop=None,
+    planned=None,
+    mistakes=None,
+    exit_time=None,
+    journaled_at=None,
 ):
     # Unique per call -- compute_advanced_metrics joins scored R values back
     # onto trades by trade_id (see compute_strategy_breakdown and, since the
@@ -40,6 +48,8 @@ def make_trade(
         stop_loss=Decimal(stop) if stop is not None else None,
         mistakes=mistakes or [],
         review_status="reviewed",
+        exit_time=exit_time,
+        journaled_at=journaled_at,
     )
 
 
@@ -97,6 +107,35 @@ class TestSlippage:
         assert compute_slippage(make_trade("BUY", "100")) is None
 
 
+class TestJournalLag:
+    def test_hours_between_close_and_the_review_that_completed_it(self):
+        exit_time = datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc)
+        journaled_at = datetime(2026, 6, 3, 15, 0, tzinfo=timezone.utc)  # +54h
+        trade = make_trade(exit_time=exit_time, journaled_at=journaled_at)
+        assert compute_journal_lag(trade) == 54.0
+
+    def test_not_yet_journaled_returns_none_not_zero(self):
+        """Covers both the never-reviewed and dismissed-not-reviewed cases --
+        `journaled_at` is None either way, and this must not read as an
+        instant journal entry."""
+        trade = make_trade(exit_time=datetime(2026, 6, 1, tzinfo=timezone.utc))
+        assert compute_journal_lag(trade) is None
+
+    def test_no_exit_time_returns_none(self):
+        trade = make_trade(journaled_at=datetime(2026, 6, 1, tzinfo=timezone.utc))
+        assert compute_journal_lag(trade) is None
+
+    def test_a_negative_gap_returns_none_rather_than_flattering_the_average(self):
+        """journaled_at before exit_time cannot happen through the real write
+        path, but a wrong answer here would be a negative "lag" rather than a
+        loud failure -- guarded the same as any other invariant no valid
+        input can violate but a bug still could."""
+        exit_time = datetime(2026, 6, 3, tzinfo=timezone.utc)
+        journaled_at = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        trade = make_trade(exit_time=exit_time, journaled_at=journaled_at)
+        assert compute_journal_lag(trade) is None
+
+
 class TestExpectancy:
     def test_balanced_sample(self):
         # 2 wins @2R, 2 losses @1R -> (0.5*2) - (0.5*1)
@@ -145,6 +184,30 @@ class TestAggregate:
 
     def test_worst_mistake_sorted_first(self, metrics):
         assert metrics["mistake_breakdown"][0]["mistake"] == "Chased"
+
+    def test_journal_lag_averages_only_what_was_actually_journaled(self):
+        """A never-journaled and a dismissed trade look identical here --
+        both are `journaled_at=None` -- and both must be left OUT of the
+        average, not counted as zero lag. Only the two genuinely journaled
+        trades feed it."""
+        exit_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        metrics = compute_advanced_metrics([
+            make_trade(
+                "BUY", "100", "106", "98",
+                exit_time=exit_time,
+                journaled_at=datetime(2026, 6, 2, tzinfo=timezone.utc),  # 24h
+            ),
+            make_trade(
+                "BUY", "100", "106", "98",
+                exit_time=exit_time,
+                journaled_at=datetime(2026, 6, 4, tzinfo=timezone.utc),  # 72h
+            ),
+            # Never journaled -- open review queue or a dismissal, either way
+            # journaled_at is None.
+            make_trade("BUY", "100", "106", "98", exit_time=exit_time),
+        ])
+        assert metrics["journal_lag_sample"] == 2
+        assert metrics["avg_journal_lag_hours"] == 48.0
 
     def test_a_mistake_tagged_on_an_unscoreable_trade_is_not_invisible(self):
         """Issue #6 of the calculation audit: tagging "Oversized" on 3 trades
@@ -205,6 +268,8 @@ class TestJsonSafety:
         assert m["avg_r"] is None
         assert m["expectancy_r"] is None
         assert m["avg_slippage"] is None
+        assert m["avg_journal_lag_hours"] is None
+        assert m["journal_lag_sample"] == 0
 
 
 def make_position(pnl, entry_price, quantity, exit_day=601):

@@ -129,6 +129,8 @@ function advancedMetrics(overrides: Partial<AdvancedMetrics> = {}): AdvancedMetr
     expectancy_r: null,
     avg_slippage: null,
     slippage_sample: 0,
+    avg_journal_lag_hours: null,
+    journal_lag_sample: 0,
     r_distribution: {},
     mistake_breakdown: [],
     discipline_breakdown: [],
@@ -393,6 +395,24 @@ describe('KpiCard / metric() formatting', () => {
     mocked.getAdvancedMetrics.mockResolvedValue(advancedMetrics({ avg_slippage: 0.0123, slippage_sample: 7 }));
     await mountPage();
     expect(kpiValue('Avg Slippage')).toHaveTextContent('0.0123');
+  });
+
+  it('Journal Lag renders a dash and says nothing is journaled yet, before anything is', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({ avg_journal_lag_hours: null, journal_lag_sample: 0 })
+    );
+    await mountPage();
+    expect(kpiValue('Journal Lag')).toHaveTextContent('—');
+    expect(screen.getByText('Nothing journaled yet')).toBeInTheDocument();
+  });
+
+  it('Journal Lag formats hours through the shared duration formatter, with its sample size', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({ avg_journal_lag_hours: 6.25, journal_lag_sample: 3 })
+    );
+    await mountPage();
+    expect(kpiValue('Journal Lag')).toHaveTextContent('6.3h');
+    expect(screen.getByText(/3 journaled · close to write-up/)).toBeInTheDocument();
   });
 
   it('Total R gets the win tone class when non-negative', async () => {

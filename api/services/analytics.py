@@ -1059,6 +1059,11 @@ class ReviewedTrade:
     # disagreeing about which trades a window contains is the confusion this
     # field exists to prevent.
     exit_time: Optional[datetime] = None
+    # When a genuine review completed (migration 038). None means "not
+    # journaled" -- a position still pending, or one dismissed rather than
+    # written up -- which compute_journal_lag reads as "no lag to report",
+    # not as zero.
+    journaled_at: Optional[datetime] = None
 
 
 def compute_r_multiple(trade: ReviewedTrade) -> Optional[float]:
@@ -1108,6 +1113,31 @@ def compute_slippage(trade: ReviewedTrade) -> Optional[float]:
         else trade.planned_entry - trade.actual_entry
     )
     return float(round(diff, 4))
+
+
+def compute_journal_lag(trade: ReviewedTrade) -> Optional[float]:
+    """Hours between the trade closing and a genuine review completing it.
+
+    None -- never 0.0 -- when it has not been journaled at all: still
+    pending, or dismissed rather than written up. `journaled_at` is only
+    ever set by a real review (see the column's own comment on `Position`),
+    so this cannot be gamed by clearing the queue without writing anything;
+    a trade that was dismissed simply contributes nothing to the average
+    rather than looking like an instant journal entry.
+
+    Also None for a negative gap -- `journaled_at` landing before
+    `exit_time` -- which no real write path can produce (the column is
+    always stamped with `now()` on a position whose exit already happened),
+    but reporting a negative "lag" would flatter the average with a value
+    this metric has no honest way to mean.
+    """
+    if trade.journaled_at is None or trade.exit_time is None:
+        return None
+
+    lag_hours = (trade.journaled_at - trade.exit_time).total_seconds() / 3600
+    if lag_hours < 0:
+        return None
+    return round(lag_hours, 2)
 
 
 def compute_expectancy(r_multiples: list[float]) -> Optional[float]:
@@ -1467,6 +1497,7 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
     """R-multiples, slippage, expectancy, and per-mistake breakdown."""
     scored: list[tuple[ReviewedTrade, float]] = []
     slippages: list[float] = []
+    journal_lags: list[float] = []
 
     for trade in trades:
         r = compute_r_multiple(trade)
@@ -1475,6 +1506,9 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
         s = compute_slippage(trade)
         if s is not None:
             slippages.append(s)
+        lag = compute_journal_lag(trade)
+        if lag is not None:
+            journal_lags.append(lag)
 
     r_multiples = [r for _, r in scored]
 
@@ -1541,6 +1575,10 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
             round(sum(slippages) / len(slippages), 4) if slippages else None
         ),
         "slippage_sample": len(slippages),
+        "avg_journal_lag_hours": (
+            round(sum(journal_lags) / len(journal_lags), 2) if journal_lags else None
+        ),
+        "journal_lag_sample": len(journal_lags),
         "r_distribution": _r_distribution(r_multiples),
         "mistake_breakdown": mistake_breakdown,
         "discipline_breakdown": compute_discipline_breakdown(
@@ -1598,6 +1636,7 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                 Position.strategy_id,
                 Position.entry_time,
                 Position.exit_time,
+                Position.journaled_at,
             )
         )
     ).all()
@@ -1682,6 +1721,7 @@ async def load_reviewed_trades(session: AsyncSession) -> list[ReviewedTrade]:
                 ),
                 entry_time=position.entry_time,
                 exit_time=position.exit_time,
+                journaled_at=position.journaled_at,
             )
         )
     return reviewed

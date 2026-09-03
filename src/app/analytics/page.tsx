@@ -21,6 +21,7 @@ import {
   DEFAULT_SELECTION,
   TimeframeToolbar,
 } from '@/components/TimeframeToolbar';
+import { formatDuration } from '@/lib/format';
 import type {
   AdvancedMetrics,
   Position,
@@ -784,7 +785,7 @@ export default function AnalyticsPage() {
           </div>
         ) : m ? (
           <>
-            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
               <KpiCard
                 label="Total R"
                 value={metric(m.total_r, 'R')}
@@ -832,6 +833,22 @@ export default function AnalyticsPage() {
                     : m.avg_slippage > 0
                       ? 'loss'
                       : 'win'
+                }
+              />
+              <KpiCard
+                label="Journal Lag"
+                // No sign here to reduce to win/loss on -- lower is simply
+                // better, which formatDuration's own scale already conveys
+                // without a colour needing to say it twice.
+                value={
+                  m.avg_journal_lag_hours === null
+                    ? '—'
+                    : formatDuration(m.avg_journal_lag_hours)
+                }
+                hint={
+                  m.journal_lag_sample === 0
+                    ? 'Nothing journaled yet'
+                    : `${m.journal_lag_sample} journaled · close to write-up`
                 }
               />
             </section>

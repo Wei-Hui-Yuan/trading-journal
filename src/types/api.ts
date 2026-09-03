@@ -1340,6 +1340,14 @@ export interface AdvancedMetrics {
   /** Positive means worse fills than planned. Null when nothing was planned. */
   avg_slippage: number | null;
   slippage_sample: number;
+  /**
+   * Hours between a trade closing and it actually being journaled. Null
+   * when nothing in the window has been journaled yet — a dismissed trade
+   * never counts, only a genuine review does, so this cannot be gamed by
+   * clearing the queue without writing anything.
+   */
+  avg_journal_lag_hours: number | null;
+  journal_lag_sample: number;
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
   discipline_breakdown: DisciplineBreakdown[];
