@@ -4,7 +4,7 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { LucideIcon } from 'lucide-react';
-import { Activity, BarChart3, BookOpen, BookText, Calculator, ClipboardList, Landmark, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
+import { Activity, BarChart3, BookOpen, BookText, Calculator, ClipboardList, Landmark, LayoutDashboard, RefreshCw, SlidersHorizontal, User } from 'lucide-react';
 import { SyncBrokerButton } from './SyncBrokerButton';
 import { PlanModal } from './PlanModal';
 import { SyncResultToast } from './SyncResultToast';
@@ -259,6 +259,8 @@ interface NavPage {
 const PAGES: readonly NavPage[] = [
   {
     href: '/',
+    label: 'Dashboard',
+    icon: LayoutDashboard,
     title: 'TRADING JOURNAL',
     subtitle: 'IBKR Gateway Execution Engine',
     brand: true,
@@ -346,14 +348,17 @@ export const AppNav: React.FC = () => {
           shared header had before it was measured at 375px. */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 min-h-16 py-2 flex items-center justify-between gap-3">
 
-        {/* Logo doubles as the way home, which is why no page carries a
-            "← Dashboard" link any more. Six of them used to, and the tab row
-            below could not show which page you were on because it only ever
-            existed on the one page that was never a destination. */}
+        {/* Also links home, same as the Dashboard tab in row 2 below --
+            six pages used to each carry their own "← Dashboard" link, and the
+            tab row could not show which page you were on because '/' was
+            never a destination in it. The logo staying clickable is the
+            ordinary convention on top of that tab, not a second copy of it;
+            its own aria-label is distinct so the two links to '/' are not
+            announced as the same thing. */}
         <div className="flex items-center space-x-3">
           <Link
             href="/"
-            aria-label="Dashboard"
+            aria-label="Trading Journal home"
             className="h-9 w-9 shrink-0 rounded-xl bg-gradient-to-br from-win/20 to-emerald-900/40 border border-win/30 flex items-center justify-center shadow-win-glow transition-colors hover:border-win/60"
           >
             <Activity className="h-5 w-5 text-win" />

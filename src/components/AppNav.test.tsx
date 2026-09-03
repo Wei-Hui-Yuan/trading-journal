@@ -236,7 +236,24 @@ describe('AppNav > page identity', () => {
 
   it('points the logo home, which is what replaced six back-links', () => {
     mountNav(0, '/journal');
-    expect(screen.getByRole('link', { name: 'Dashboard' })).toHaveAttribute('href', '/');
+    expect(
+      screen.getByRole('link', { name: 'Trading Journal home' })
+    ).toHaveAttribute('href', '/');
+  });
+
+  it('also offers Dashboard as an explicit tab, leftmost in the row', () => {
+    mountNav(0, '/journal');
+    // Two links to '/' now -- the logo and the tab -- distinguished by name
+    // so neither query is ambiguous.
+    const links = screen.getAllByRole('link', { name: 'Dashboard' });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute('href', '/');
+
+    const tabNames = screen
+      .getAllByRole('link')
+      .map((el) => el.textContent)
+      .filter((text): text is string => Boolean(text));
+    expect(tabNames.indexOf('Dashboard')).toBeLessThan(tabNames.indexOf('Journal'));
   });
 });
 
@@ -247,7 +264,7 @@ describe('AppNav > active tab', () => {
     expect(active).toHaveAttribute('aria-current', 'page');
     expect(active.className).toContain('border-win');
 
-    for (const other of ['Journal', 'Strategies', 'Sizing', 'Portfolio']) {
+    for (const other of ['Dashboard', 'Journal', 'Strategies', 'Sizing', 'Portfolio']) {
       expect(screen.getByRole('link', { name: other })).not.toHaveAttribute('aria-current');
     }
   });
@@ -256,13 +273,17 @@ describe('AppNav > active tab', () => {
     // Settings is reached by the gear icon; no tab should light up for it, and
     // the dashboard tab must not either -- '/' is not a prefix match.
     mountNav(0, '/settings');
-    for (const label of ['Journal', 'Analytics', 'Strategies', 'Sizing', 'Portfolio']) {
+    for (const label of ['Dashboard', 'Journal', 'Analytics', 'Strategies', 'Sizing', 'Portfolio']) {
       expect(screen.getByRole('link', { name: label })).not.toHaveAttribute('aria-current');
     }
   });
 
-  it('marks nothing on the dashboard, which has no tab of its own', () => {
+  it('marks the dashboard tab active on its own route, and only it', () => {
     mountNav(0, '/');
+    const active = screen.getByRole('link', { name: 'Dashboard' });
+    expect(active).toHaveAttribute('aria-current', 'page');
+    expect(active.className).toContain('border-win');
+
     for (const label of ['Journal', 'Analytics', 'Strategies', 'Sizing', 'Portfolio']) {
       expect(screen.getByRole('link', { name: label })).not.toHaveAttribute('aria-current');
     }
