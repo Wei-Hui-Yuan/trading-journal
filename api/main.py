@@ -46,6 +46,7 @@ from sqlalchemy import (
     literal,
     or_,
     select,
+    text,
     union_all,
     update,
 )
@@ -880,6 +881,130 @@ async def _warm_connection_pool() -> None:
         )
 
 
+class SchemaBehindError(RuntimeError):
+    """The database is missing migrations this code already assumes exist."""
+
+
+#: Emergency valve, read from the environment at boot. Set it to "1" to start
+#: anyway with the schema behind. It exists because this check stands between
+#: a deploy and serving ANY traffic: if the check itself is ever wrong, the
+#: alternative to an env var someone can flip in the Northflank dashboard is a
+#: code change and a full rebuild, performed during an outage. Nothing sets it
+#: normally, and it logs loudly when it is honoured.
+SKIP_SCHEMA_CHECK_ENV = "SKIP_SCHEMA_CHECK"
+
+
+async def _applied_migration_filenames() -> Optional[set[str]]:
+    """Every migration `schema_migrations` records as applied.
+
+    None -- deliberately not an empty set -- when the database cannot be
+    reached. The two are different facts: an unreachable database says
+    NOTHING about the schema, while an empty set says the schema is untouched,
+    and only one of those is a reason to refuse to boot.
+
+    A missing tracking table reads as the empty set rather than an error. That
+    is the honest answer: the runner creates that table on its first run, so
+    its absence means no migration has ever been applied here. `to_regclass`
+    returns NULL instead of raising for a table that is not there, which keeps
+    that case distinguishable from a connection failure without having to
+    discriminate driver exception types.
+    """
+    # Deferred: migrate.py is a standalone runner that deliberately shares no
+    # state with the app (it rebuilds the database URL itself rather than
+    # importing it, so a broken app cannot take the migration runner down with
+    # it). Importing it lazily keeps that one-directional, and keeps a missing
+    # runner from being an import-time failure for the whole API.
+    import migrate  # noqa: PLC0415
+
+    try:
+        async with engine.connect() as connection:
+            present = (
+                await connection.execute(
+                    text(f"SELECT to_regclass('public.{migrate.TRACKING_TABLE}')")
+                )
+            ).scalar()
+            if present is None:
+                return set()
+            rows = (
+                await connection.execute(
+                    text(f"SELECT filename FROM {migrate.TRACKING_TABLE}")
+                )
+            ).scalars().all()
+            return set(rows)
+    except Exception as exc:  # noqa: BLE001 - unreachable is not "behind"
+        logger.warning(
+            "Could not read the migration tracking table (%s); "
+            "skipping the schema check",
+            type(exc).__name__,
+        )
+        return None
+
+
+async def _assert_schema_current() -> None:
+    """Refuse to boot when migrations on disk have not reached the database.
+
+    THE FAILURE THIS EXISTS TO PREVENT. Merging a migration does not apply it
+    -- the container's command is gunicorn and nothing else, and CI runs
+    migrate.py against its own throwaway Postgres, so a green build says
+    nothing about production. Migration 038 shipped exactly this way: the
+    Position model gained `journaled_at`, Northflank redeployed, and every
+    endpoint issuing `select(Position)` began returning 500 while /health
+    still reported "database": "ok", because connectivity was never the
+    problem. The Journal, Trade Inbox and Analytics pages were down; the
+    dashboard's equity curve, which selects a narrow explicit column list,
+    kept working -- so the breakage did not even look like a schema problem.
+
+    Refusing to start is the loud version of that. A container that will not
+    boot is visible in the deploy log within seconds and cannot be mistaken
+    for anything else; a container that boots and serves 500s from half its
+    endpoints took a screenshot and a bisect to identify.
+
+    NOT fatal when the database is merely unreachable, matching the reasoning
+    on _warm_connection_pool: that state is transient and self-healing, it is
+    what /health exists to report, and a dead process cannot report it. Only a
+    database that answers AND is behind stops the boot, because that one never
+    fixes itself.
+
+    Drift -- an already-applied migration whose file has since been edited --
+    is deliberately NOT checked here. It is a real hazard, and `migrate.py
+    --status` reports it, but it does not produce the runtime failure above,
+    and a boot-blocking check should only ever fire on something that does.
+    """
+    if os.environ.get(SKIP_SCHEMA_CHECK_ENV) == "1":
+        logger.warning(
+            "%s=1 -- starting without verifying the schema is current",
+            SKIP_SCHEMA_CHECK_ENV,
+        )
+        return
+
+    applied = await _applied_migration_filenames()
+    if applied is None:
+        return
+
+    import migrate  # noqa: PLC0415 - deferred, see _applied_migration_filenames
+
+    behind = migrate.pending(migrate.load_migrations(), applied)
+    if not behind:
+        logger.info("Schema is current: %d migration(s) applied", len(applied))
+        return
+
+    names = ", ".join(m.filename for m in behind)
+    raise SchemaBehindError(
+        f"Database schema is behind this code by {len(behind)} migration(s): "
+        f"{names}. Refusing to start, because booting would serve HTTP 500s "
+        "from every endpoint that touches the changed tables while /health "
+        "still reported the database as reachable. Apply them with "
+        "`cd api && python migrate.py`"
+        + (
+            ""
+            if applied
+            else " -- or, if this database was migrated by hand and has no "
+            "tracking table yet, adopt it with `python migrate.py --baseline`"
+        )
+        + f". To start anyway, set {SKIP_SCHEMA_CHECK_ENV}=1."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown.
@@ -905,7 +1030,12 @@ async def lifespan(app: FastAPI):
     Doing it here moves that cost into container startup, where nobody is
     waiting. Northflank restarts the container often enough on the free tier
     that this is not a one-time saving.
+
+    The schema check runs BEFORE the pool is warmed: a boot it is going to
+    refuse should not first spend several round trips opening connections the
+    process is about to throw away.
     """
+    await _assert_schema_current()
     await _warm_connection_pool()
     yield
     await engine.dispose()
