@@ -406,6 +406,21 @@ describe('KpiCard / metric() formatting', () => {
     expect(screen.getByText('Nothing journaled yet')).toBeInTheDocument();
   });
 
+  it('lays the six KPI cards out three across, so they fill two even rows', async () => {
+    // The count and the column number are one decision, not two: six cards
+    // in three columns is two full rows, and a seventh card would leave a row
+    // of one. This fails when either half changes, which is the point --
+    // adding a KPI should force a look at the layout rather than quietly
+    // producing an orphan.
+    mocked.getAdvancedMetrics.mockResolvedValue(advancedMetrics());
+    await mountPage();
+
+    const grid = screen.getByText('Total R').closest('section');
+    expect(grid).not.toBeNull();
+    expect(grid!.className).toContain('lg:grid-cols-3');
+    expect(grid!.children).toHaveLength(6);
+  });
+
   it('Journal Lag formats hours through the shared duration formatter, with its sample size', async () => {
     mocked.getAdvancedMetrics.mockResolvedValue(
       advancedMetrics({ avg_journal_lag_hours: 6.25, journal_lag_sample: 3 })

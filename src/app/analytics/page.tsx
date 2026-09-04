@@ -785,7 +785,14 @@ export default function AnalyticsPage() {
           </div>
         ) : m ? (
           <>
-            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
+            {/* Three across rather than one row of six, which left each card
+                about a sixth of the width and reading as small and far apart.
+                Six cards over two rows of three doubles the width of each.
+
+                Tied to the number of cards: a seventh would leave a row of
+                one. Adding one means revisiting this, which is what the test
+                asserting six-cards-in-three-columns is for. */}
+            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               <KpiCard
                 label="Total R"
                 value={metric(m.total_r, 'R')}
