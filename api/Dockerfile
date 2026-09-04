@@ -36,6 +36,15 @@ COPY --from=builder /root/.local /root/.local
 COPY *.py ./
 COPY services/ ./services/
 
+# The migration FILES, not just the runner that reads them. main.py's boot
+# check compares this directory against `schema_migrations` to refuse a start
+# when the schema is behind, and without the files here it has nothing to
+# compare -- migrate.load_migrations() raised MigrationError on a directory
+# that did not exist, which killed the container instead of starting it.
+# Kept in the image rather than the check made optional, because production is
+# the one environment where the check has any value.
+COPY migrations/ ./migrations/
+
 # Worker count is deliberately low and set via WEB_CONCURRENCY (gunicorn reads
 # that natively) rather than a baked-in --workers flag, so it can be tuned from
 # the Northflank dashboard without a rebuild.

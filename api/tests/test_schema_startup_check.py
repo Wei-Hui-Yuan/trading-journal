@@ -33,6 +33,7 @@ every test here substitutes it.
 
 import asyncio
 import os
+from pathlib import Path
 
 import pytest
 
@@ -152,6 +153,44 @@ def test_the_escape_hatch_needs_exactly_one(applied, monkeypatch):
         applied(set())
         with pytest.raises(main.SchemaBehindError):
             run(main._assert_schema_current())
+
+
+def test_an_unreadable_migrations_directory_still_boots(applied, monkeypatch):
+    """The regression that took production down harder than the bug it guards.
+
+    The Docker image copied *.py and services/ but not migrations/, so in the
+    container `load_migrations` raised MigrationError on a directory that did
+    not exist. Nothing caught it, it escaped the lifespan, every worker died
+    at boot, and the API went from serving one stale column to refusing
+    connections outright.
+
+    The rule this pins: fail CLOSED only on a definite answer -- the database
+    answered AND is behind -- and fail OPEN on any inability to work one out.
+    A guard that cannot run must never be the thing that stops the app.
+    """
+    def explode(*_args, **_kwargs):
+        raise migrate.MigrationError("No migrations directory at /app/migrations")
+
+    monkeypatch.setattr(migrate, "load_migrations", explode)
+    applied({"001_whatever.sql"})
+
+    run(main._assert_schema_current())  # does not raise
+
+
+def test_the_image_ships_the_migrations_the_check_reads(applied):
+    """The other half of that fix, and the half a Python test would otherwise
+    miss entirely: the check is only worth anything in production, and it can
+    only run there if the migration FILES are in the image. Copying *.py alone
+    ships the runner without the files it reads.
+
+    Asserted here rather than left to a deploy, because the failure mode is
+    invisible locally -- api/migrations/ is always present in a checkout, so
+    every test and every dev run passes while the container cannot work.
+    """
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "COPY migrations/" in dockerfile
 
 
 def test_the_check_runs_before_the_pool_is_warmed():

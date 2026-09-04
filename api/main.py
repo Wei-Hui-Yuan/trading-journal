@@ -983,7 +983,30 @@ async def _assert_schema_current() -> None:
 
     import migrate  # noqa: PLC0415 - deferred, see _applied_migration_filenames
 
-    behind = migrate.pending(migrate.load_migrations(), applied)
+    # Reading the files can fail for reasons that say nothing about the schema,
+    # and this one already took production down once: the Docker image copied
+    # *.py and services/ but not migrations/, so load_migrations raised
+    # MigrationError on a directory that did not exist in the container. That
+    # escaped the lifespan, every worker died at boot, and the whole API went
+    # from "one stale column" to "connection refused" -- strictly worse than
+    # the problem the check exists to catch.
+    #
+    # So this fails OPEN, exactly like an unreachable database above. The rule
+    # the check has to obey: fail CLOSED only on a definite answer ("the
+    # database is reachable, and it is behind"), and fail OPEN on any inability
+    # to work one out. A guard that cannot run must not be the thing that
+    # stops the app.
+    try:
+        on_disk = migrate.load_migrations()
+    except Exception as exc:  # noqa: BLE001 - cannot check is not "behind"
+        logger.warning(
+            "Could not read the migrations directory (%s); "
+            "skipping the schema check",
+            type(exc).__name__,
+        )
+        return
+
+    behind = migrate.pending(on_disk, applied)
     if not behind:
         logger.info("Schema is current: %d migration(s) applied", len(applied))
         return
