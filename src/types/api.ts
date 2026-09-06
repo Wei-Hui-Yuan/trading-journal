@@ -1326,6 +1326,47 @@ export interface MistakeBreakdown {
  * computable from this sample" — no scoreable trades, no losses, no planned
  * entries — which is distinct from a real value of 0.
  */
+/** One loss that went further than its planned risk allowed. */
+export interface StopOverrun {
+  ticker: string;
+  exit_time: string | null; // ISO 8601
+  r_multiple: number;
+  realized_pnl: number | null;
+  strategy: string | null;
+}
+
+/**
+ * Losses measured against the stop they were planned against.
+ *
+ * `recoverable_r` is the leak, as a POSITIVE magnitude: the R that would come
+ * back if every overrun had stopped where it was planned to. Positive because
+ * it sits beside `total_r` and `avg_r`, both negative on a losing account,
+ * where another negative figure would read as further loss rather than as
+ * loss that need not have happened.
+ *
+ * Says nothing about WHY a trade overran -- gapping through a stop and
+ * widening one by hand need different fixes, and `actual_stop_loss` carries
+ * no signal to tell them apart (it never differs from the planned stop).
+ */
+export interface StopIntegrity {
+  /** Losses that went past their stop. */
+  overrun_count: number;
+  /** Losses that respected it, including a clean stop-out at exactly -1R. */
+  within_count: number;
+  /** The two above summed -- what the overrun share is a share OF. */
+  assessed_losses: number;
+  /** Losses with no usable stop, so no planned risk to compare against. */
+  unassessable_losses: number;
+  /** Null, never 0, when nothing overran. */
+  avg_overrun_r: number | null;
+  worst_overrun_r: number | null;
+  /** Combined realised P&L of the overruns. */
+  overrun_pnl: number;
+  recoverable_r: number;
+  /** The worst few, named so a repeated ticker or a cluster is visible. */
+  worst_overruns: StopOverrun[];
+}
+
 export interface AdvancedMetrics {
   /** Trades with both an exit and a usable stop, so R could be computed. */
   scored_trades: number;
@@ -1348,6 +1389,14 @@ export interface AdvancedMetrics {
    */
   avg_journal_lag_hours: number | null;
   journal_lag_sample: number;
+  /**
+   * How losses ended relative to the stop they were planned against.
+   *
+   * Distinct from `r_distribution`, whose `-2R..-1R` bucket reads as
+   * "stopped out" when every trade in it went PAST the stop. A clean
+   * stop-out is exactly -1R and lands in `-1R..0R`.
+   */
+  stop_integrity: StopIntegrity;
   r_distribution: Record<string, number>;
   mistake_breakdown: MistakeBreakdown[];
   discipline_breakdown: DisciplineBreakdown[];

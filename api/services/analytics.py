@@ -1140,6 +1140,99 @@ def compute_journal_lag(trade: ReviewedTrade) -> Optional[float]:
     return round(lag_hours, 2)
 
 
+#: How many of the worst overruns to name individually. Enough to see a
+#: pattern -- a repeated ticker, a cluster of dates -- without turning the
+#: payload into a second copy of the ledger.
+STOP_OVERRUN_SAMPLE = 8
+
+
+def compute_stop_integrity(trades: list[ReviewedTrade]) -> dict[str, Any]:
+    """How losses ended relative to the stop they were planned against.
+
+    The one question the R distribution nearly answers and cannot quite: of
+    the trades that lost, how many lost MORE than the risk they were sized
+    for? A trade stopped out cleanly is -1R and costs exactly what it was
+    supposed to. A trade that ends at -1.4R spent 40% more than the plan
+    allowed, and no other figure on the Analytics page separates the two --
+    `avg_r` averages them together, and the distribution's `-2R..-1R` bucket
+    is easy to read as "stopped out" when every trade in it went past the
+    stop.
+
+    `recoverable_r` is the size of that leak: the R that would come back if
+    every overrun had stopped where it was planned to. Reported as a positive
+    magnitude, because it is money not lost rather than money made -- and
+    because the alternative reading, a negative number beside other negative
+    numbers, is one sign flip away from looking like more loss.
+
+    WHAT THIS DELIBERATELY DOES NOT CLAIM. It does not say WHY a trade
+    overran. Gapping through a stop overnight and widening a stop by hand are
+    different failures with different fixes, and this account's data cannot
+    tell them apart: `trades.actual_stop_loss` is populated on 122 of 140
+    round trips and differs from `trades.stop_loss` on ZERO of them, so it
+    carries no signal about stops that moved. Splitting the count on that
+    column would report "0 moved, 49 gapped" and read as a finding, when it
+    is an artefact of a field that is never edited. The classification is left
+    to `exit_reason`, which is the field that would actually record it.
+
+    Losses with no usable stop cannot be assessed at all -- there is no
+    planned risk to compare against -- and are counted separately rather than
+    folded in as compliant, for the same reason `unscored_trades` exists.
+    """
+    overruns: list[tuple[ReviewedTrade, float]] = []
+    within = 0
+    unassessable = 0
+
+    for trade in trades:
+        r = compute_r_multiple(trade)
+        if r is None:
+            # A loss that cannot be scored still deserves counting, so the
+            # denominator below is not quietly smaller than the real one.
+            if trade.realized_pnl is not None and trade.realized_pnl < 0:
+                unassessable += 1
+            continue
+        if r >= 0:
+            continue
+        if r < -1:
+            overruns.append((trade, r))
+        else:
+            within += 1
+
+    # Sum of (r + 1): how far past -1R each overrun went, added up. Negated
+    # so the figure reads as a magnitude -- see the docstring.
+    recoverable_r = -sum(r + 1 for _, r in overruns) if overruns else 0.0
+    overrun_pnl = sum(
+        float(t.realized_pnl) for t, _ in overruns if t.realized_pnl is not None
+    )
+
+    worst = sorted(overruns, key=lambda pair: pair[1])[:STOP_OVERRUN_SAMPLE]
+
+    return {
+        "overrun_count": len(overruns),
+        "within_count": within,
+        # Losses that had a stop to be measured against, which is what the
+        # overrun share is a share OF.
+        "assessed_losses": len(overruns) + within,
+        "unassessable_losses": unassessable,
+        "avg_overrun_r": (
+            round(sum(r for _, r in overruns) / len(overruns), 4) if overruns else None
+        ),
+        "worst_overrun_r": round(min(r for _, r in overruns), 4) if overruns else None,
+        "overrun_pnl": round(overrun_pnl, 2) if overruns else 0.0,
+        "recoverable_r": round(recoverable_r, 4),
+        "worst_overruns": [
+            {
+                "ticker": t.ticker,
+                "exit_time": t.exit_time.isoformat() if t.exit_time else None,
+                "r_multiple": round(r, 4),
+                "realized_pnl": (
+                    float(t.realized_pnl) if t.realized_pnl is not None else None
+                ),
+                "strategy": t.strategy,
+            }
+            for t, r in worst
+        ],
+    }
+
 def compute_expectancy(r_multiples: list[float]) -> Optional[float]:
     """(win rate x avg win R) - (loss rate x avg loss R).
 
@@ -1579,6 +1672,7 @@ def compute_advanced_metrics(trades: list[ReviewedTrade]) -> dict[str, Any]:
             round(sum(journal_lags) / len(journal_lags), 2) if journal_lags else None
         ),
         "journal_lag_sample": len(journal_lags),
+        "stop_integrity": compute_stop_integrity(trades),
         "r_distribution": _r_distribution(r_multiples),
         "mistake_breakdown": mistake_breakdown,
         "discipline_breakdown": compute_discipline_breakdown(

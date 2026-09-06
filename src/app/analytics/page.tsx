@@ -21,7 +21,7 @@ import {
   DEFAULT_SELECTION,
   TimeframeToolbar,
 } from '@/components/TimeframeToolbar';
-import { formatDuration } from '@/lib/format';
+import { formatDuration, formatMoney } from '@/lib/format';
 import type {
   AdvancedMetrics,
   Position,
@@ -66,6 +66,158 @@ function KpiCard({
       </span>
       <div className={`mt-2 text-2xl font-bold font-mono ${toneClass}`}>{value}</div>
       {hint && <p className="mt-1 text-[10px] text-obsidian-muted">{hint}</p>}
+    </div>
+  );
+}
+
+/**
+ * Losses that went past the stop they were planned against.
+ *
+ * The R-distribution beside it cannot answer this. Its `-2R..-1R` bucket
+ * reads as "stopped out" when in fact every trade in it went PAST the stop --
+ * a clean stop-out is exactly -1R and lands in `-1R..0R`. So a page showing
+ * both an R distribution and an average R can still leave the single largest
+ * leak on an account invisible.
+ *
+ * `recoverable_r` is the headline because it is the figure a decision gets
+ * made on: the R that comes back if every overrun had stopped where it was
+ * planned to. It is deliberately shown against `total_r`, since "11.68R
+ * recoverable" against "-5.91R total" says something a percentage cannot --
+ * that the strategies are not the problem.
+ *
+ * It does NOT say why any trade overran. Gapping through a stop overnight and
+ * widening one by hand need different fixes, and nothing in the data
+ * distinguishes them: `actual_stop_loss` never differs from the planned stop.
+ * The caption points at `exit_reason` instead, which is the field that would
+ * record it.
+ */
+function StopIntegrityCard({ metrics }: { metrics: AdvancedMetrics }) {
+  const s = metrics.stop_integrity;
+
+  if (s.assessed_losses === 0) {
+    return (
+      <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+        <h3 className="text-sm font-semibold text-slate-200 mb-2">Stop Integrity</h3>
+        <p className="text-xs text-obsidian-muted">
+          No losses with a stop to measure against yet.
+          {s.unassessable_losses > 0 &&
+            ` ${s.unassessable_losses} loss${
+              s.unassessable_losses === 1 ? '' : 'es'
+            } had no usable stop.`}
+        </p>
+      </div>
+    );
+  }
+
+  const share = (s.overrun_count / s.assessed_losses) * 100;
+
+  return (
+    <div className="p-5 rounded-xl border border-obsidian-border bg-obsidian-card">
+      <h3 className="text-sm font-semibold text-slate-200 mb-1">Stop Integrity</h3>
+      <p className="text-[11px] text-obsidian-muted mb-4">
+        Of the losses that had a stop, how many cost more than it allowed. A
+        clean stop-out is exactly &minus;1R.
+      </p>
+
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <span className="block text-[10px] uppercase tracking-wide text-obsidian-muted">
+            Past the stop
+          </span>
+          <span className="font-mono font-bold text-lg text-loss">
+            {s.overrun_count}
+            <span className="ml-1 text-xs text-obsidian-muted">
+              of {s.assessed_losses} ({share.toFixed(0)}%)
+            </span>
+          </span>
+        </div>
+        <div>
+          <span className="block text-[10px] uppercase tracking-wide text-obsidian-muted">
+            Recoverable
+          </span>
+          {/* Not toned as a win: it is loss that need not have happened, not
+              profit. Amber reads as "attention", which is what it is. */}
+          <span className="font-mono font-bold text-lg text-amber-300">
+            {s.recoverable_r.toFixed(2)}R
+          </span>
+          <span className="block text-[10px] text-obsidian-muted">
+            if every stop had held
+          </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 text-[11px] mb-4">
+        <div className="flex justify-between">
+          <span className="text-obsidian-muted">Avg overrun</span>
+          <span className="font-mono text-slate-200">
+            {s.avg_overrun_r === null ? '—' : `${s.avg_overrun_r.toFixed(2)}R`}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-obsidian-muted">Worst</span>
+          <span className="font-mono text-slate-200">
+            {s.worst_overrun_r === null ? '—' : `${s.worst_overrun_r.toFixed(2)}R`}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-obsidian-muted">Within plan</span>
+          <span className="font-mono text-slate-200">{s.within_count}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-obsidian-muted">Their P&amp;L</span>
+          <span className="font-mono text-loss">
+            {formatMoney(s.overrun_pnl)}
+          </span>
+        </div>
+      </div>
+
+      {s.worst_overruns.length > 0 && (
+        <div className="border-t border-obsidian-border pt-3">
+          <span className="block text-[10px] uppercase tracking-wide text-obsidian-muted mb-2">
+            Worst offenders
+          </span>
+          <div className="space-y-1.5">
+            {s.worst_overruns.map((o) => (
+              <div
+                key={`${o.ticker}-${o.exit_time ?? ''}-${o.r_multiple}`}
+                className="flex items-baseline gap-2 text-[11px]"
+              >
+                <span className="w-14 shrink-0 font-mono text-slate-200">
+                  {o.ticker}
+                </span>
+                <span className="w-16 shrink-0 font-mono text-loss">
+                  {o.r_multiple.toFixed(2)}R
+                </span>
+                <span className="w-20 shrink-0 font-mono text-obsidian-muted">
+                  {o.realized_pnl === null ? '—' : formatMoney(o.realized_pnl)}
+                </span>
+                <span className="truncate text-obsidian-muted">
+                  {o.strategy ?? 'Unassigned'}
+                  {o.exit_time !== null && (
+                    <span className="ml-1.5">
+                      {new Date(o.exit_time).toLocaleDateString()}
+                    </span>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Stated rather than guessed at. Splitting these into "gapped" and
+          "moved the stop" needs a record of which, and exit_reason is the
+          field that holds it. */}
+      <p className="mt-3 text-[10px] leading-relaxed text-obsidian-muted">
+        Why they overran is not recorded — a gap through the stop and a stop
+        moved by hand need different fixes. Set{' '}
+        <span className="text-slate-300">exit reason</span> when reviewing to
+        tell them apart.
+        {s.unassessable_losses > 0 &&
+          ` ${s.unassessable_losses} further loss${
+            s.unassessable_losses === 1 ? '' : 'es'
+          } had no usable stop and are excluded.`}
+      </p>
     </div>
   );
 }
@@ -860,17 +1012,24 @@ export default function AnalyticsPage() {
               />
             </section>
 
+            {/* Directly under the R distribution on purpose: this is the
+                question that chart invites and cannot answer, since its
+                -2R..-1R bucket holds only trades that went PAST the stop. */}
             <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <RDistribution metrics={m} />
+              <StopIntegrityCard metrics={m} />
+            </section>
+
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <MistakeBreakdown metrics={m} />
+              <DisciplineBreakdown metrics={m} />
             </section>
 
             <section>
               <StrategyBreakdownChart metrics={m} />
             </section>
 
-            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <DisciplineBreakdown metrics={m} />
+            <section>
               <ComplianceBuckets metrics={m} />
             </section>
           </>

@@ -97,6 +97,7 @@ import type {
   DisciplineBreakdown as DisciplineBreakdownRow,
   MistakeBreakdown as MistakeBreakdownRow,
   Position,
+  StopIntegrity,
   StrategyBreakdown as StrategyBreakdownRow,
   ToolbarWindow,
 } from '@/types/api';
@@ -117,6 +118,22 @@ function toolbarWindow(overrides: Partial<ToolbarWindow> = {}): ToolbarWindow {
   };
 }
 
+/** The empty stop-integrity shape; override per test. */
+function stopIntegrity(overrides: Partial<StopIntegrity> = {}): StopIntegrity {
+  return {
+    overrun_count: 0,
+    within_count: 0,
+    assessed_losses: 0,
+    unassessable_losses: 0,
+    avg_overrun_r: null,
+    worst_overrun_r: null,
+    overrun_pnl: 0,
+    recoverable_r: 0,
+    worst_overruns: [],
+    ...overrides,
+  };
+}
+
 /** Every field defaulted to an empty/neutral shape; override per test. */
 function advancedMetrics(overrides: Partial<AdvancedMetrics> = {}): AdvancedMetrics {
   return {
@@ -131,6 +148,7 @@ function advancedMetrics(overrides: Partial<AdvancedMetrics> = {}): AdvancedMetr
     slippage_sample: 0,
     avg_journal_lag_hours: null,
     journal_lag_sample: 0,
+    stop_integrity: stopIntegrity(),
     r_distribution: {},
     mistake_breakdown: [],
     discipline_breakdown: [],
@@ -404,6 +422,175 @@ describe('KpiCard / metric() formatting', () => {
     await mountPage();
     expect(kpiValue('Journal Lag')).toHaveTextContent('—');
     expect(screen.getByText('Nothing journaled yet')).toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------
+  // Stop integrity: the leak the R distribution cannot show
+  // ---------------------------------------------------------------------
+
+  it('says it has nothing to measure when no loss had a stop', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({ stop_integrity: stopIntegrity({ assessed_losses: 0 }) })
+    );
+    await mountPage();
+    expect(
+      screen.getByText(/No losses with a stop to measure against yet/)
+    ).toBeInTheDocument();
+  });
+
+  it('counts unassessable losses in the empty state, pluralised', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({ assessed_losses: 0, unassessable_losses: 3 }),
+      })
+    );
+    await mountPage();
+    expect(screen.getByText(/3 losses had no usable stop/)).toBeInTheDocument();
+  });
+
+  it('uses the singular for exactly one unassessable loss', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({ assessed_losses: 0, unassessable_losses: 1 }),
+      })
+    );
+    await mountPage();
+    expect(screen.getByText(/1 loss had no usable stop/)).toBeInTheDocument();
+  });
+
+  it('reports the overrun share and the R it would give back', async () => {
+    // The real account's shape: 49 of 83 assessed losses went past the stop,
+    // worth 11.68R against a total of -5.91R.
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 49,
+          within_count: 34,
+          assessed_losses: 83,
+          avg_overrun_r: -1.2384,
+          worst_overrun_r: -4.02,
+          overrun_pnl: -1361.26,
+          recoverable_r: 11.6828,
+        }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText(/of 83 \(59%\)/)).toBeInTheDocument();
+    expect(screen.getByText('11.68R')).toBeInTheDocument();
+    expect(screen.getByText('-1.24R')).toBeInTheDocument();
+    expect(screen.getByText('-4.02R')).toBeInTheDocument();
+  });
+
+  it('dashes the overrun averages rather than printing 0R when nothing overran', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 0,
+          within_count: 12,
+          assessed_losses: 12,
+          avg_overrun_r: null,
+          worst_overrun_r: null,
+        }),
+      })
+    );
+    await mountPage();
+
+    // 0R would be a claim about trades that do not exist.
+    expect(screen.getByText('Avg overrun').parentElement).toHaveTextContent('—');
+    expect(screen.getByText('Worst').parentElement).toHaveTextContent('—');
+  });
+
+  it('names the worst offenders with everything needed to find the trade', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 1,
+          assessed_losses: 1,
+          recoverable_r: 3.02,
+          worst_overruns: [
+            {
+              ticker: 'AMZN',
+              exit_time: '2026-05-28T13:40:53+00:00',
+              r_multiple: -4.02,
+              realized_pnl: -14.87,
+              strategy: 'Breakout form base/within base',
+            },
+          ],
+        }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText('AMZN')).toBeInTheDocument();
+    expect(screen.getByText('Breakout form base/within base', { exact: false })).toBeInTheDocument();
+  });
+
+  it('falls back to Unassigned and dashes a missing P&L on an offender row', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 1,
+          assessed_losses: 1,
+          worst_overruns: [
+            {
+              ticker: 'ZZZ',
+              exit_time: null,
+              r_multiple: -1.5,
+              realized_pnl: null,
+              strategy: null,
+            },
+          ],
+        }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText('Unassigned')).toBeInTheDocument();
+  });
+
+  it('says the cause is unrecorded rather than guessing at it', async () => {
+    // The honest half: actual_stop_loss never differs from the planned stop,
+    // so gapped-vs-moved cannot be split. The card points at exit_reason.
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({ overrun_count: 2, assessed_losses: 5 }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText(/Why they overran is not recorded/)).toBeInTheDocument();
+    expect(screen.getByText('exit reason')).toBeInTheDocument();
+  });
+
+  it('mentions excluded stopless losses under a populated card too', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 2,
+          assessed_losses: 5,
+          unassessable_losses: 6,
+        }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText(/6 further losses had no usable stop/)).toBeInTheDocument();
+  });
+
+  it('uses the singular for one excluded stopless loss', async () => {
+    mocked.getAdvancedMetrics.mockResolvedValue(
+      advancedMetrics({
+        stop_integrity: stopIntegrity({
+          overrun_count: 2,
+          assessed_losses: 5,
+          unassessable_losses: 1,
+        }),
+      })
+    );
+    await mountPage();
+
+    expect(screen.getByText(/1 further loss had no usable stop/)).toBeInTheDocument();
   });
 
   it('lays the six KPI cards out three across, so they fill two even rows', async () => {
