@@ -27,6 +27,29 @@ const money = (value: number) =>
   })}`;
 
 /**
+ * Below this many trades, a cell is marked as a thin sample.
+ *
+ * The same 20 as BreakevenCheck's own THIN_SAMPLE, and it lands well here
+ * rather than by coincidence: this grid splits an account across 20 cells, so
+ * a populated one is either a session actually traded regularly or a handful
+ * of one-offs, with very little in between. On the ledger this was written
+ * against, the five morning cells hold 23-26 trades each and the other seven
+ * populated cells hold one to four.
+ *
+ * Nothing is hidden by this. A single-trade cell is real history and belongs
+ * on the grid; what it must not do is carry the same visual weight as a
+ * twenty-six-trade cell, because the colour is what the eye reads as a
+ * pattern. "Wednesday After-Hours loses money" off one trade is a sentence
+ * this chart was previously happy to imply.
+ */
+const THIN_CELL_SAMPLE = 20;
+
+/** A populated cell with too few trades to read as a pattern. */
+function isThinSample(cell: HeatmapCell): boolean {
+  return cell.trade_count > 0 && cell.trade_count < THIN_CELL_SAMPLE;
+}
+
+/**
  * A cell with trades but no losses at all.
  *
  * `profit_factor === null` is the backend's signal for "gross losses were
@@ -39,13 +62,41 @@ function isPerfectSession(cell: HeatmapCell): boolean {
   );
 }
 
+/**
+ * A perfect session with the sample to back it.
+ *
+ * Gold plus a sparkle is the strongest claim this grid makes, and off two
+ * trades it is also the least earned -- "no losses at all" is nearly
+ * guaranteed at n=2. A thin cell therefore loses the treatment and keeps only
+ * its muted colour.
+ *
+ * One predicate rather than the same condition written at both call sites,
+ * so the styling and the icon cannot drift into disagreeing about which
+ * cells qualify.
+ */
+function isEarnedPerfectSession(cell: HeatmapCell): boolean {
+  return isPerfectSession(cell) && !isThinSample(cell);
+}
+
 function cellClasses(cell: HeatmapCell): string {
   if (cell.trade_count === 0) {
     return 'bg-obsidian-bg/60 text-obsidian-muted border-obsidian-border/50 hover:border-slate-600';
   }
-  if (isPerfectSession(cell)) {
+  if (isEarnedPerfectSession(cell)) {
     // Gold: flawless execution, visually distinct from ordinary profit.
     return 'bg-amber-400/15 text-amber-300 border-amber-400/60 shadow-[0_0_16px_-3px_rgba(251,191,36,0.45)] hover:border-amber-300 font-semibold';
+  }
+  // Checked before the win/loss scales, so a thin cell never gets the glow.
+  // Dashed and desaturated, keeping the sign legible while withholding the
+  // emphasis that makes a cell read as a finding.
+  if (isThinSample(cell)) {
+    if (cell.net_pnl > 0) {
+      return 'bg-win/[0.07] text-win/70 border-dashed border-win/30 hover:border-win/60';
+    }
+    if (cell.net_pnl < 0) {
+      return 'bg-loss/[0.07] text-loss/70 border-dashed border-loss/30 hover:border-loss/60';
+    }
+    return 'bg-slate-800/30 text-slate-400 border-dashed border-slate-700 hover:border-slate-500';
   }
   if (cell.net_pnl > 0) {
     return 'bg-win/20 text-win border-win/40 shadow-win-glow hover:border-win font-medium';
@@ -127,6 +178,12 @@ export const DayOfWeekHeatmap: React.FC<DayOfWeekHeatmapProps> = ({
         <span className="text-obsidian-muted">Loss</span>
       </div>
       <div className="flex items-center space-x-1.5">
+        <span className="h-3 w-3 rounded border border-dashed border-slate-500 inline-block" />
+        <span className="text-obsidian-muted">
+          Under {THIN_CELL_SAMPLE} trades
+        </span>
+      </div>
+      <div className="flex items-center space-x-1.5">
         <span className="h-3 w-3 rounded bg-obsidian-bg/60 border border-obsidian-border/50 inline-block" />
         <span className="text-obsidian-muted">No trades</span>
       </div>
@@ -189,7 +246,7 @@ export const DayOfWeekHeatmap: React.FC<DayOfWeekHeatmapProps> = ({
                   };
                   const isHovered =
                     hovered?.day === day && hovered?.session === session;
-                  const perfect = isPerfectSession(cell);
+                  const perfect = isEarnedPerfectSession(cell);
 
                   return (
                     <div
@@ -218,6 +275,15 @@ export const DayOfWeekHeatmap: React.FC<DayOfWeekHeatmapProps> = ({
                             }`
                           : 'No trades'}
                       </div>
+                      {/* The count alone does not say whether it is enough.
+                          Spelled out on the cell rather than only in the
+                          hover, since the colour is read at a glance and the
+                          tooltip is not. */}
+                      {isThinSample(cell) && (
+                        <div className="text-[9px] uppercase tracking-wide opacity-60 mt-0.5">
+                          thin
+                        </div>
+                      )}
 
                       {/* Tooltip */}
                       {isHovered && cell.trade_count > 0 && (
