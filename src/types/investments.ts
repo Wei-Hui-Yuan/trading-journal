@@ -38,6 +38,26 @@ export interface ValuationScenario {
   growth_1_5: number;
   growth_6_10: number;
   growth_11_20: number;
+  /**
+   * Growth assumed to continue FOREVER after year 20 — a different claim
+   * from `growth_11_20`, which covers a finite decade. Null only when the
+   * model could not run at all.
+   */
+  perpetual_growth?: number | null;
+  /**
+   * The same trade valued with a perpetuity after year 20. NULL when the
+   * discount rate is too close to (or below) perpetual growth: Gordon growth
+   * has no upper bound as that spread approaches zero, so the model reports
+   * nothing rather than an enormous number. A hand-set discount rate below
+   * ~4.5% will do this.
+   */
+  intrinsic_value_with_terminal?: number | null;
+  /**
+   * How much of the with-terminal value comes from the perpetuity, 0–100.
+   * Shown because a figure that is 80% terminal is a statement about the
+   * discount rate rather than about the business.
+   */
+  terminal_share_pct?: number | null;
 }
 
 /**
@@ -56,6 +76,13 @@ export interface HoldingValuation {
   conservative?: ValuationScenario;
   /** Simple mean of base and conservative, not a probability weighting. */
   average_intrinsic_value?: number;
+  /**
+   * The same mean for the with-terminal figures. Null unless BOTH scenarios
+   * produced one — mixing a with-terminal base with a twenty-year
+   * conservative would average two different models into a number that is
+   * neither.
+   */
+  average_intrinsic_value_with_terminal?: number | null;
   /**
    * (price / intrinsic value - 1) x 100. POSITIVE means the market is asking
    * MORE than the model says it is worth, so a negative figure is the

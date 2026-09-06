@@ -121,7 +121,7 @@ export const ValuationModal: React.FC<{
               )}
             </h2>
             <p className="mt-0.5 text-[11px] text-obsidian-muted">
-              Twenty-year discounted cash flow · no terminal value
+              Twenty-year discounted cash flow, with and without a terminal value
             </p>
           </div>
           <button
@@ -178,6 +178,93 @@ export const ValuationModal: React.FC<{
               </span>
               . Fill them in on the right and it will value on save.
             </span>
+          </div>
+        )}
+
+        {/* ---------------- the same trade, with a perpetuity ----------------
+
+            Shown BESIDE the twenty-year figures rather than replacing them.
+            The two answer different questions -- "what are two decades of
+            this flow worth" and "what is it worth if the business simply
+            continues" -- and the gap between them is the output. A terminal
+            value that doubles the number is saying the thesis rests on year
+            21 onwards, which is worth seeing rather than averaging away.
+
+            When the model declines, the reason is stated rather than the row
+            hidden. A discount rate at or below perpetual growth has no finite
+            answer at all, and that is usually a hand-set rate doing it. */}
+        {valuation?.available && valuation.base && (
+          <div className="border-b border-obsidian-border px-5 py-3">
+            {valuation.base.intrinsic_value_with_terminal != null ? (
+              <>
+                <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2">
+                  <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+                    With terminal value
+                  </span>
+                  <span className="text-[10px] text-obsidian-muted">
+                    perpetuity at{' '}
+                    {((valuation.base.perpetual_growth ?? 0) * 100).toFixed(1)}%
+                    {valuation.base.terminal_share_pct != null && (
+                      <>
+                        {' · '}
+                        <span
+                          className={
+                            valuation.base.terminal_share_pct >= 75
+                              ? 'text-amber-300'
+                              : ''
+                          }
+                        >
+                          {valuation.base.terminal_share_pct.toFixed(0)}% of the
+                          value is the perpetuity
+                        </span>
+                      </>
+                    )}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-x-6 gap-y-1 font-mono text-[11px]">
+                  {[
+                    ['Base', valuation.base.intrinsic_value_with_terminal],
+                    [
+                      'Conservative',
+                      valuation.conservative?.intrinsic_value_with_terminal,
+                    ],
+                    ['Average', valuation.average_intrinsic_value_with_terminal],
+                  ].map(([label, value]) => (
+                    <span key={String(label)}>
+                      <span className="text-obsidian-muted">{label} </span>
+                      <span className="text-slate-100">
+                        {value == null ? '—' : display(value as number)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+                {/* A perpetuity worth three quarters of the answer is a
+                    statement about the discount rate, not the business. */}
+                {(valuation.base.terminal_share_pct ?? 0) >= 75 && (
+                  <p className="mt-1.5 text-[10px] text-amber-300">
+                    Most of this comes from after year 20. Treat it as a
+                    statement about the discount rate rather than about the
+                    business.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-[10px] leading-relaxed text-obsidian-muted">
+                <span className="uppercase tracking-wide">
+                  No terminal value
+                </span>{' '}
+                — a perpetuity needs the discount rate to sit clearly above
+                perpetual growth
+                {valuation.base.perpetual_growth != null &&
+                  ` (${(valuation.base.perpetual_growth * 100).toFixed(1)}%)`}
+                , and this one is{' '}
+                {valuation.discount_rate != null
+                  ? `${(valuation.discount_rate * 100).toFixed(2)}%`
+                  : 'lower'}
+                . Below that the formula has no finite answer, so nothing is
+                reported rather than a very large number.
+              </p>
+            )}
           </div>
         )}
 

@@ -98,3 +98,97 @@ describe('the filing-currency prompt', () => {
     expect(screen.queryByText(/Filing currency unknown/)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * The terminal-value row.
+ *
+ * Two branches, and the refusing one carries most of the weight. Gordon
+ * growth divides by (discount rate - perpetual growth), so as that spread
+ * approaches zero the value has no upper bound -- and this book's own
+ * numbers put HALF its holdings on a spread under 2% against the stage-3
+ * constant, which is a 53x-76x terminal multiple. The row has to decline
+ * loudly rather than print a very large number.
+ */
+describe('the terminal-value row', () => {
+  const valued = (over: Record<string, unknown>) =>
+    ({
+      ...(holding('USD', 1) as unknown as Record<string, unknown>),
+      valuation: {
+        available: true,
+        discount_rate: 0.0627,
+        base: {
+          scenario: 'base',
+          intrinsic_value: 369.71,
+          growth_1_5: 0.1829,
+          growth_6_10: 0.15,
+          growth_11_20: 0.04,
+          perpetual_growth: 0.025,
+          intrinsic_value_with_terminal: 871.11,
+          terminal_share_pct: 57.9,
+          ...over,
+        },
+        conservative: {
+          scenario: 'conservative',
+          intrinsic_value: 296.64,
+          growth_1_5: 0.1829,
+          growth_6_10: 0.09145,
+          growth_11_20: 0.025,
+          perpetual_growth: 0.02,
+          intrinsic_value_with_terminal: 590.0,
+          terminal_share_pct: 50.1,
+        },
+        average_intrinsic_value: 333.17,
+        average_intrinsic_value_with_terminal: 730.56,
+        premium_pct: 54.1,
+        overridden_fields: [],
+      },
+    }) as never;
+
+  it('shows the with-terminal figures beside the twenty-year ones', () => {
+    renderModal(valued({}));
+
+    // Both models on screen at once -- the gap between them is the output.
+    expect(screen.getByText('369.71')).toBeInTheDocument();
+    expect(screen.getByText('871.11')).toBeInTheDocument();
+    expect(screen.getByText('730.56')).toBeInTheDocument();
+  });
+
+  it('says how much of the value is the perpetuity', () => {
+    renderModal(valued({}));
+
+    expect(
+      screen.getByText(/58% of the value is the perpetuity/)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/perpetuity at 2.5%/)).toBeInTheDocument();
+  });
+
+  it('warns when the perpetuity dominates the answer', () => {
+    renderModal(valued({ terminal_share_pct: 82.0 }));
+
+    expect(
+      screen.getByText(/statement about the discount rate rather than about the business/)
+    ).toBeInTheDocument();
+  });
+
+  it('stays quiet about dominance at an ordinary share', () => {
+    renderModal(valued({}));
+
+    expect(
+      screen.queryByText(/statement about the discount rate rather than/)
+    ).not.toBeInTheDocument();
+  });
+
+  it('explains itself instead of printing a number when it declines', () => {
+    // The real case: a hand-set 2% discount rate sits BELOW the 2.5%
+    // perpetual growth, where the formula has no finite answer at all.
+    renderModal(
+      valued({ intrinsic_value_with_terminal: null, terminal_share_pct: null })
+    );
+
+    expect(screen.getByText(/No terminal value/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/no finite answer, so nothing is reported/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText('871.11')).not.toBeInTheDocument();
+  });
+});

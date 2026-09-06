@@ -192,6 +192,20 @@ class ScenarioResult:
     growth_6_10: float
     growth_11_20: float
     present_value: float
+    # The same trade valued WITH a perpetuity after year 20. Reported beside
+    # the twenty-year figure rather than replacing it: the two answer
+    # different questions, and the gap between them is the point -- a
+    # terminal value that doubles the number is telling you the thesis rests
+    # on year 21 onwards.
+    perpetual_growth: Optional[float] = None
+    #: PV of the perpetuity, in statement currency. None when the spread
+    #: guard refused it.
+    terminal_present_value: Optional[float] = None
+    intrinsic_value_with_terminal: Optional[float] = None
+    #: What share of the with-terminal value comes from the perpetuity, 0-100.
+    #: Surfaced because a model whose answer is 80% terminal is really a
+    #: statement about the discount rate, not about the business.
+    terminal_share_pct: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +218,11 @@ class ValuationResult:
     # "Average IV" -- verified against a row carrying both: (3837 + 3172)/2
     # = 3504.50 exactly. Deliberately NOT a probability weighting.
     average_intrinsic_value: float
+    #: The same mean for the with-terminal figures. None unless BOTH
+    #: scenarios produced one -- averaging a with-terminal base against a
+    #: twenty-year conservative would silently mix two models into a number
+    #: that is neither.
+    average_intrinsic_value_with_terminal: Optional[float] = None
 
     def premium_pct(self, price: float, against: str = "average") -> Optional[float]:
         """(price / intrinsic value - 1) x 100.
@@ -239,6 +258,95 @@ def present_value_of_flows(base_flow: float, rate: float,
     return total
 
 
+# ---------------------------------------------------------------------------
+# Terminal value
+# ---------------------------------------------------------------------------
+
+#: Growth assumed to continue FOREVER, after the twenty explicit years.
+#:
+#: NOT `TERMINAL_GROWTH`, despite the name of that constant, and the
+#: distinction is the whole reason this model needed its own number. Stage 3
+#: is what years 11-20 grow at -- a finite stretch, and 4% for a decade is an
+#: ordinary assumption. A PERPETUAL rate is a different claim: it says the
+#: company outgrows the economy for the rest of time, so it cannot plausibly
+#: exceed long-run nominal GDP.
+#:
+#: Reusing stage 3 here is not merely aggressive, it is arithmetically
+#: unstable on this book. Gordon growth divides by (rate - growth), and with
+#: stage 3 at 4% against derived discount rates of 5.37%-7.77%, HALF of the
+#: holdings land on a spread under 2%: CHRW, FDS, MBGL, NVO, PANW, SHLD, TMO
+#: and UNH all sit at 1.37%, which is a terminal multiple of 76x final-year
+#: cash flow. MSFT lands at 52.8x. Those figures are driven entirely by the
+#: gap between two assumptions, neither of them measured, and they would
+#: dominate the valuation while looking precise.
+#:
+#: At 2.5% every holding in the book clears the guard below, with multiples
+#: between 19x and 36x -- a range a reader can argue with rather than one
+#: that swamps the explicit forecast.
+PERPETUAL_GROWTH: dict[tuple[str, str], float] = {
+    ("US", "base"): 0.025,
+    ("US", "conservative"): 0.020,
+    ("HK", "base"): 0.030,
+    ("HK", "conservative"): 0.025,
+}
+
+#: Minimum (discount rate - perpetual growth) before a terminal value is
+#: reported at all.
+#:
+#: Gordon growth has no upper bound as the denominator approaches zero, so
+#: without a floor a low-beta holding produces an enormous number rather than
+#: an error. Below this the model does not return a smaller value, it returns
+#: NOTHING -- the same "None rather than a fabricated figure" contract
+#: premium_pct and compute_r_multiple already keep. A caller that wants a
+#: value anyway can raise the discount rate by hand, which is a decision
+#: rather than a default.
+MIN_TERMINAL_SPREAD = 0.02
+
+
+def final_year_flow(base_flow: float, stage_1: float, stage_2: float,
+                    stage_3: float) -> float:
+    """The flow in year `HORIZON`, which is what perpetuity grows from.
+
+    Deliberately a separate walk rather than a second return value from
+    `present_value_of_flows`: that function's signature is called directly by
+    a dozen tests, and widening it to serve this model would change every one
+    of them for a number they do not use. The loop is four lines and the two
+    must agree, so the growth schedule is applied identically here -- if they
+    ever diverge, `test_the_final_flow_matches_the_last_year_of_the_sum`
+    fails.
+    """
+    flow = base_flow
+    for year in range(1, HORIZON + 1):
+        if year <= STAGE_1_END:
+            flow *= (1.0 + stage_1)
+        elif year <= STAGE_2_END:
+            flow *= (1.0 + stage_2)
+        else:
+            flow *= (1.0 + stage_3)
+    return flow
+
+
+def present_value_of_terminal(final_flow: float, rate: float,
+                              perpetual_growth: float) -> Optional[float]:
+    """Gordon growth value of everything after year 20, discounted to today.
+
+        TV      = final_flow x (1 + g) / (rate - g)
+        PV(TV)  = TV / (1 + rate) ** HORIZON
+
+    None -- never a number -- when the spread is thinner than
+    MIN_TERMINAL_SPREAD, or when the flow being grown is not positive. A
+    negative denominator would return a NEGATIVE terminal value, which reads
+    as "the future is a liability" rather than as "this model does not apply
+    here", and a near-zero one returns a figure with no information in it.
+    """
+    if final_flow <= 0:
+        return None
+    spread = rate - perpetual_growth
+    if spread < MIN_TERMINAL_SPREAD:
+        return None
+    terminal = final_flow * (1.0 + perpetual_growth) / spread
+    return terminal / ((1.0 + rate) ** HORIZON)
+
 def value_scenario(inputs: ValuationInputs, rate: float,
                    scenario: Scenario) -> ScenarioResult:
     """One scenario's intrinsic value per share."""
@@ -250,21 +358,47 @@ def value_scenario(inputs: ValuationInputs, rate: float,
         # A company with no shares or no positive flow cannot be valued this
         # way. Zero is returned rather than a negative or a crash, and
         # premium_pct reports None for it rather than inventing a percentage.
+        # Terminal fields stay None: an unvaluable company has no
+        # perpetuity either, and a 0.0 there would read as a computed
+        # answer rather than an absent one.
         return ScenarioResult(scenario, 0.0, stage_1, stage_2, stage_3, 0.0)
 
     pv = present_value_of_flows(inputs.base_flow, rate, stage_1, stage_2, stage_3)
 
-    # The workbook's N16 - N18 + N20: everything per share, debt removed and
-    # cash added AFTER the division rather than folded into the flow.
-    per_share = pv / inputs.shares_outstanding
-    per_share -= inputs.total_debt / inputs.shares_outstanding
-    per_share += inputs.cash_and_st_investments / inputs.shares_outstanding
+    def per_share_value(total_pv: float) -> float:
+        """The workbook's N16 - N18 + N20, then the two currency hops.
 
-    # Statement currency -> USD -> listing currency. See ValuationInputs'
-    # docstring for why this is two hops rather than the one multiplication
-    # it used to be.
-    per_share_usd = per_share / inputs.statement_exchange_rate
-    intrinsic_value = per_share_usd * inputs.exchange_rate
+        Shared by the twenty-year and with-terminal figures rather than
+        written twice. Debt, cash and BOTH exchange rates apply identically
+        to either present value, and two copies of this arithmetic is exactly
+        how one variant ends up quietly missing a hop -- the failure issue #5
+        of the calculation audit already found once.
+        """
+        per_share = total_pv / inputs.shares_outstanding
+        per_share -= inputs.total_debt / inputs.shares_outstanding
+        per_share += inputs.cash_and_st_investments / inputs.shares_outstanding
+        # Statement currency -> USD -> listing currency. See ValuationInputs'
+        # docstring for why this is two hops rather than one multiplication.
+        return (per_share / inputs.statement_exchange_rate) * inputs.exchange_rate
+
+    intrinsic_value = per_share_value(pv)
+
+    perpetual = PERPETUAL_GROWTH[(inputs.region, scenario)]
+    terminal_pv = present_value_of_terminal(
+        final_year_flow(inputs.base_flow, stage_1, stage_2, stage_3),
+        rate,
+        perpetual,
+    )
+    with_terminal: Optional[float] = None
+    terminal_share: Optional[float] = None
+    if terminal_pv is not None:
+        with_terminal = per_share_value(pv + terminal_pv)
+        # Share of the COMBINED present value, not of the per-share figure --
+        # debt and cash shift the latter and would make the percentage read
+        # as something other than "how much of this comes from year 21 on".
+        combined = pv + terminal_pv
+        if combined > 0:
+            terminal_share = round(terminal_pv / combined * 100.0, 1)
 
     return ScenarioResult(
         scenario=scenario,
@@ -273,6 +407,12 @@ def value_scenario(inputs: ValuationInputs, rate: float,
         growth_6_10=stage_2,
         growth_11_20=stage_3,
         present_value=pv,
+        perpetual_growth=perpetual,
+        terminal_present_value=terminal_pv,
+        intrinsic_value_with_terminal=(
+            None if with_terminal is None else round(with_terminal, 2)
+        ),
+        terminal_share_pct=terminal_share,
     )
 
 
@@ -285,6 +425,11 @@ def value(inputs: ValuationInputs) -> ValuationResult:
     base = value_scenario(inputs, rate, "base")
     conservative = value_scenario(inputs, rate, "conservative")
 
+    both_have_terminal = (
+        base.intrinsic_value_with_terminal is not None
+        and conservative.intrinsic_value_with_terminal is not None
+    )
+
     return ValuationResult(
         ticker=inputs.ticker,
         discount_rate=rate,
@@ -292,5 +437,17 @@ def value(inputs: ValuationInputs) -> ValuationResult:
         conservative=conservative,
         average_intrinsic_value=round(
             (base.intrinsic_value + conservative.intrinsic_value) / 2.0, 2
+        ),
+        average_intrinsic_value_with_terminal=(
+            round(
+                (
+                    base.intrinsic_value_with_terminal
+                    + conservative.intrinsic_value_with_terminal
+                )
+                / 2.0,
+                2,
+            )
+            if both_have_terminal
+            else None
         ),
     )

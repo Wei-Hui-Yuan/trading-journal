@@ -8617,6 +8617,12 @@ def _value_holding(
             "growth_1_5": s.growth_1_5,
             "growth_6_10": s.growth_6_10,
             "growth_11_20": s.growth_11_20,
+            # The second model. Null rather than absent when the spread guard
+            # refused it, so the modal can say "not applicable here" instead
+            # of rendering a blank where a number belongs.
+            "perpetual_growth": s.perpetual_growth,
+            "intrinsic_value_with_terminal": s.intrinsic_value_with_terminal,
+            "terminal_share_pct": s.terminal_share_pct,
         }
 
     return {
@@ -8625,6 +8631,9 @@ def _value_holding(
         "base": scenario(result.base),
         "conservative": scenario(result.conservative),
         "average_intrinsic_value": result.average_intrinsic_value,
+        "average_intrinsic_value_with_terminal": (
+            result.average_intrinsic_value_with_terminal
+        ),
         # Positive means the market is asking more than the model says it is
         # worth. None when there is no price to compare against, rather than
         # a 0% that would read as "fairly priced".
