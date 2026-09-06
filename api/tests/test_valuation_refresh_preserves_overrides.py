@@ -54,6 +54,12 @@ class FakeFundamentals:
     currency = "USD"
     statement_currency = "USD"
     free_cash_flow_m = 70_000.0
+    # The two flows migration 039 keeps, in MSFT's real proportions: cash
+    # from operations well above free cash flow (the gap is capex), and net
+    # income between the two. Kept realistic rather than round because the
+    # ordering is what the three models are read for.
+    operating_cash_flow_m = 136_000.0
+    net_income_m = 88_000.0
     shares_outstanding_m = 7_400.0
     total_debt_ex_leases_m = 45_000.0
     cash_and_st_m = 80_000.0

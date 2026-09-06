@@ -61,6 +61,37 @@ export interface ValuationScenario {
 }
 
 /**
+ * Which line of the financial statements the twenty-year model is grown
+ * from. Three names for one engine, matching the reference tool's own bars:
+ *
+ *     free_cash_flow       DFCF-20   (the default, and the only one before
+ *                                     migration 039)
+ *     operating_cash_flow  DCF-20
+ *     net_income           DNI-20
+ */
+export type ValuationMethod =
+  | 'free_cash_flow'
+  | 'operating_cash_flow'
+  | 'net_income';
+
+/**
+ * One method's complete output.
+ *
+ * Every field here also appears at the top level of `HoldingValuation` for
+ * whichever method is selected — the duplication is deliberate, so readers
+ * that predate the choice (the portfolio table, the CSV export) keep working
+ * unchanged while the modal can show all three at once.
+ */
+export interface ValuationModel {
+  discount_rate: number;
+  base: ValuationScenario;
+  conservative: ValuationScenario;
+  average_intrinsic_value: number;
+  average_intrinsic_value_with_terminal: number | null;
+  premium_pct: number | null;
+}
+
+/**
  * What the DCF produced, or why it could not run.
  *
  * `available: false` is a real answer rather than an error — it means an
@@ -91,6 +122,26 @@ export interface HoldingValuation {
   premium_pct?: number | null;
   /** Fields the user's override supplied, so the UI can mark them. */
   overridden_fields?: string[];
+  /**
+   * Which method the top-level figures above came from. Present even when
+   * `available` is false — it is the method that could not run.
+   */
+  method?: ValuationMethod;
+  /**
+   * Every method whose flow was available, computed on identical inputs
+   * bar the flow itself. Sparse: a method with no figure to grow is absent
+   * rather than present-and-zero. Still populated when the SELECTED method
+   * could not run, so the UI can offer a switch instead of only reporting
+   * the gap.
+   */
+  models?: Partial<Record<ValuationMethod, ValuationModel>>;
+  /**
+   * Set to the selected method's flow field when that flow exists but is
+   * zero or negative — a different problem from a missing one, and one no
+   * refresh will fix. A loss-making year is a real reading; the model
+   * declines rather than reporting the business as worth 0.00.
+   */
+  non_positive_flow?: string | null;
 }
 
 /** One row of `investment_valuation_inputs`, either variant. */
@@ -98,6 +149,10 @@ export interface ValuationInputRow {
   variant: 'auto' | 'override';
   base_flow: number | null;
   metric: string | null;
+  /** Migration 039. The other two flows the same engine can be run on,
+   * fetched or hand-keyed independently of `base_flow`. */
+  operating_cash_flow: number | null;
+  net_income: number | null;
   shares_outstanding: number | null;
   total_debt: number | null;
   cash_and_st: number | null;
@@ -146,6 +201,9 @@ export interface Holding {
   planned_allocation: number | null;
   /** False for a fund, which has no cash flows of its own to discount. */
   is_valuable: boolean;
+  /** Which of the three base flows this holding's headline valuation comes
+   * from. All three are still returned under `valuation.models`. */
+  valuation_method: ValuationMethod;
 
   /** The manual override when set, otherwise the last auto-fetched quote --
    * whichever every other figure below (market value, unrealized P&L, DCF
@@ -290,6 +348,11 @@ export interface HoldingPayload {
   is_valuable?: boolean;
   /** null clears the override and reverts to the auto-fetched quote. */
   manual_price?: number | null;
+  /** Which of the three base flows this holding is valued on. Unlike every
+   * other field here, null is REFUSED rather than meaning "clear it": the
+   * column is NOT NULL with a default, so some method is always in force.
+   * Omit the key to leave it unchanged. */
+  valuation_method?: ValuationMethod;
 }
 
 /**
@@ -319,6 +382,8 @@ export interface BasisCorrectionResult {
 export interface ValuationOverridePayload {
   base_flow?: number | null;
   metric?: string | null;
+  operating_cash_flow?: number | null;
+  net_income?: number | null;
   shares_outstanding?: number | null;
   total_debt?: number | null;
   cash_and_st?: number | null;

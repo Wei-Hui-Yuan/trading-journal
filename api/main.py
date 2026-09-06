@@ -7023,6 +7023,13 @@ class InvestmentHolding(Base):
     # Whether a discounted cash flow means anything here. False for an ETF,
     # which has no cash flows of its own.
     is_valuable = Column(Boolean, nullable=False, default=True)
+    # Which of the three base flows this holding is valued on (migration
+    # 039). Selects between results rather than producing one: all three
+    # models run on every request regardless, and this decides which of them
+    # premium_pct and the portfolio table report as THE valuation.
+    valuation_method = Column(
+        String(24), nullable=False, server_default="free_cash_flow"
+    )
     current_price = Column(Numeric(18, 4), nullable=True)
     price_updated_at = Column(DateTime(timezone=True), nullable=True)
     # Overrides current_price when set (migration 028). current_price keeps
@@ -7059,6 +7066,12 @@ class InvestmentValuationInput(Base):
     variant = Column(String(10), nullable=False)
     base_flow = Column(Numeric(20, 4), nullable=True)
     metric = Column(String(24), nullable=True)
+    # Migration 039. Two more flows the same twenty-year engine can be run
+    # on, kept beside base_flow rather than replacing it so switching method
+    # re-reads a stored figure instead of rewriting one -- a hand-keyed free
+    # cash flow must not be reinterpreted as net income by a toggle.
+    operating_cash_flow = Column(Numeric(20, 4), nullable=True)
+    net_income = Column(Numeric(20, 4), nullable=True)
     shares_outstanding = Column(Numeric(20, 4), nullable=True)
     total_debt = Column(Numeric(20, 4), nullable=True)
     cash_and_st = Column(Numeric(20, 4), nullable=True)
@@ -7130,7 +7143,34 @@ VALUATION_FIELDS = (
     "base_flow", "metric", "shares_outstanding", "total_debt",
     "cash_and_st", "beta", "growth_1_5", "discount_rate", "region",
     "statement_exchange_rate",
+    # Migration 039. In the merge like every other input, so an override can
+    # hand-key either of them for a holding no provider covers.
+    "operating_cash_flow", "net_income",
 )
+
+
+# The three ways to run the same twenty-year model, keyed by the column each
+# reads its flow from.
+#
+# One engine, one discount rate, one growth schedule, one debt-and-cash
+# bridge -- the ONLY difference between these three numbers is which line of
+# the financial statements is grown for twenty years. That is what makes
+# comparing them informative rather than merely three opinions: a DCF-20 far
+# above its DFCF-20 says the operating cash is going into capital
+# expenditure, and a DNI-20 above both says the earnings are accounting
+# earnings that the cash flow statement does not corroborate.
+#
+# The short names are the reference tool's own labels, kept so a figure here
+# and a bar on its chart can be checked against each other by name.
+VALUATION_METHODS: dict[str, tuple[str, str]] = {
+    "free_cash_flow": ("base_flow", "DFCF-20"),
+    "operating_cash_flow": ("operating_cash_flow", "DCF-20"),
+    "net_income": ("net_income", "DNI-20"),
+}
+
+# What every holding valued on before migration 039 gave them a choice, and
+# what a holding that has never been switched still values on.
+DEFAULT_VALUATION_METHOD = "free_cash_flow"
 
 # How stale an 'auto' row may be before a refresh will replace it. Twenty-five
 # rather than thirty so a monthly job cannot drift into skipping a month: run
@@ -7361,6 +7401,12 @@ class HoldingUpdate(BaseModel):
     # number sets it. Distinguished from "field not sent" the same way every
     # other nullable field here is, via exclude_unset in the handler below.
     manual_price: Optional[float] = Field(None, ge=0)
+    # Which of the three base flows this holding is valued on (migration
+    # 039). Rides on the existing partial-update endpoint rather than
+    # earning one of its own: it is a per-holding preference exactly like
+    # is_valuable, and exclude_unset already distinguishes "not sent" from
+    # "sent as null" for every field here.
+    valuation_method: Optional[str] = None
 
     _valid_category = field_validator("category")(HoldingCreate._valid_category.__func__)
 
@@ -7368,6 +7414,33 @@ class HoldingUpdate(BaseModel):
     @classmethod
     def _upper_currency(cls, value: Optional[str]) -> Optional[str]:
         return value.strip().upper() if value else value
+
+    @field_validator("valuation_method")
+    @classmethod
+    def _valid_method(cls, value: Optional[str]) -> Optional[str]:
+        """A 422 naming the three methods, rather than a holding silently
+        valued on a flow that does not exist.
+
+        An explicit null is refused too, which is not how the other
+        nullable fields here behave and is deliberate: the column is NOT
+        NULL with a default, so "clear it" has no meaning -- there is always
+        some method in force. Refusing it here turns what would be a 500
+        from the driver into a 422 that says what to send instead. Omitting
+        the key entirely still means "leave it alone", as everywhere else on
+        this model, because that path never reaches this validator.
+        """
+        if value is None:
+            raise ValueError(
+                "valuation_method cannot be null; omit it to leave it "
+                f"unchanged, or send one of {', '.join(sorted(VALUATION_METHODS))}"
+            )
+        method = value.strip()
+        if method not in VALUATION_METHODS:
+            raise ValueError(
+                "valuation_method must be one of "
+                f"{', '.join(sorted(VALUATION_METHODS))}"
+            )
+        return method
 
 
 async def _get_holding(session: AsyncSession, ticker: str) -> InvestmentHolding:
@@ -8021,6 +8094,12 @@ class ValuationOverride(BaseModel):
 
     base_flow: Optional[float] = None
     metric: Optional[str] = Field(None, max_length=24)
+    # Deliberately unbounded below, like base_flow: a company can burn cash
+    # or lose money, and a `ge=0` here would reject the true figure and
+    # leave the fetched one standing. The engine declines to value a
+    # non-positive flow, which is the honest place for that judgement.
+    operating_cash_flow: Optional[float] = None
+    net_income: Optional[float] = None
     shares_outstanding: Optional[float] = Field(None, gt=0)
     total_debt: Optional[float] = Field(None, ge=0)
     cash_and_st: Optional[float] = Field(None, ge=0)
@@ -8052,6 +8131,8 @@ def _input_row(row: Optional[InvestmentValuationInput]) -> Optional[dict]:
         "variant": row.variant,
         "base_flow": _f(row.base_flow),
         "metric": row.metric,
+        "operating_cash_flow": _f(row.operating_cash_flow),
+        "net_income": _f(row.net_income),
         "shares_outstanding": _f(row.shares_outstanding),
         "total_debt": _f(row.total_debt),
         "cash_and_st": _f(row.cash_and_st),
@@ -8435,6 +8516,12 @@ async def refresh_valuation_inputs(
                 # totalDebt includes them.
                 "base_flow": fundamentals.free_cash_flow_m,
                 "metric": "free_cash_flow",
+                # Migration 039. Both already arrived on the calls above --
+                # operating cash flow has been fetched since the beginning
+                # and discarded here, and net income is the cash flow
+                # statement's opening line. Storing them costs no request.
+                "operating_cash_flow": fundamentals.operating_cash_flow_m,
+                "net_income": fundamentals.net_income_m,
                 "shares_outstanding": fundamentals.shares_outstanding_m,
                 "total_debt": fundamentals.total_debt_ex_leases_m,
                 "cash_and_st": fundamentals.cash_and_st_m,
@@ -8549,6 +8636,9 @@ def _holding_row(holding: InvestmentHolding) -> dict:
         "exchange_rate": _f(holding.exchange_rate),
         "planned_allocation": _f(holding.planned_allocation),
         "is_valuable": holding.is_valuable,
+        # Which of the three models this holding's headline valuation comes
+        # from. All three are returned under valuation.models regardless.
+        "valuation_method": holding.valuation_method or DEFAULT_VALUATION_METHOD,
         # The number every downstream calculation (market value, unrealized
         # P&L, DCF premium) actually uses -- see _effective_price.
         "current_price": _effective_price(holding),
@@ -8568,46 +8658,39 @@ def _holding_row(holding: InvestmentHolding) -> dict:
 def _value_holding(
     holding: InvestmentHolding, merged: dict, overridden: Sequence[str]
 ) -> Optional[dict]:
-    """Run the DCF for one holding, or return None when it cannot be run.
+    """Run all three DCF models for one holding, and report the chosen one.
 
-    None rather than a zero: a missing input means the model has nothing to
-    say, and a zero intrinsic value would render as "worth nothing" -- an
-    assertion, where silence is the truth.
+    Every method the inputs allow is computed on every call and returned
+    under `models`, because the comparison is the point: the three differ in
+    exactly one input -- which line of the statements is grown -- so the gap
+    between them says where a company's paper earnings, operating cash and
+    free cash diverge. `valuation_method` then selects which of them is THIS
+    holding's valuation, and that one is ALSO spread across the top level so
+    every existing reader (the portfolio table, premium_pct, the CSV export)
+    keeps seeing the shape it always has.
+
+    Silence rather than a zero, unchanged from when there was one model: a
+    missing input means the model has nothing to say, and a zero intrinsic
+    value would render as "worth nothing" -- an assertion about the business
+    where the truth is about the data.
     """
-    base_flow = merged.get("base_flow")
     shares = merged.get("shares_outstanding")
     growth = merged.get("growth_1_5")
-    # Treated exactly like a missing base_flow or shares_outstanding, not
+    # Treated exactly like a missing flow or shares_outstanding, not
     # defaulted to 1.0 -- see migration 037. A holding whose filer reports
     # in USD gets this from refresh_valuations automatically; anything else
     # needs it supplied by hand before the DCF will run at all, because
     # guessing 1.0 here is the bug this column exists to stop.
     statement_rate = merged.get("statement_exchange_rate")
-    if base_flow is None or not shares or growth is None or not statement_rate:
-        missing = [
-            name for name, value in (
-                ("base_flow", base_flow),
-                ("shares_outstanding", shares),
-                ("growth_1_5", growth),
-                ("statement_exchange_rate", statement_rate),
-            ) if value is None or value == 0
-        ]
-        return {"available": False, "missing": missing}
 
-    inputs = valuation_engine.ValuationInputs(
-        ticker=holding.ticker,
-        base_flow=float(base_flow),
-        shares_outstanding=float(shares),
-        growth_1_5=float(growth),
-        beta=_f(merged.get("beta")),
-        total_debt=float(merged.get("total_debt") or 0.0),
-        cash_and_st_investments=float(merged.get("cash_and_st") or 0.0),
-        region=merged.get("region") or "US",
-        exchange_rate=_f(holding.exchange_rate) or 1.0,
-        statement_exchange_rate=float(statement_rate),
-        discount_rate_override=_f(merged.get("discount_rate")),
-    )
-    result = valuation_engine.value(inputs)
+    method = holding.valuation_method or DEFAULT_VALUATION_METHOD
+    if method not in VALUATION_METHODS:
+        # A method that is no longer recognised (a rename, a hand-edited
+        # row) values on free cash flow rather than refusing: the holding
+        # still has a valuation, and the response says which method it is.
+        method = DEFAULT_VALUATION_METHOD
+    selected_field = VALUATION_METHODS[method][0]
+
     price = _effective_price(holding)
 
     def scenario(s) -> dict:
@@ -8625,19 +8708,93 @@ def _value_holding(
             "terminal_share_pct": s.terminal_share_pct,
         }
 
+    def run(flow_field: str) -> Optional[dict]:
+        """One model, or None when its flow cannot be grown.
+
+        A non-positive flow is declined here rather than passed on, even
+        though the engine already floors it at zero. Net income makes that
+        distinction matter for the first time: a loss-making year is a real
+        reading, and rendering it as an intrinsic value of 0.00 would say
+        the company is worth nothing when what is true is that this model
+        does not apply to it.
+        """
+        flow = merged.get(flow_field)
+        if flow is None or float(flow) <= 0:
+            return None
+
+        # Everything except base_flow is identical across the three, which
+        # is what makes them comparable -- one input apart, by construction.
+        result = valuation_engine.value(valuation_engine.ValuationInputs(
+            ticker=holding.ticker,
+            base_flow=float(flow),
+            shares_outstanding=float(shares),
+            growth_1_5=float(growth),
+            beta=_f(merged.get("beta")),
+            total_debt=float(merged.get("total_debt") or 0.0),
+            cash_and_st_investments=float(merged.get("cash_and_st") or 0.0),
+            region=merged.get("region") or "US",
+            exchange_rate=_f(holding.exchange_rate) or 1.0,
+            statement_exchange_rate=float(statement_rate),
+            discount_rate_override=_f(merged.get("discount_rate")),
+        ))
+        return {
+            "discount_rate": result.discount_rate,
+            "base": scenario(result.base),
+            "conservative": scenario(result.conservative),
+            "average_intrinsic_value": result.average_intrinsic_value,
+            "average_intrinsic_value_with_terminal": (
+                result.average_intrinsic_value_with_terminal
+            ),
+            # Positive means the market is asking more than the model says it
+            # is worth. None when there is no price to compare against,
+            # rather than a 0% that would read as "fairly priced".
+            "premium_pct": result.premium_pct(price) if price else None,
+        }
+
+    # The inputs every model shares. When one of these is absent no method
+    # can run, so the answer is the same whichever is selected.
+    shared_missing = [
+        name for name, value in (
+            ("shares_outstanding", shares),
+            ("growth_1_5", growth),
+            ("statement_exchange_rate", statement_rate),
+        ) if value is None or value == 0
+    ]
+
+    models: dict[str, dict] = {}
+    if not shared_missing:
+        for name, (flow_field, _label) in VALUATION_METHODS.items():
+            produced = run(flow_field)
+            if produced is not None:
+                models[name] = produced
+
+    selected = models.get(method)
+    if selected is None:
+        # Deliberately NOT falling back to a method that did work. A number
+        # under the wrong label is worse than no number: the holding would
+        # show a valuation the trader did not choose, indistinguishable from
+        # the one they did. The models that ran are still returned, so the
+        # modal can offer the switch rather than only reporting the gap.
+        flow = merged.get(selected_field)
+        return {
+            "available": False,
+            "method": method,
+            "missing": shared_missing or ([selected_field] if flow is None else []),
+            # Present, but zero or negative -- a different problem from an
+            # absent one, and one no amount of refreshing will fix.
+            "non_positive_flow": (
+                selected_field
+                if not shared_missing and flow is not None
+                else None
+            ),
+            "models": models,
+        }
+
     return {
         "available": True,
-        "discount_rate": result.discount_rate,
-        "base": scenario(result.base),
-        "conservative": scenario(result.conservative),
-        "average_intrinsic_value": result.average_intrinsic_value,
-        "average_intrinsic_value_with_terminal": (
-            result.average_intrinsic_value_with_terminal
-        ),
-        # Positive means the market is asking more than the model says it is
-        # worth. None when there is no price to compare against, rather than
-        # a 0% that would read as "fairly priced".
-        "premium_pct": result.premium_pct(price) if price else None,
+        "method": method,
+        **selected,
+        "models": models,
         "overridden_fields": list(overridden),
     }
 
@@ -9074,6 +9231,11 @@ async def _export_investment_holdings(session: AsyncSession):
         "dividends", "dividends_usd", "portfolio_weight_pct",
         "planned_allocation", "transaction_count", "first_acquired",
         "is_valuable", "valuation_available",
+        # Which of the three base flows the intrinsic values below came from
+        # (migration 039). Without it the export is ambiguous: the same
+        # ticker on two different methods produces two different intrinsic
+        # values with nothing in the file to say why.
+        "valuation_method",
         "intrinsic_value_base", "intrinsic_value_conservative",
         "intrinsic_value_average", "premium_pct", "discount_rate",
     ]
@@ -9119,6 +9281,7 @@ async def _export_investment_holdings(session: AsyncSession):
             fmt.timestamp(row["first_acquired"]),
             fmt.flag(row["is_valuable"]),
             fmt.flag(valuation.get("available")),
+            fmt.text(row.get("valuation_method")),
             fmt.number(base.get("intrinsic_value")),
             fmt.number(conservative.get("intrinsic_value")),
             fmt.number(valuation.get("average_intrinsic_value")),

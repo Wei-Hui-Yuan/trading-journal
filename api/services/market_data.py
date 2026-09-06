@@ -126,6 +126,22 @@ class Fundamentals:
     operating_cash_flow_m: Optional[float] = None
     capital_expenditure_m: Optional[float] = None
 
+    # Net income for the latest filed year, feeding the DNI-20 model.
+    #
+    # Costs no extra call from either provider: it is the top line of the
+    # cash flow statement, which both already return in full for the free
+    # cash flow figure above.
+    #
+    # Deliberately NOT smoothed the way free_cash_flow_m is. That averaging
+    # exists to stop one heavy capital-expenditure year being mistaken for a
+    # permanent collapse in cash generation, and net income is measured
+    # before capex -- there is no equivalent distortion to absorb, and
+    # averaging it would blur a real earnings trend instead.
+    #
+    # May be negative. An unprofitable year is a reading, not a gap, and the
+    # valuation engine already refuses to value a non-positive flow.
+    net_income_m: Optional[float] = None
+
     # As reported: long-term + short-term + capitalised leases.
     total_debt_m: Optional[float] = None
     # The workbook's figure, and the one the valuation should use. Its input
@@ -187,6 +203,19 @@ _CAPEX_TAGS = (
 _CASH_TAGS = (
     "CashAndCashEquivalentsAtCarryingValue",
     "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+)
+
+# Net income, for DNI-20. Ranked by whose income it is, because the three
+# tags are not synonyms: `NetIncomeLoss` is what accrues to the PARENT's
+# shareholders, which is the figure a per-share valuation is about, while
+# `ProfitLoss` is consolidated and still includes the slice belonging to
+# minority holders of subsidiaries. Taking ProfitLoss where NetIncomeLoss
+# exists would value a claim on earnings the shareholder has none of, so it
+# ranks last rather than first despite being the more "complete" number.
+_NET_INCOME_TAGS = (
+    "NetIncomeLoss",
+    "NetIncomeLossAvailableToCommonStockholdersBasic",
+    "ProfitLoss",
 )
 _SHORT_TERM_INVESTMENT_TAGS = (
     "ShortTermInvestments",
@@ -430,7 +459,8 @@ async def _finnhub_statements(
         return None
 
     latest = filings[0]
-    balance = (latest.get("report") or {}).get("bs") or []
+    report = latest.get("report") or {}
+    balance = report.get("bs") or []
 
     # Free cash flow, up to three filings, most recent first -- the same
     # smoothing rule the FMP path applies (_smoothed_free_cash_flow), computed
@@ -457,6 +487,18 @@ async def _finnhub_statements(
 
     free_cash_flow, smoothed = _smoothed_free_cash_flow(fcf_years)
 
+    # The income statement first, the cash flow statement second. Both carry
+    # net income -- it is the line the indirect method starts from -- but on
+    # the income statement it is the reported result, while on the cash flow
+    # statement some filers tag the consolidated figure there and the
+    # parent-only one on `ic`. Preferring `ic` takes the reading that matches
+    # the EPS in the same filing.
+    net_income, _ = _pick(report.get("ic") or [], _NET_INCOME_TAGS)
+    if net_income is None:
+        net_income, _ = _pick(
+            (filings[0].get("report") or {}).get("cf") or [], _NET_INCOME_TAGS
+        )
+
     cash, _ = _pick(balance, _CASH_TAGS)
     investments, _ = _pick(balance, _SHORT_TERM_INVESTMENT_TAGS)
 
@@ -476,6 +518,7 @@ async def _finnhub_statements(
         "capital_expenditure": abs(latest_capex) if latest_capex is not None else None,
         "free_cash_flow": free_cash_flow,
         "free_cash_flow_smoothed": smoothed,
+        "net_income": net_income,
         "total_debt": total_debt,
         "debt_includes_leases": includes_leases,
         "cash_and_st": (cash or 0.0) + (investments or 0.0) if cash is not None else None,
@@ -564,6 +607,10 @@ async def fetch_fundamentals(
                 free_cash_flow_m=base_flow_m,
                 base_flow_smoothed=smoothed,
                 operating_cash_flow_m=_millions(cash_flow, "operatingCashFlow"),
+                # The cash flow statement's own opening line -- no extra
+                # call, and no separate income-statement request, which the
+                # free tier gates by symbol anyway.
+                net_income_m=_millions(cash_flow, "netIncome"),
                 # FMP reports capex negative (a cash outflow). Stored as a
                 # magnitude so callers subtract it rather than having to know.
                 capital_expenditure_m=(
@@ -623,6 +670,7 @@ async def fetch_fundamentals(
             base_flow_smoothed=filed["free_cash_flow_smoothed"],
             operating_cash_flow_m=to_m(filed["operating_cash_flow"]),
             capital_expenditure_m=to_m(filed["capital_expenditure"]),
+            net_income_m=to_m(filed["net_income"]),
             total_debt_m=to_m(filed["total_debt"]),
             # Lease-only tags are never summed into the debt figure, so what
             # comes back is already the workbook's definition -- unless the

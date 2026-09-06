@@ -1,13 +1,39 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
-import { AlertCircle, Loader2, RotateCcw, X } from 'lucide-react';
+import { AlertCircle, Check, Loader2, RotateCcw, X } from 'lucide-react';
 
 import {
   useClearValuationOverride,
   useSetValuationOverride,
+  useUpdateHolding,
 } from '@/hooks/useInvestments';
-import type { Holding, ValuationOverridePayload } from '@/types/investments';
+import type {
+  Holding,
+  ValuationMethod,
+  ValuationOverridePayload,
+} from '@/types/investments';
+
+/**
+ * The three ways to run the same twenty-year model.
+ *
+ * One engine, one discount rate, one growth schedule, one debt-and-cash
+ * bridge — the ONLY thing that differs between these numbers is which line
+ * of the financial statements gets grown for twenty years. That is what
+ * makes them worth showing together rather than as three separate opinions:
+ *
+ *     DCF-20 far above DFCF-20   the operating cash is going into capex
+ *     DNI-20 far above both      accounting earnings the cash flow
+ *                                statement does not corroborate
+ *
+ * Short names are the reference tool's own, so a figure here and a bar on
+ * its chart can be checked against each other by name.
+ */
+const METHODS: { key: ValuationMethod; short: string; label: string }[] = [
+  { key: 'free_cash_flow', short: 'DFCF-20', label: 'Free cash flow' },
+  { key: 'operating_cash_flow', short: 'DCF-20', label: 'Operating cash flow' },
+  { key: 'net_income', short: 'DNI-20', label: 'Net income' },
+];
 
 /**
  * The inputs the DCF takes, in the order the workbook lists them.
@@ -24,7 +50,13 @@ const FIELDS: {
   hint?: string;
   percent?: boolean;
 }[] = [
-  { key: 'base_flow', label: 'Free cash flow', hint: 'millions, as reported' },
+  { key: 'base_flow', label: 'Free cash flow', hint: 'millions — feeds DFCF-20' },
+  // The other two flows, editable for the same reason base_flow is: no
+  // provider covers every holding, and a company nobody reports on can
+  // still be valued by hand. Left blank they simply produce no bar.
+  { key: 'operating_cash_flow', label: 'Operating cash flow',
+    hint: 'millions — feeds DCF-20' },
+  { key: 'net_income', label: 'Net income', hint: 'millions — feeds DNI-20' },
   { key: 'shares_outstanding', label: 'Shares outstanding', hint: 'millions' },
   { key: 'total_debt', label: 'Total debt', hint: 'millions, excl. leases' },
   { key: 'cash_and_st', label: 'Cash + short-term', hint: 'millions' },
@@ -43,6 +75,19 @@ function display(value: number | null | undefined, percent?: boolean): string {
   return value.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
+/**
+ * A premium over intrinsic value, signed.
+ *
+ * POSITIVE means the market is asking more than the model says it is worth,
+ * so the negative figure is the interesting one. Null renders as an em dash
+ * rather than 0%, which would read as "fairly priced" — a claim, where the
+ * truth is that there was nothing to compare against.
+ */
+function premium(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  return `${value < 0 ? '−' : '+'}${Math.abs(value).toFixed(1)}%`;
+}
+
 /** Empty string means "no override", which is different from zero. */
 function parse(raw: string, percent?: boolean): number | null {
   const text = raw.trim();
@@ -58,6 +103,10 @@ export const ValuationModal: React.FC<{
 }> = ({ holding, onClose }) => {
   const save = useSetValuationOverride();
   const clear = useClearValuationOverride();
+  // The method is a property of the holding, not of the override — it picks
+  // between results rather than feeding one — so it rides the ordinary
+  // holding patch rather than earning an endpoint of its own.
+  const switchMethod = useUpdateHolding();
   const [error, setError] = useState<string | null>(null);
 
   const auto = holding.inputs.auto;
@@ -86,6 +135,23 @@ export const ValuationModal: React.FC<{
     () => new Set(valuation?.overridden_fields ?? []),
     [valuation]
   );
+
+  // `valuation.method` is what the server actually valued on; the holding's
+  // own column is the fallback for a payload that predates the choice. They
+  // agree except when the stored method is unrecognised, and then the
+  // server's answer is the honest one — it says which model produced the
+  // numbers on screen, not which one was asked for.
+  const models = valuation?.models ?? {};
+  const method = valuation?.method ?? holding.valuation_method;
+
+  const choose = (next: ValuationMethod) => {
+    if (next === method) return;
+    setError(null);
+    switchMethod.mutate(
+      { ticker: holding.ticker, payload: { valuation_method: next } },
+      { onError: (e) => setError(e.message) }
+    );
+  };
 
   const submit = () => {
     setError(null);
@@ -121,7 +187,8 @@ export const ValuationModal: React.FC<{
               )}
             </h2>
             <p className="mt-0.5 text-[11px] text-obsidian-muted">
-              Twenty-year discounted cash flow, with and without a terminal value
+              Twenty-year discounted cash flow — three base flows, with and
+              without a terminal value
             </p>
           </div>
           <button
@@ -132,6 +199,85 @@ export const ValuationModal: React.FC<{
           >
             <X className="h-4 w-4" />
           </button>
+        </div>
+
+        {/* ---------------- one engine, three base flows ----------------
+
+            All three are shown at once rather than only the chosen one,
+            because the COMPARISON is the output. The three differ in
+            exactly one input — which line of the statements is grown — so
+            the gap between them is attributable, and a DCF-20 towering over
+            its DFCF-20 is a fact about capital expenditure rather than a
+            disagreement between models.
+
+            Every method stays clickable even with no figure behind it. That
+            is the path into hand-keying one: switch to DNI-20, the banner
+            below names `net_income` as what is missing, and the field for it
+            is on the right. Blocking the click would make the flow a dead
+            end for exactly the holdings no provider covers. */}
+        <div className="border-b border-obsidian-border px-5 py-3">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2">
+            <span className="text-[10px] uppercase tracking-wide text-obsidian-muted">
+              Valuation method
+            </span>
+            <span className="text-[10px] text-obsidian-muted">
+              same twenty years, same discount rate — a different line of the
+              statements
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-obsidian-border bg-obsidian-border sm:grid-cols-3">
+            {METHODS.map(({ key, short, label }) => {
+              const model = models[key];
+              const active = key === method;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => choose(key)}
+                  disabled={switchMethod.isPending}
+                  aria-pressed={active}
+                  aria-label={`${short}, ${label}`}
+                  className={`px-3 py-2 text-left transition-colors disabled:cursor-wait ${
+                    active
+                      ? 'bg-obsidian-hover'
+                      : 'bg-obsidian-card hover:bg-obsidian-hover/60'
+                  }`}
+                >
+                  <div className="flex items-center gap-1">
+                    <span
+                      className={`text-[10px] font-semibold uppercase tracking-wide ${
+                        active ? 'text-slate-100' : 'text-obsidian-muted'
+                      }`}
+                    >
+                      {short}
+                    </span>
+                    {active && (
+                      <Check className="h-3 w-3 shrink-0 text-emerald-400" />
+                    )}
+                  </div>
+                  <div className="text-[10px] text-obsidian-muted">{label}</div>
+                  {model ? (
+                    <div className="mt-1 flex items-baseline gap-2 font-mono text-[11px]">
+                      <span className="text-slate-100">
+                        {display(model.average_intrinsic_value)}
+                      </span>
+                      <span
+                        className={
+                          (model.premium_pct ?? 0) < 0 ? 'text-win' : 'text-loss'
+                        }
+                      >
+                        {premium(model.premium_pct)}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="mt-1 font-mono text-[11px] text-obsidian-muted">
+                      — no figure
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         {/* ---------------- what it produced ---------------- */}
@@ -160,24 +306,35 @@ export const ValuationModal: React.FC<{
                   (valuation.premium_pct ?? 0) < 0 ? 'text-win' : 'text-loss'
                 }`}
               >
-                {valuation.premium_pct === null || valuation.premium_pct === undefined
-                  ? '—'
-                  : `${valuation.premium_pct < 0 ? '−' : '+'}${Math.abs(
-                      valuation.premium_pct
-                    ).toFixed(1)}%`}
+                {premium(valuation.premium_pct)}
               </div>
             </div>
           </div>
         ) : (
           <div className="flex items-start gap-2 border-b border-obsidian-border bg-amber-500/5 px-5 py-3 text-[11px] text-amber-300">
             <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0" />
-            <span>
-              Not valued yet — needs{' '}
-              <span className="font-mono">
-                {(valuation?.missing ?? ['inputs']).join(', ')}
+            {/* A flow that exists and is not positive is a different problem
+                from a flow that is absent, and telling the trader to "fill
+                in net_income" when net income is a real reported loss would
+                be asking them to correct a fact. */}
+            {valuation?.non_positive_flow ? (
+              <span>
+                Not valued on this method —{' '}
+                <span className="font-mono">{valuation.non_positive_flow}</span>{' '}
+                is zero or negative, and a flow that shrinks toward nothing
+                cannot be grown for twenty years. That is a reading about the
+                year, not a gap: pick another method above, or override the
+                figure if it is wrong.
               </span>
-              . Fill them in on the right and it will value on save.
-            </span>
+            ) : (
+              <span>
+                Not valued yet — needs{' '}
+                <span className="font-mono">
+                  {(valuation?.missing ?? ['inputs']).join(', ')}
+                </span>
+                . Fill them in on the right and it will value on save.
+              </span>
+            )}
           </div>
         )}
 
