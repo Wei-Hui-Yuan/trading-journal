@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -53,6 +54,28 @@ from dotenv import load_dotenv
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 TRACKING_TABLE = "schema_migrations"
+
+#: Postgres advisory-lock key held for the duration of a real migration run.
+#:
+#: Needed from the moment the container started migrating itself on boot
+#: (start.py). Northflank can have two containers up at once -- a rolling
+#: deploy overlaps the old and the new -- and before this, both would read the
+#: same pending list and both start applying it. The files are written
+#: idempotently, so the likely outcome was a duplicate-key error on the
+#: bookkeeping INSERT rather than a corrupt schema, but "likely" is not a
+#: property to rest a deploy on: a migration that manages its own transaction
+#: has no such protection.
+#:
+#: A session-level lock, not a transaction-level one, because the run spans
+#: several transactions -- one per migration, plus the files that opt out of
+#: transactions entirely. Postgres drops it when the connection closes, so a
+#: runner killed mid-flight cannot wedge the next one.
+#:
+#: Derived from the table name rather than written as a magic number, so it
+#: cannot silently collide with an unrelated advisory lock someone adds later
+#: and needs no separate registry to look up. crc32 is a fixed algorithm, so
+#: the value is stable across interpreters and releases.
+MIGRATION_LOCK_KEY = zlib.crc32(TRACKING_TABLE.encode())
 
 # Two prefixes were used twice before tracking existed: 021 and 022 each name
 # two different migrations. Renaming them was considered and rejected -- an
@@ -384,6 +407,22 @@ async def run(args: argparse.Namespace) -> int:
     # statement caching is incompatible with connection poolers.
     conn = await asyncpg.connect(url, statement_cache_size=0)
     try:
+        # Serialise real runs against each other, but never the read-only
+        # commands. --status is what you reach for when a run looks stuck, and
+        # blocking it behind that run's own lock would make the one diagnostic
+        # in this tool unusable at exactly the moment it is needed. Neither
+        # --status nor --dry-run writes anything, so neither needs the lock.
+        #
+        # Taken BEFORE fetch_applied, not after. A second runner that read the
+        # pending list first and then waited would come out of the wait holding
+        # a list the first runner has already applied, and try to apply it
+        # again -- which is the race, just moved.
+        mutating = not (args.status or args.dry_run)
+        if mutating:
+            await conn.execute(
+                "SELECT pg_advisory_lock($1)", MIGRATION_LOCK_KEY
+            )
+
         await ensure_tracking_table(conn)
         applied = await fetch_applied(conn)
 

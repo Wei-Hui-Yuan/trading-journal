@@ -60,6 +60,22 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
+# Migrate before serving, then exec the CMD below.
+#
+# ENTRYPOINT rather than folding this into CMD, for two reasons. Docker passes
+# CMD to ENTRYPOINT as arguments, so the gunicorn line stays a plain, readable
+# argv that start.py execs -- and test_the_budget_is_below_the_worker_timeout
+# parses that exact line out of this file to check --timeout against the IBKR
+# fetch budget, so it has to stay in CMD form.
+#
+# Written in Python, not as a shell script, deliberately. This repository is
+# checked out on Windows with autocrlf on, and a .sh with CRLF line endings
+# fails in the container with a `bad interpreter` error that names nothing
+# useful -- an entrypoint is a poor place to learn that. Python does not care,
+# and the fail-open/fail-closed decision gets unit tests as a bonus
+# (tests/test_start.py).
+ENTRYPOINT ["python", "start.py"]
+
 # --timeout MUST stay above services/ibkr_client.TOTAL_BUDGET_SECONDS, and
 # test_the_budget_is_below_the_worker_timeout reads this line to enforce it.
 #
