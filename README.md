@@ -8,6 +8,13 @@ checklist), while the investment book is built around a holding bought over
 time and valued against what the business is worth rather than against a
 stop.
 
+This is a public, read-only mirror of a personal project -- the app itself
+runs against a private production database, so there's nothing to sign into
+here. It's shared for the code: migration discipline, the DCF valuation
+engine, R-multiple analytics, and the reasoning trail in the commit history.
+Everything below still applies if you want to run it yourself against your
+own broker export and your own Postgres instance.
+
 ## What's here
 
 One repo, two deployables:

@@ -12,12 +12,16 @@ export const metadata: Metadata = {
 /**
  * Where the data comes from. Read here only to warm the connection to it.
  *
- * Falls back to the production host rather than localhost: this value is
- * inlined at build time, and a preconnect to a dev server that is not running
- * would be a wasted hint on every deployed page.
+ * Falls back to a placeholder rather than a real host in this public copy --
+ * see NEXT_PUBLIC_API_URL in .env.example. Upstream, this falls back to the
+ * production host instead of localhost, since this value is inlined at build
+ * time and a preconnect to a dev server that is not running would be a
+ * wasted hint on every deployed page. With no env var set, this now falls
+ * back to a placeholder host instead: the preconnect hint is simply wasted
+ * rather than pointed at anything real, until NEXT_PUBLIC_API_URL is set.
  */
 const API_ORIGIN = (() => {
-  const raw = process.env.NEXT_PUBLIC_API_URL || 'https://p01--host--5zs8snzvhrhl.code.run';
+  const raw = process.env.NEXT_PUBLIC_API_URL || 'https://your-api-host.example.com';
   try {
     return new URL(raw).origin;
   } catch {
