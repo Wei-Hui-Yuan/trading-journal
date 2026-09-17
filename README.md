@@ -15,10 +15,7 @@ engine, R-multiple analytics, and the reasoning trail in the commit history.
 Everything below still applies if you want to run it yourself against your
 own broker export and your own Postgres instance.
 
-## Screenshots
-
-Demo data throughout -- round numbers, common tickers, nothing from the real
-account. Shown to illustrate the UI, not to claim a track record.
+## Features
 
 **Analytics.** Net P&L / win rate / trade quality at a glance, and a
 day-of-week × session heatmap that marks a cell "thin" below 20 trades rather
