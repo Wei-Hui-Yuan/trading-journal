@@ -13,11 +13,11 @@
 
 -r requirements.txt
 
-pytest==9.1.1
+pytest==9.2.0
 
 # --- transitive, via pytest ---
-iniconfig==2.3.0
-pluggy==1.6.0
+iniconfig==2.3.1
+pluggy==1.7.0
 pygments==2.21.0
 
 # packaging is already pinned in requirements.txt (via gunicorn); pytest needs
